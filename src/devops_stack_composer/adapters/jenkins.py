@@ -483,12 +483,12 @@ def _scan_stage_lines(
             else _scan_severities(fail_on)
         )
         exit_code = 0 if fail_on == "never" else 1
-        policy_arguments = f" --severity {severities}"
+        policy_arguments = f"--severity {severities} "
     output_path = "out/supply-chain/vulnerabilities.json"
     command = (
         "mkdir -p out/supply-chain && "
         f"trivy image --format json --output {output_path} --exit-code {exit_code} "
-        f"{policy_arguments.strip()}\"$IMAGE_REF\""
+        f"{policy_arguments}\"$IMAGE_REF\""
     )
     lines = ["        stage('Scan Same Digest') {"]
     lines.extend(_branch_when_lines(routed_branches, "            "))
