@@ -664,9 +664,9 @@ set -- env -i \
 [ -z "${{BUILDX_CONFIG:-}}" ] || set -- "$@" "BUILDX_CONFIG=$BUILDX_CONFIG"
 [ -z "${{XDG_RUNTIME_DIR:-}}" ] || set -- "$@" "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
 
-# A Docker --load result cannot carry registry attestations. Keep the configured
-# SBOM/provenance values for validation and push, but disable attestations only for
-# this local image load; Jenkins runs its local Syft/Trivy checks afterwards.
+# A Docker --load result cannot carry registry attestations. The validator and build
+# in this mode must use matching no-attestation inputs; --validate and --push retain
+# the configured values. Jenkins runs local Syft/Trivy checks after loading.
 if [ "$MODE" = "--load" ]; then
   set -- "$@" "SBOM=false" "PROVENANCE=false"
 fi

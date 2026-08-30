@@ -1,0 +1,16 @@
+include LICENSE
+include README.md
+include templates.lock.json
+recursive-include schemas *.json
+recursive-include docs *.md
+prune docs/management
+include examples/python-service/.gitignore
+include examples/python-service/README.md
+include examples/python-service/devops-stack.yaml
+include examples/python-service/requirements.txt
+recursive-include examples/python-service/app *.py
+recursive-include examples/python-service/tests *.py
+prune tests
+prune .github
+global-exclude __pycache__
+global-exclude *.py[cod]

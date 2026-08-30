@@ -325,6 +325,8 @@ def _plan_value(composition: Composition, writer: ArtifactWriter) -> dict[str, A
 def _run_generate(args: argparse.Namespace) -> int:
     if args.force and not args.write:
         raise ValueError("--force is only valid together with --write")
+    if args.build_image and not args.write:
+        raise ValueError("--build-image is only valid together with --write for generate")
     composition = _composition(args)
     writer = ArtifactWriter(composition.project, DEFAULT_OUTPUT)
     value = _plan_value(composition, writer)

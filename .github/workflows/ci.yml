@@ -1,0 +1,674 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Build and install release artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build wheel and source distribution
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Inspect and install both artifacts
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+          from pathlib import Path
+
+          artifacts = sorted(Path("dist").iterdir())
+          assert {path.suffix for path in artifacts} >= {".whl", ".gz"}, artifacts
+          source = next(path for path in artifacts if path.name.endswith(".tar.gz"))
+          with tarfile.open(source, "r:gz") as archive:
+              names = archive.getnames()
+          assert not any(
+              len(name.split("/")) > 1 and name.split("/")[1] == "tests"
+              for name in names
+          ), names
+          assert not any("/docs/management/" in name for name in names), names
+          sensitive_suffixes = (".pem", ".key", ".p12", ".log")
+          assert not any(
+              name.endswith(sensitive_suffixes)
+              or name.rsplit("/", 1)[-1] in {".env", ".env.local"}
+              for name in names
+          ), names
+
+          for artifact in artifacts:
+              with tempfile.TemporaryDirectory() as directory:
+                  root = Path(directory)
+                  environment = root / "venv"
+                  subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
+                  executable = environment / "bin" / "python"
+                  subprocess.run(
+                      [str(executable), "-m", "pip", "install", str(artifact.resolve())],
+                      check=True,
+                  )
+                  subprocess.run(
+                      [
+                          str(executable),
+                          "-c",
+                          (
+                              "from devops_stack_composer.resources import "
+                              "default_lock_path, schema_path; "
+                              "assert default_lock_path().is_file(); "
+                              "assert schema_path('generated-manifest.schema.json').is_file()"
+                          ),
+                      ],
+                      check=True,
+                      cwd=root,
+                  )
+                  subprocess.run(
+                      [str(environment / "bin" / "devops-stack"), "--version"],
+                      check=True,
+                      cwd=root,
+                  )
+          PY
+
+      - name: Verify wheel resources in an isolated prefix
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          wheel = next(Path("dist").glob("*.whl")).resolve()
+          with tempfile.TemporaryDirectory() as directory:
+              root = Path(directory)
+              prefix = root / "prefix"
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "--prefix", str(prefix), str(wheel)],
+                  check=True,
+              )
+              sites = sorted(prefix.rglob("site-packages")) + sorted(prefix.rglob("dist-packages"))
+              assert sites, prefix
+              environment = dict(os.environ)
+              environment["PYTHONPATH"] = os.pathsep.join(str(path) for path in sites)
+              subprocess.run(
+                  [
+                      sys.executable,
+                      "-c",
+                      (
+                          "from devops_stack_composer.resources import "
+                          "default_lock_path, schema_path; "
+                          "assert default_lock_path().is_file(); "
+                          "assert schema_path('devops-stack.schema.json').is_file()"
+                      ),
+                  ],
+                  check=True,
+                  cwd=root,
+                  env=environment,
+              )
+          PY
+
+  unit:
+    name: Unit tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip check
+
+      - name: Verify installed CLI and package data
+        run: |
+          devops-stack --version
+          python - <<'PY'
+          from pathlib import Path
+
+          import devops_stack_composer
+          from devops_stack_composer.resources import default_lock_path, schema_path
+
+          checkout = Path.cwd().resolve()
+          module = Path(devops_stack_composer.__file__).resolve()
+          assert not module.is_relative_to(checkout), module
+          assert default_lock_path().is_file()
+          assert schema_path("devops-stack.schema.json").is_file()
+          assert schema_path("templates-lock.schema.json").is_file()
+          assert schema_path("generated-manifest.schema.json").is_file()
+          PY
+
+      - name: Run unit tests against installed package
+        run: python -m unittest discover -s tests -v
+
+  locked-template-e2e:
+    name: Locked-template end-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Initialize isolated paths
+        run: |
+          {
+            echo "APP_ROOT=$RUNNER_TEMP/python-service"
+            echo "DEVOPS_STACK_CACHE=$RUNNER_TEMP/devops-stack-cache"
+            echo "INIT_ROOT=$RUNNER_TEMP/init-smoke"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up minimum supported Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip check
+          devops-stack --version
+
+      - name: Verify required adapter tools
+        run: |
+          git --version
+          pwsh --version
+          docker buildx version
+
+      - name: Prove init dry-run and explicit write behavior
+        run: |
+          mkdir "$INIT_ROOT"
+          devops-stack init \
+            --project "$INIT_ROOT" \
+            --dry-run > "$RUNNER_TEMP/init-preview.yaml"
+          test ! -e "$INIT_ROOT/devops-stack.yaml"
+          devops-stack init --project "$INIT_ROOT"
+          test -s "$INIT_ROOT/devops-stack.yaml"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          import yaml
+
+          init_root = Path(os.environ["INIT_ROOT"])
+          preview = yaml.safe_load((Path(os.environ["RUNNER_TEMP"]) / "init-preview.yaml").read_text())
+          written = yaml.safe_load((init_root / "devops-stack.yaml").read_text())
+          assert preview == written
+          assert written["metadata"]["annotations"]["devops-stack.io/review-required"] == "true"
+          PY
+
+      - name: Prepare and test the example application
+        run: |
+          test ! -e "$APP_ROOT"
+          cp -a examples/python-service "$APP_ROOT"
+          cd "$APP_ROOT"
+          python -m unittest discover -s tests -v
+          mkdir -p build
+          python -m zipapp app -o build/service.pyz
+          test -s build/service.pyz
+          PORT=18081 python build/service.pyz > "$RUNNER_TEMP/zipapp.log" 2>&1 &
+          SERVICE_PID=$!
+          trap 'kill "$SERVICE_PID" 2>/dev/null || true' EXIT
+          python - <<'PY'
+          import json
+          import time
+          from urllib.request import urlopen
+
+          for attempt in range(30):
+              try:
+                  with urlopen("http://127.0.0.1:18081/health", timeout=1) as response:
+                      assert response.status == 200
+                      assert json.loads(response.read()) == {"status": "healthy"}
+                  with urlopen("http://127.0.0.1:18081/ready", timeout=1) as response:
+                      assert response.status == 200
+                      assert json.loads(response.read()) == {"status": "ready"}
+                  break
+              except Exception:
+                  if attempt == 29:
+                      raise
+                  time.sleep(0.2)
+          PY
+          kill "$SERVICE_PID"
+          wait "$SERVICE_PID" || true
+          trap - EXIT
+
+      - name: Inspect the example application
+        run: |
+          devops-stack inspect \
+            --project "$APP_ROOT" \
+            --json > "$RUNNER_TEMP/inspect.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          inspection = json.loads((Path(os.environ["RUNNER_TEMP"]) / "inspect.json").read_text())
+          assert inspection["runtime"]["application_type"] == "python", inspection
+          assert inspection["test_command"], inspection
+          assert inspection["run_command"], inspection
+          assert inspection["health_endpoint"] == "/health", inspection
+          assert inspection["readiness_endpoint"] == "/ready", inspection
+          PY
+
+      - name: Resolve real locked template commits
+        run: |
+          devops-stack templates list \
+            --project "$APP_ROOT" \
+            --json > "$RUNNER_TEMP/templates.json"
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          lock = json.loads(Path("templates.lock.json").read_text())
+          resolved = json.loads((Path(os.environ["RUNNER_TEMP"]) / "templates.json").read_text())
+          cache = Path(os.environ["DEVOPS_STACK_CACHE"]).resolve()
+          assert set(resolved) == set(lock["templates"])
+          for key, pin in lock["templates"].items():
+              value = resolved[key]
+              assert value["matchesLock"] is True, (key, value)
+              assert value["resolvedCommit"] == pin["commit"], (key, value)
+              assert value["origin"] == "lock-remote", (key, value)
+              source = cache / pin["name"] / pin["commit"]
+              assert source.is_dir(), source
+              head = subprocess.run(
+                  ["git", "-C", str(source), "rev-parse", "HEAD"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout.strip()
+              status = subprocess.run(
+                  ["git", "-C", str(source), "status", "--porcelain=v1", "--untracked-files=all"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout
+              assert head == pin["commit"], (key, head, pin["commit"])
+              assert status == "", (key, status)
+          PY
+
+      - name: Capture immutable source inventories
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import stat
+          from pathlib import Path
+
+          def inventory(root, excluded):
+              root = root.resolve()
+              values = []
+              for path in sorted(root.rglob("*")):
+                  relative = path.relative_to(root).as_posix()
+                  if any(relative == item or relative.startswith(item + "/") for item in excluded):
+                      continue
+                  mode = path.lstat().st_mode
+                  entry = {
+                      "path": relative,
+                      "mode": f"0{stat.S_IMODE(mode):03o}",
+                  }
+                  if path.is_symlink():
+                      entry.update(type="symlink", target=os.readlink(path))
+                  elif path.is_dir():
+                      entry["type"] = "directory"
+                  elif path.is_file():
+                      entry.update(
+                          type="file",
+                          sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                      )
+                  else:
+                      entry["type"] = "other"
+                  values.append(entry)
+              return values
+
+          lock = json.loads(Path("templates.lock.json").read_text())
+          cache = Path(os.environ["DEVOPS_STACK_CACHE"]).resolve()
+          baseline = {
+              "application": inventory(
+                  Path(os.environ["APP_ROOT"]),
+                  {"generated", ".devops-stack"},
+              ),
+              "composer": inventory(Path.cwd(), {".git"}),
+              "templates": {
+                  key: inventory(cache / pin["name"] / pin["commit"], {".git"})
+                  for key, pin in sorted(lock["templates"].items())
+              },
+          }
+          target = Path(os.environ["RUNNER_TEMP"]) / "source-inventory-before.json"
+          target.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n")
+          PY
+
+      - name: Record host diagnostics with honest skips
+        run: |
+          devops-stack doctor \
+            --project "$APP_ROOT" \
+            --no-fetch \
+            --json > "$RUNNER_TEMP/doctor.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads((Path(os.environ["RUNNER_TEMP"]) / "doctor.json").read_text())
+          counts = report["counts"]
+          assert report["passed"] is True, report
+          assert counts["FAILED"] == 0, counts
+          assert counts["BLOCKED_MISSING_REQUIRED_TOOL"] == 0, counts
+          assert sum(counts.values()) == len(report["checks"]), counts
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as stream:
+              stream.write("## Doctor status counts\n\n")
+              for status, count in counts.items():
+                  stream.write(f"- `{status}`: {count}\n")
+          PY
+
+      - name: Prove preview performs no writes
+        run: |
+          test ! -e "$APP_ROOT/generated"
+          devops-stack generate \
+            --project "$APP_ROOT" \
+            --no-fetch \
+            --json > "$RUNNER_TEMP/preview.json"
+          test ! -e "$APP_ROOT/generated"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          value = json.loads((Path(os.environ["RUNNER_TEMP"]) / "preview.json").read_text())
+          assert value["write"] is False, value
+          assert value["validation"]["passed"] is True, value["validation"]
+          assert value["files"], value
+          assert all(item["action"] == "create" for item in value["files"]), value["files"]
+          assert not value["conflicts"], value
+          assert not value["stale"], value
+          assert not value["unowned"], value
+          assert not value["unsafe"], value
+          PY
+
+      - name: Write generated artifacts explicitly
+        run: |
+          devops-stack generate \
+            --project "$APP_ROOT" \
+            --no-fetch \
+            --write \
+            --json > "$RUNNER_TEMP/write.json"
+          test -s "$APP_ROOT/generated/.devops-stack-manifest.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          value = json.loads((Path(os.environ["RUNNER_TEMP"]) / "write.json").read_text())
+          assert value["write"] is True, value
+          assert value["validation"]["passed"] is True, value["validation"]
+          assert value["manifest"] == "generated/.devops-stack-manifest.json", value
+          PY
+
+      - name: Prove deterministic rerender and preview immutability
+        run: |
+          cd "$APP_ROOT"
+          find generated -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/before.sha256"
+          devops-stack generate \
+            --project "$APP_ROOT" \
+            --no-fetch \
+            --json > "$RUNNER_TEMP/rerender.json"
+          find generated -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/after.sha256"
+          diff -u "$RUNNER_TEMP/before.sha256" "$RUNNER_TEMP/after.sha256"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          value = json.loads((Path(os.environ["RUNNER_TEMP"]) / "rerender.json").read_text())
+          assert value["write"] is False, value
+          assert value["validation"]["passed"] is True, value["validation"]
+          assert value["files"], value
+          assert all(item["action"] == "unchanged" for item in value["files"]), value["files"]
+          assert not value["conflicts"], value
+          assert not value["stale"], value
+          assert not value["unowned"], value
+          assert not value["unsafe"], value
+          PY
+
+      - name: Validate manifest integrity and composition
+        run: |
+          devops-stack validate \
+            --project "$APP_ROOT" \
+            --no-fetch \
+            --json > "$RUNNER_TEMP/validate.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads((Path(os.environ["RUNNER_TEMP"]) / "validate.json").read_text())
+          counts = report["counts"]
+          assert report["passed"] is True, report
+          assert counts["FAILED"] == 0, counts
+          assert counts["BLOCKED_MISSING_REQUIRED_TOOL"] == 0, counts
+          assert sum(counts.values()) == len(report["checks"]), counts
+          checks = {item["check"]: item["status"] for item in report["checks"]}
+          required = {
+              "generated.file-integrity",
+              "generated.config-hash",
+              "generated.template-versions",
+              "generated.planned-content",
+          }
+          assert required <= checks.keys(), checks
+          assert all(checks[name] == "PASSED" for name in required), checks
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as stream:
+              stream.write("\n## End-to-end validation counts\n\n")
+              for status, count in counts.items():
+                  stream.write(f"- `{status}`: {count}\n")
+          PY
+
+      - name: Build the single-platform example image without pushing
+        run: |
+          IMAGE_TAG="e2e-${GITHUB_SHA::12}"
+          devops-stack validate \
+            --project "$APP_ROOT" \
+            --no-fetch \
+            --build-image \
+            --image-tag "$IMAGE_TAG" \
+            --json > "$RUNNER_TEMP/local-build.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads((Path(os.environ["RUNNER_TEMP"]) / "local-build.json").read_text())
+          checks = {item["check"]: item for item in report["checks"]}
+          local_build = checks["adapter.docker.docker-local-build"]
+          assert report["passed"] is True, report
+          assert local_build["status"] == "PASSED", local_build
+          assert local_build["command"] == ["sh", "scripts/build-image.sh"], local_build
+          assert not any("push-image.sh" in " ".join(item.get("command", [])) for item in report["checks"])
+          PY
+          CONTAINER_NAME="devops-stack-e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker run --detach --rm \
+            --name "$CONTAINER_NAME" \
+            --publish 127.0.0.1:18082:8000 \
+            "ghcr.io/k4nul/devops-stack-composer-example:$IMAGE_TAG"
+          trap 'docker rm --force "$CONTAINER_NAME" >/dev/null 2>&1 || true' EXIT
+          python - <<'PY'
+          import json
+          import time
+          from urllib.request import urlopen
+
+          for attempt in range(30):
+              try:
+                  with urlopen("http://127.0.0.1:18082/health", timeout=1) as response:
+                      assert response.status == 200
+                      assert json.loads(response.read()) == {"status": "healthy"}
+                  with urlopen("http://127.0.0.1:18082/ready", timeout=1) as response:
+                      assert response.status == 200
+                      assert json.loads(response.read()) == {"status": "ready"}
+                  break
+              except Exception:
+                  if attempt == 29:
+                      raise
+                  time.sleep(0.2)
+          PY
+          docker rm --force "$CONTAINER_NAME"
+          trap - EXIT
+
+      - name: Require an empty generated diff
+        run: |
+          devops-stack diff \
+            --project "$APP_ROOT" \
+            --no-fetch \
+            --against generated \
+            --json > "$RUNNER_TEMP/diff.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          differences = json.loads((Path(os.environ["RUNNER_TEMP"]) / "diff.json").read_text())
+          assert differences, differences
+          assert all(item["status"] == "unchanged" for item in differences), differences
+          assert all(item["diff"] == "" for item in differences), differences
+          PY
+
+      - name: Generate and verify validation reports
+        run: |
+          devops-stack report \
+            --project "$APP_ROOT" \
+            --no-fetch \
+            --json > "$RUNNER_TEMP/report.json"
+          test -s "$APP_ROOT/.devops-stack/reports/devops-stack-report.md"
+          test -s "$APP_ROOT/.devops-stack/reports/devops-stack-report.json"
+          cmp "$RUNNER_TEMP/report.json" "$APP_ROOT/.devops-stack/reports/devops-stack-report.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads((Path(os.environ["RUNNER_TEMP"]) / "report.json").read_text())
+          assert report["validation"]["passed"] is True, report["validation"]
+          assert report["manifest"]["clean"] is True, report["manifest"]
+          assert {item["name"] for item in report["adapters"]} == {
+              "docker",
+              "jenkins",
+              "kubernetes",
+          }
+          PY
+
+      - name: Verify template and composer checkout cleanliness
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import hashlib
+          import stat
+          import subprocess
+          from pathlib import Path
+
+          lock = json.loads(Path("templates.lock.json").read_text())
+          cache = Path(os.environ["DEVOPS_STACK_CACHE"]).resolve()
+
+          def inventory(root, excluded):
+              root = root.resolve()
+              values = []
+              for path in sorted(root.rglob("*")):
+                  relative = path.relative_to(root).as_posix()
+                  if any(relative == item or relative.startswith(item + "/") for item in excluded):
+                      continue
+                  mode = path.lstat().st_mode
+                  entry = {
+                      "path": relative,
+                      "mode": f"0{stat.S_IMODE(mode):03o}",
+                  }
+                  if path.is_symlink():
+                      entry.update(type="symlink", target=os.readlink(path))
+                  elif path.is_dir():
+                      entry["type"] = "directory"
+                  elif path.is_file():
+                      entry.update(
+                          type="file",
+                          sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                      )
+                  else:
+                      entry["type"] = "other"
+                  values.append(entry)
+              return values
+
+          current = {
+              "application": inventory(
+                  Path(os.environ["APP_ROOT"]),
+                  {"generated", ".devops-stack"},
+              ),
+              "composer": inventory(Path.cwd(), {".git"}),
+              "templates": {
+                  key: inventory(cache / pin["name"] / pin["commit"], {".git"})
+                  for key, pin in sorted(lock["templates"].items())
+              },
+          }
+          baseline = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "source-inventory-before.json").read_text()
+          )
+          assert current == baseline, {
+              key: current[key] != baseline[key]
+              for key in current
+          }
+          for key, pin in lock["templates"].items():
+              source = cache / pin["name"] / pin["commit"]
+              head = subprocess.run(
+                  ["git", "-C", str(source), "rev-parse", "HEAD"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout.strip()
+              status = subprocess.run(
+                  ["git", "-C", str(source), "status", "--porcelain=v1", "--untracked-files=all"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout
+              assert head == pin["commit"], (key, head, pin["commit"])
+              assert status == "", (key, status)
+
+          composer_status = subprocess.run(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout
+          assert composer_status == "", composer_status
+          PY

@@ -151,6 +151,33 @@ class CliTests(unittest.TestCase):
                 )
             self.assertTrue((root / "generated" / ".devops-stack-manifest.json").is_file())
 
+    def test_generate_preview_never_runs_an_optional_local_build(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for preview_mode in ([], ["--dry-run"]):
+                with self.subTest(preview_mode=preview_mode):
+                    with patch("devops_stack_composer.cli._composition") as composition:
+                        stderr = io.StringIO()
+                        with contextlib.redirect_stderr(stderr):
+                            result = main(
+                                [
+                                    "generate",
+                                    "--project",
+                                    str(root),
+                                    *preview_mode,
+                                    "--build-image",
+                                    "--image-tag",
+                                    "local-smoke",
+                                ]
+                            )
+                    self.assertEqual(result, 2)
+                    self.assertIn(
+                        "--build-image is only valid together with --write",
+                        stderr.getvalue(),
+                    )
+                    composition.assert_not_called()
+                    self.assertFalse((root / "generated").exists())
+
     def test_generate_blocks_user_edits_unless_force_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

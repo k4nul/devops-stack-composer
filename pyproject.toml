@@ -7,7 +7,7 @@ name = "devops-stack-composer"
 version = "0.1.0"
 description = "Compose Docker, Jenkins, and Kubernetes templates from one declarative contract"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = {file = "LICENSE"}
 dependencies = [
   "jsonschema>=3.2,<5",
@@ -30,3 +30,7 @@ devops-stack = "devops_stack_composer.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.data-files]
+"share/devops-stack-composer" = ["templates.lock.json"]
+"share/devops-stack-composer/schemas" = ["schemas/*.json"]
