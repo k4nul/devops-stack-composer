@@ -9,6 +9,10 @@ description = "Compose Docker, Jenkins, and Kubernetes templates from one declar
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
+dependencies = [
+  "jsonschema>=3.2,<5",
+  "PyYAML>=5.4,<7",
+]
 authors = [
   {name = "k4nul"},
 ]

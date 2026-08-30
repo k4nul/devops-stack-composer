@@ -1,0 +1,123 @@
+apiVersion: devops-stack.io/v1alpha1
+kind: DevOpsStack
+metadata:
+  name: sample-api
+  annotations:
+    devops-stack.io/source: fixture
+application:
+  name: sample-api
+  serviceName: sample-api
+  type: python
+  root: .
+  buildCommand: python -m compileall app
+  testCommand: python -m unittest discover -s tests
+  runCommand: python app/server.py
+  buildArtifact: app
+image:
+  registry: ghcr.io
+  repository: k4nul/sample-api
+  tag:
+    strategy: branch-sha
+  architectures:
+    - linux/amd64
+    - linux/arm64
+build:
+  context: .
+  dockerfile:
+    strategy: generated
+  multiStage: true
+  reproducible: true
+  cache:
+    enabled: true
+    from: []
+    to: []
+ci:
+  jenkins:
+    credentialId: ghcr-credentials
+  branches:
+    dev:
+      - develop
+      - feature/*
+    staging:
+      - staging
+      - release/*
+    production:
+      - main
+  approval:
+    production: true
+deployment:
+  namespace: sample-api
+  replicas: 1
+  containerPort: 8080
+  service:
+    type: ClusterIP
+    port: 80
+  health:
+    path: /health
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  readiness:
+    path: /ready
+    initialDelaySeconds: 2
+    periodSeconds: 5
+  environment:
+    LOG_LEVEL: info
+    FEATURE_FLAG: false
+  secretRefs:
+    - name: sample-api-secrets
+      keys:
+        - DATABASE_URL
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  rollout:
+    strategy: RollingUpdate
+    maxUnavailable: 0
+    maxSurge: 1
+  rollback:
+    enabled: true
+    revisionHistoryLimit: 10
+environments:
+  dev:
+    namespace: sample-api-dev
+    environment:
+      LOG_LEVEL: debug
+  staging:
+    namespace: sample-api-staging
+    replicas: 2
+  production:
+    namespace: sample-api-production
+    replicas: 3
+    resources:
+      requests:
+        cpu: 250m
+      limits:
+        cpu: "1"
+        memory: 512Mi
+supplyChain:
+  sbom:
+    enabled: true
+    format: spdx-json
+  provenance:
+    enabled: true
+    mode: max
+  scan:
+    enabled: true
+    failOn: high
+security:
+  runAsNonRoot: true
+  runAsUser: 10001
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  seccompProfile: RuntimeDefault
+  serviceAccount: sample-api
+policies:
+  production:
+    minimumReplicas: 2
+    requireApproval: true
+    requireResourceLimits: true
+    requireReadOnlyRootFilesystem: true

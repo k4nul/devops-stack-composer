@@ -1,0 +1,507 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/k4nul/devops-stack-composer/schemas/devops-stack.schema.json",
+  "title": "DevOps Stack configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "application",
+    "image",
+    "build",
+    "ci",
+    "environments",
+    "deployment",
+    "supplyChain",
+    "security",
+    "policies"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "devops-stack.io/v1alpha1",
+      "examples": ["devops-stack.io/v1alpha1"]
+    },
+    "kind": {
+      "const": "DevOpsStack",
+      "examples": ["DevOpsStack"]
+    },
+    "metadata": {
+      "$ref": "#/definitions/metadata"
+    },
+    "application": {
+      "$ref": "#/definitions/application"
+    },
+    "image": {
+      "$ref": "#/definitions/image"
+    },
+    "build": {
+      "$ref": "#/definitions/build"
+    },
+    "ci": {
+      "$ref": "#/definitions/ci"
+    },
+    "environments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dev", "staging", "production"],
+      "properties": {
+        "dev": {"$ref": "#/definitions/environmentOverride"},
+        "staging": {"$ref": "#/definitions/environmentOverride"},
+        "production": {"$ref": "#/definitions/environmentOverride"}
+      }
+    },
+    "deployment": {
+      "$ref": "#/definitions/deployment"
+    },
+    "supplyChain": {
+      "$ref": "#/definitions/supplyChain"
+    },
+    "security": {
+      "$ref": "#/definitions/security"
+    },
+    "policies": {
+      "$ref": "#/definitions/policies"
+    }
+  },
+  "definitions": {
+    "dnsLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$",
+      "examples": ["orders-api"]
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"$ref": "#/definitions/dnsLabel"},
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {"type": "string"},
+          "default": {}
+        }
+      }
+    },
+    "application": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "serviceName",
+        "type",
+        "root",
+        "buildCommand",
+        "testCommand",
+        "runCommand",
+        "buildArtifact"
+      ],
+      "properties": {
+        "name": {"$ref": "#/definitions/dnsLabel"},
+        "serviceName": {"$ref": "#/definitions/dnsLabel"},
+        "type": {
+          "type": "string",
+          "enum": ["nodejs", "python", "java", "go", "rust", "static"],
+          "examples": ["python"]
+        },
+        "root": {"$ref": "#/definitions/relativePath"},
+        "buildCommand": {"type": "string", "minLength": 1, "examples": ["python -m compileall app"]},
+        "testCommand": {"type": "string", "minLength": 1, "examples": ["python -m unittest"]},
+        "runCommand": {"type": "string", "minLength": 1, "examples": ["python app.py"]},
+        "buildArtifact": {"$ref": "#/definitions/relativePath"}
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["registry", "repository", "tag", "architectures"],
+      "properties": {
+        "registry": {"type": "string", "minLength": 1, "examples": ["ghcr.io"]},
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9][a-z0-9._/-]*$",
+          "examples": ["acme/orders-api"]
+        },
+        "tag": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy"],
+          "properties": {
+            "strategy": {
+              "type": "string",
+              "enum": ["branch-sha", "git-sha", "semver", "fixed"],
+              "examples": ["branch-sha"]
+            },
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$",
+              "examples": ["1.0.0"]
+            }
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"strategy": {"const": "fixed"}}},
+              "then": {"required": ["value"]},
+              "else": {"not": {"required": ["value"]}}
+            }
+          ]
+        },
+        "architectures": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["linux/amd64", "linux/arm64"]
+          },
+          "examples": [["linux/amd64"]]
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["context", "dockerfile", "multiStage", "reproducible", "cache"],
+      "properties": {
+        "context": {"$ref": "#/definitions/relativePath"},
+        "dockerfile": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy"],
+          "properties": {
+            "strategy": {
+              "type": "string",
+              "enum": ["generated", "existing"],
+              "examples": ["generated"]
+            },
+            "path": {"$ref": "#/definitions/relativePath"}
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"strategy": {"const": "existing"}}},
+              "then": {"required": ["path"]}
+            }
+          ]
+        },
+        "multiStage": {"type": "boolean", "examples": [true]},
+        "reproducible": {"type": "boolean", "examples": [true]},
+        "cache": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "from", "to"],
+          "properties": {
+            "enabled": {"type": "boolean", "examples": [true]},
+            "from": {"type": "array", "items": {"type": "string"}, "default": []},
+            "to": {"type": "array", "items": {"type": "string"}, "default": []}
+          }
+        }
+      }
+    },
+    "ci": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jenkins", "branches", "approval"],
+      "properties": {
+        "jenkins": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["credentialId"],
+          "properties": {
+            "credentialId": {"type": "string", "minLength": 1, "examples": ["container-registry"]}
+          }
+        },
+        "branches": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dev", "staging", "production"],
+          "properties": {
+            "dev": {"$ref": "#/definitions/branchList"},
+            "staging": {"$ref": "#/definitions/branchList"},
+            "production": {"$ref": "#/definitions/branchList"}
+          }
+        },
+        "approval": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["production"],
+          "properties": {
+            "production": {"type": "boolean", "examples": [true]}
+          }
+        }
+      }
+    },
+    "branchList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1},
+      "examples": [["main"]]
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "namespace",
+        "replicas",
+        "containerPort",
+        "service",
+        "health",
+        "readiness",
+        "environment",
+        "secretRefs",
+        "resources",
+        "rollout",
+        "rollback"
+      ],
+      "properties": {
+        "namespace": {"$ref": "#/definitions/dnsLabel"},
+        "replicas": {"type": "integer", "minimum": 1, "examples": [2]},
+        "containerPort": {"$ref": "#/definitions/port"},
+        "service": {"$ref": "#/definitions/service"},
+        "health": {"$ref": "#/definitions/probe"},
+        "readiness": {"$ref": "#/definitions/probe"},
+        "environment": {"$ref": "#/definitions/environmentValues"},
+        "secretRefs": {"$ref": "#/definitions/secretRefs"},
+        "resources": {"$ref": "#/definitions/resources"},
+        "rollout": {"$ref": "#/definitions/rollout"},
+        "rollback": {"$ref": "#/definitions/rollback"}
+      }
+    },
+    "environmentOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "namespace": {"$ref": "#/definitions/dnsLabel"},
+        "replicas": {"type": "integer", "minimum": 1, "examples": [2]},
+        "containerPort": {"$ref": "#/definitions/port"},
+        "service": {"$ref": "#/definitions/serviceOverride"},
+        "health": {"$ref": "#/definitions/probeOverride"},
+        "readiness": {"$ref": "#/definitions/probeOverride"},
+        "environment": {"$ref": "#/definitions/environmentValues"},
+        "secretRefs": {"$ref": "#/definitions/secretRefs"},
+        "resources": {"$ref": "#/definitions/resourcesOverride"},
+        "rollout": {"$ref": "#/definitions/rolloutOverride"},
+        "rollback": {"$ref": "#/definitions/rollbackOverride"}
+      }
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "examples": [8080]
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "port"],
+      "properties": {
+        "type": {"type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"], "examples": ["ClusterIP"]},
+        "port": {"$ref": "#/definitions/port"}
+      }
+    },
+    "serviceOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {"type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"], "examples": ["ClusterIP"]},
+        "port": {"$ref": "#/definitions/port"}
+      }
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "initialDelaySeconds", "periodSeconds"],
+      "properties": {
+        "path": {"type": "string", "pattern": "^/", "examples": ["/health"]},
+        "initialDelaySeconds": {"type": "integer", "minimum": 0, "examples": [5]},
+        "periodSeconds": {"type": "integer", "minimum": 1, "examples": [10]}
+      }
+    },
+    "probeOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {"type": "string", "pattern": "^/", "examples": ["/health"]},
+        "initialDelaySeconds": {"type": "integer", "minimum": 0, "examples": [5]},
+        "periodSeconds": {"type": "integer", "minimum": 1, "examples": [10]}
+      }
+    },
+    "environmentValues": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[A-Z_][A-Z0-9_]*$"},
+      "additionalProperties": {"type": ["string", "number", "boolean"]},
+      "default": {}
+    },
+    "secretRefs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "keys"],
+        "properties": {
+          "name": {"$ref": "#/definitions/dnsLabel"},
+          "keys": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$"}
+          }
+        }
+      },
+      "default": []
+    },
+    "quantityMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu": {"type": "string", "pattern": "^(?:[0-9]+m|[0-9]+(?:\\.[0-9]+)?)$", "examples": ["100m"]},
+        "memory": {"type": "string", "pattern": "^[0-9]+(?:Ki|Mi|Gi|Ti)$", "examples": ["128Mi"]}
+      },
+      "required": ["cpu", "memory"]
+    },
+    "quantityMapOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu": {"type": "string", "pattern": "^(?:[0-9]+m|[0-9]+(?:\\.[0-9]+)?)$", "examples": ["100m"]},
+        "memory": {"type": "string", "pattern": "^[0-9]+(?:Ki|Mi|Gi|Ti)$", "examples": ["128Mi"]}
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": {"$ref": "#/definitions/quantityMap"},
+        "limits": {"$ref": "#/definitions/quantityMap"}
+      }
+    },
+    "resourcesOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": {"$ref": "#/definitions/quantityMapOverride"},
+        "limits": {"$ref": "#/definitions/quantityMapOverride"}
+      }
+    },
+    "rollout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "maxUnavailable", "maxSurge"],
+      "properties": {
+        "strategy": {"type": "string", "const": "RollingUpdate", "examples": ["RollingUpdate"]},
+        "maxUnavailable": {"type": ["integer", "string"], "examples": [0]},
+        "maxSurge": {"type": ["integer", "string"], "examples": [1]}
+      }
+    },
+    "rolloutOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {"type": "string", "const": "RollingUpdate", "examples": ["RollingUpdate"]},
+        "maxUnavailable": {"type": ["integer", "string"], "examples": [0]},
+        "maxSurge": {"type": ["integer", "string"], "examples": [1]}
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "revisionHistoryLimit"],
+      "properties": {
+        "enabled": {"type": "boolean", "examples": [true]},
+        "revisionHistoryLimit": {"type": "integer", "minimum": 1, "examples": [10]}
+      }
+    },
+    "rollbackOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean", "examples": [true]},
+        "revisionHistoryLimit": {"type": "integer", "minimum": 1, "examples": [10]}
+      }
+    },
+    "supplyChain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sbom", "provenance", "scan"],
+      "properties": {
+        "sbom": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "format"],
+          "properties": {
+            "enabled": {"type": "boolean", "examples": [true]},
+            "format": {"type": "string", "enum": ["spdx-json", "cyclonedx-json"], "examples": ["spdx-json"]}
+          }
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "mode"],
+          "properties": {
+            "enabled": {"type": "boolean", "examples": [true]},
+            "mode": {"type": "string", "enum": ["min", "max"], "examples": ["max"]}
+          }
+        },
+        "scan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "failOn"],
+          "properties": {
+            "enabled": {"type": "boolean", "examples": [true]},
+            "failOn": {"type": "string", "enum": ["critical", "high", "medium", "never"], "examples": ["high"]}
+          }
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runAsNonRoot",
+        "runAsUser",
+        "readOnlyRootFilesystem",
+        "allowPrivilegeEscalation",
+        "seccompProfile",
+        "serviceAccount"
+      ],
+      "properties": {
+        "runAsNonRoot": {"type": "boolean", "examples": [true]},
+        "runAsUser": {"type": "integer", "minimum": 1, "examples": [10001]},
+        "readOnlyRootFilesystem": {"type": "boolean", "examples": [true]},
+        "allowPrivilegeEscalation": {"type": "boolean", "examples": [false]},
+        "seccompProfile": {"type": "string", "enum": ["RuntimeDefault", "Localhost"], "examples": ["RuntimeDefault"]},
+        "serviceAccount": {"$ref": "#/definitions/dnsLabel"}
+      }
+    },
+    "policies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["production"],
+      "properties": {
+        "production": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minimumReplicas", "requireApproval", "requireResourceLimits", "requireReadOnlyRootFilesystem"],
+          "properties": {
+            "minimumReplicas": {"type": "integer", "minimum": 2, "examples": [2]},
+            "requireApproval": {"type": "boolean", "examples": [true]},
+            "requireResourceLimits": {"type": "boolean", "examples": [true]},
+            "requireReadOnlyRootFilesystem": {"type": "boolean", "examples": [true]}
+          }
+        }
+      }
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$",
+      "examples": ["."]
+    }
+  }
+}
