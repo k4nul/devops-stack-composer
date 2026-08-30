@@ -49,7 +49,7 @@ spec:
   ports:
   - name: http
     port: 8080
-    targetPort: 8080
+    targetPort: 8000
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -71,7 +71,7 @@ spec:
         readinessProbe:
           httpGet:
             path: /ready
-            port: 8080
+            port: 8000
 """
     return ResolvedKubernetesManifest(
         environment="staging",
@@ -172,7 +172,8 @@ class FakeKubectlRunner:
         self.pod_output_truncated = False
         self.forward_started = threading.Event()
         self.forward_stopped = threading.Event()
-        self.forward_readiness = "Forwarding from 127.0.0.1:45123 -> 8080\n"
+        self.service_target_port = 8000
+        self.forward_readiness = "Forwarding from 127.0.0.1:45123 -> 8000\n"
         self.forward_cleanup_succeeds = True
         self.cancellation_token: CancellationToken | None = None
 
@@ -335,8 +336,7 @@ class FakeKubectlRunner:
             ]
         }
 
-    @staticmethod
-    def _service() -> dict[str, object]:
+    def _service(self) -> dict[str, object]:
         return {
             "apiVersion": "v1",
             "kind": "Service",
@@ -347,7 +347,7 @@ class FakeKubectlRunner:
                     {
                         "name": "http",
                         "port": 8080,
-                        "targetPort": 8080,
+                        "targetPort": self.service_target_port,
                         "protocol": "TCP",
                     }
                 ],
@@ -592,6 +592,20 @@ users:
 
         self.assertEqual(raised.exception.code, "RUNTIME_DIGEST_MISMATCH")
         self.assertEqual(raised.exception.identity.runtime_digest, OTHER_DIGEST)
+        self.assertFalse(self.runner.forward_started.is_set())
+        self.assertEqual(self.http.calls, [])
+
+    def test_rejects_applied_service_target_port_drift_before_smoke(self) -> None:
+        self.runner.service_target_port = 9090
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(raised.exception.code, "SERVICE_TARGET_PORT_MISMATCH")
         self.assertFalse(self.runner.forward_started.is_set())
         self.assertEqual(self.http.calls, [])
 

@@ -216,6 +216,7 @@ class _ValidatedManifest:
     identity: KubernetesArtifactIdentity
     documents: tuple[Mapping[str, object], ...]
     namespace_document: Mapping[str, object]
+    service_target_port: int
 
 
 def _loopback_http_get(
@@ -569,12 +570,19 @@ class KubernetesExecutor:
             service_path = self.store.write_json(
                 "kubernetes/applied-service.json", service
             )
-            self._service_contract(
+            applied_target_port = self._service_contract(
                 service,
                 namespace=manifest.namespace,
                 identity=identity,
                 stage=stage,
             )
+            if applied_target_port != validated.service_target_port:
+                raise KubernetesExecutionError(
+                    "SERVICE_TARGET_PORT_MISMATCH",
+                    stage,
+                    "applied Service targetPort differs from the validated manifest",
+                    identity=identity,
+                )
 
             stage = "runtime-attestation"
             pod_result = self._kubectl(
@@ -615,7 +623,11 @@ class KubernetesExecutor:
                 )
 
             stage = "smoke"
-            health, readiness = self._smoke(manifest.namespace, identity)
+            health, readiness = self._smoke(
+                manifest.namespace,
+                identity,
+                target_port=applied_target_port,
+            )
             for probe in (health, readiness):
                 if probe.status_code != 200:
                     raise KubernetesExecutionError(
@@ -758,7 +770,7 @@ class KubernetesExecutor:
                 namespace=namespace,
                 identity=identity,
             )
-            self._manifest_service(
+            service_target_port = self._manifest_service(
                 documents,
                 namespace=namespace,
                 identity=identity,
@@ -782,7 +794,12 @@ class KubernetesExecutor:
                 identity=identity,
             )
         self._require_exact_reference(manifest_reference, identity, stage)
-        return _ValidatedManifest(identity, documents, namespace_document)
+        return _ValidatedManifest(
+            identity,
+            documents,
+            namespace_document,
+            service_target_port,
+        )
 
     def _manifest_namespace(
         self,
@@ -842,7 +859,7 @@ class KubernetesExecutor:
         *,
         namespace: str,
         identity: KubernetesArtifactIdentity,
-    ) -> None:
+    ) -> int:
         matches = [
             document
             for document in documents
@@ -857,7 +874,7 @@ class KubernetesExecutor:
                 f"expected exactly one Service named {self.service_name}",
                 identity=identity,
             )
-        self._service_contract(
+        return self._service_contract(
             matches[0],
             namespace=namespace,
             identity=identity,
@@ -998,7 +1015,7 @@ class KubernetesExecutor:
         namespace: str,
         identity: KubernetesArtifactIdentity,
         stage: str,
-    ) -> None:
+    ) -> int:
         metadata = service.get("metadata")
         metadata = metadata if isinstance(metadata, Mapping) else {}
         if metadata.get("name") != self.service_name or metadata.get("namespace") != namespace:
@@ -1032,6 +1049,19 @@ class KubernetesExecutor:
                 f"Service must expose one TCP port {self.service_port}",
                 identity=identity,
             )
+        target_port = matches[0].get("targetPort")
+        if (
+            isinstance(target_port, bool)
+            or not isinstance(target_port, int)
+            or not 1 <= target_port <= 65535
+        ):
+            raise KubernetesExecutionError(
+                "SERVICE_TARGET_PORT_INVALID",
+                stage,
+                "Service targetPort must be an integer from 1 through 65535",
+                identity=identity,
+            )
+        return target_port
 
     def _ready_pod(
         self,
@@ -1444,13 +1474,15 @@ class KubernetesExecutor:
         self,
         namespace: str,
         identity: KubernetesArtifactIdentity,
+        *,
+        target_port: int,
     ) -> tuple[HttpSmokeResult, HttpSmokeResult]:
         parent_token = getattr(self.runner, "cancellation_token", None)
         if parent_token is not None and not isinstance(parent_token, CancellationToken):
             parent_token = None
         readiness = re.compile(
             rf"(?m)^Forwarding from 127\.0\.0\.1:([1-9][0-9]{{0,4}})"
-            rf" -> {self.service_port}\r?$"
+            rf" -> {target_port}\r?$"
         )
         try:
             managed = self._start_kubectl(
