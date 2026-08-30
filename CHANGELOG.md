@@ -11,6 +11,12 @@
   same-digest rollback test.
 - Add closed offline evidence bundles, runtime JSON schemas, artifact inspection and
   verification commands, and Jenkins digest-propagation contracts.
+- Add explicit execution planning, inspection, recovery cleanup, and cumulative
+  `static`, `supply-chain`, `kind-e2e`, and post-publication `release` CLI flows.
+- Add deterministic wheel/sdist inspection, package SBOM, closed release assets,
+  GitHub artifact attestations, and independent published-download verification.
+- Add checksum-pinned real kind CI, dependency/static quality gates, a tag-driven
+  release workflow, and execution, evidence, threat-model, and release guides.
 - Preserve the v0.1 configuration and static generation workflow without requiring
   execution tooling.
 

@@ -147,3 +147,58 @@ Exit code 2 indicates an argument, path, configuration, lock, source-resolution,
 IO error caught at the CLI boundary. Exit code 1 means the command completed enough to
 produce a validation report, but at least one required check did not pass. Use JSON
 output and the first failing check to distinguish them.
+
+## `kind-e2e` is blocked before building
+
+Run the profile-aware diagnosis and resolve the first
+`BLOCKED_MISSING_REQUIRED_TOOL` result:
+
+```sh
+devops-stack doctor \
+  --project examples/python-service \
+  --profile kind-e2e \
+  --json
+```
+
+The supported Linux CI versions can be installed into an empty private directory
+with `scripts/install-kind-e2e-tools.sh`. A different kind version is rejected because
+the node image and lifecycle behavior are pinned together. Confirm that Docker is
+reachable by the current user and that Buildx works before changing any timeout.
+
+## Registry or cluster creation timed out
+
+Inspect the failed run rather than deleting similarly named resources:
+
+```sh
+devops-stack execution show --project examples/python-service --run RUN_ID --json
+devops-stack execution cleanup --project examples/python-service --run RUN_ID --json
+```
+
+The cleanup command requires exact sealed IDs and ownership. If it reports a
+collision or mismatch, preserve the resource and investigate manually; do not use a
+broad Docker prune or delete every kind cluster. Check bounded `registry.log`, the
+state transition error category, Docker disk capacity, and proxy/network policy.
+
+## Rollout, smoke, or runtime digest failed
+
+Use `deployment.json`, `kubernetes/runtime-pods.json`, `smoke.json`, and the bounded
+Kubernetes diagnostics in the run directory. A healthy rendered manifest is not a
+substitute for API-observed workload state. In particular, do not change the manifest
+back to a mutable tag to make a pull succeed: repair registry connectivity or image
+identity and start a new run ID.
+
+## Evidence verification failed
+
+Do not edit `SHA256SUMS`, `checksums.json`, or a result field to repair a bundle.
+Unknown, missing, linked, or changed files make the run noncanonical. Preserve it for
+diagnosis and create a new execution. A structurally valid failed bundle still has
+`executionSucceeded: false`; that is expected and must not be upgraded.
+
+## Release profile cannot download or verify attestations
+
+Confirm that `vVERSION` exists, every release asset is present, and GitHub CLI can
+authenticate. In CI, `GH_TOKEN` is scoped to GitHub CLI by the safe runner. Locally,
+use the GitHub CLI credential store or pass the token only to the command. The
+attestation must name this repository, `.github/workflows/release.yml`, the exact tag
+ref, and the exact source commit. Replacing an asset after publication intentionally
+causes failure; publish a new version instead.

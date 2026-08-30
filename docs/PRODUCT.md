@@ -29,6 +29,10 @@ namespaces, secret references, build artifact, and branch-to-environment routing
 6. Run `devops-stack generate --write` to write each validated artifact atomically
    under `generated/` and record their ownership manifest.
 7. Run `devops-stack validate`, `diff`, `explain`, and `report` as review and CI gates.
+8. Preview `devops-stack execution plan` and, when real local proof is required, run
+   the explicit `kind-e2e` profile.
+9. Verify the resulting closed evidence from disk and retain or publish it according
+   to the release policy.
 
 Generation is preview-only unless `--write` is present. A failed validation never
 writes generated artifacts. `--force` permits replacement of explicitly listed
@@ -51,6 +55,8 @@ The current adapters generate:
   validation summary.
 
 Reports are written separately to `.devops-stack/reports/` in Markdown and JSON.
+Opt-in execution writes run-isolated state and evidence below the configured
+`.devops-stack` work directory; it never changes the generated source tree.
 
 ## Guarantees and limits
 
@@ -60,13 +66,15 @@ writes, and explicit status reporting. `PASSED` is never substituted for an
 unavailable validator: optional gaps are `SKIPPED_MISSING_OPTIONAL_TOOL`, while
 missing required tooling is `BLOCKED_MISSING_REQUIRED_TOOL` and fails the run.
 
-The composer is not a Jenkins controller, a Kubernetes cluster manager, a registry,
-or a secrets manager. It does not create credentials or Kubernetes Secret values.
+The composer is not a Jenkins controller, a production Kubernetes cluster manager,
+an external registry, or a secrets manager. Its v0.2 executor manages only a
+short-lived loopback registry and an ownership-sealed local kind cluster. It does not
+create credentials or Kubernetes Secret values.
 It does not claim Docker cache wiring because the locked Docker template has no
 official cache input. Standalone Groovy parsing, when installed, is not equivalent to
 controller-backed Jenkins plugin validation.
 
-The project is currently version `0.1.0` and classified as alpha. Review generated
+The project is currently version `0.2.0` and classified as alpha. Review generated
 artifacts and validate them in the same toolchain used for deployment.
 
 ## Independence and licensing

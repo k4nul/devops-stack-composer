@@ -5,7 +5,7 @@ Docker build, Jenkins delivery pipeline, and Kubernetes deployment tree. It is a
 orchestration layer over three independent public templates: it pins and invokes
 their supported interfaces instead of copying their repositories into this one.
 
-The current release is `v0.1.0` and the configuration API is
+The current release is `v0.2.0` and the configuration API remains
 `devops-stack.io/v1alpha1`.
 
 ## What it provides
@@ -18,6 +18,9 @@ The current release is `v0.1.0` and the configuration API is
 - artifact-derived cross-project contract and production-policy checks;
 - preview-first, atomic, project-contained writes with ownership and mode tracking;
 - human and JSON diff, validation, provenance explanation, doctor, and reports;
+- opt-in build-once supply-chain and real Docker/registry/kind execution profiles;
+- immutable digest propagation through rendered, applied, and running workloads;
+- closed, tamper-evident execution and release evidence with safe recovery cleanup;
 - explicit `PASSED`, `FAILED`, `SKIPPED_MISSING_OPTIONAL_TOOL`, and
   `BLOCKED_MISSING_REQUIRED_TOOL` evidence states.
 
@@ -25,7 +28,10 @@ The current release is `v0.1.0` and the configuration API is
 
 Python 3.10-3.12, Git, PowerShell 7 (`pwsh`), Docker, and Docker Buildx are required for
 normal locked-template composition. Java/Groovy and Kubernetes or supply-chain
-validators are optional and remain visible as skipped when unavailable.
+validators are optional for static composition and remain visible as skipped when
+unavailable. A real `kind-e2e` run makes kind, kubectl, kubeconform, Syft, and Trivy
+required; exact supported versions are listed in
+[execution-backed validation](docs/EXECUTION.md).
 
 ```sh
 git clone https://github.com/k4nul/devops-stack-composer.git
@@ -93,6 +99,42 @@ authenticated Jenkins responsibility. Composer-managed credential and Secret fie
 contain references only; user-supplied commands and annotations are trusted verbatim
 and must never contain secret values.
 
+## Execution-backed validation
+
+Preview the complete execution plan without creating resources, then opt in to the
+isolated local run:
+
+```sh
+devops-stack execution plan \
+  --project examples/python-service \
+  --environment staging \
+  --profile kind-e2e \
+  --image-tag local-e2e
+
+devops-stack execute \
+  --project examples/python-service \
+  --environment staging \
+  --profile kind-e2e \
+  --image-tag local-e2e \
+  --json
+```
+
+The real path builds once, pushes only to a run-owned loopback registry, resolves one
+canonical digest, deploys that digest to a run-owned kind cluster, verifies rollout,
+HTTP health/readiness, rollback, and the running Pod `imageID`, closes the evidence,
+then removes only resources whose immutable ownership was recorded for that run.
+
+Inspect or independently verify a completed run:
+
+```sh
+devops-stack execution show --project examples/python-service --run RUN_ID --json
+devops-stack artifact verify --project examples/python-service --run RUN_ID --json
+```
+
+See [Execution](docs/EXECUTION.md) and [Evidence](docs/EVIDENCE.md) for profiles,
+tool versions, cleanup recovery, and the same-digest proof. This local workflow never
+selects an external registry or cloud cluster.
+
 ## Documentation
 
 - [Product and operating model](docs/PRODUCT.md)
@@ -100,7 +142,11 @@ and must never contain secret values.
 - [Configuration reference](docs/CONFIGURATION.md)
 - [Template resolution and locks](docs/TEMPLATE_INTEGRATION.md)
 - [Validation evidence](docs/VALIDATION.md)
+- [Execution-backed validation](docs/EXECUTION.md)
+- [Evidence bundle and same-digest proof](docs/EVIDENCE.md)
 - [Security boundaries](docs/SECURITY.md)
+- [Threat model](docs/THREAT_MODEL.md)
+- [Release process](docs/RELEASE.md)
 - [Examples](docs/EXAMPLES.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 
@@ -113,14 +159,26 @@ Adapter-specific behavior is documented in
 After the editable install above:
 
 ```sh
+python3 -m pip install \
+  build==1.6.0 mypy==2.3.1 pip-audit==2.10.1 ruff==0.16.5 \
+  twine==7.0.0 types-PyYAML==6.0.12.20260815
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q src tests examples/python-service
+ruff check src tests --select F
+mypy --follow-imports=skip --ignore-missing-imports \
+  src/devops_stack_composer/release_assets.py \
+  src/devops_stack_composer/release_validation.py
+python3 -m build
+python3 -m twine check dist/*
 git diff --check
 ```
 
-CI also installs the built wheel, resolves the real public locked commits from an
-empty cache, performs the complete example workflow, checks deterministic rerendering
-and source cleanliness, and runs a single-platform local Docker build without push.
+CI installs the built wheel, audits dependencies, runs static checks and all tests,
+resolves the real public locked commits from an empty cache, performs the complete
+example workflow, checks deterministic rerendering and source cleanliness, and runs a
+single-platform local Docker build without push. A separate workflow runs the real
+owned registry and kind execution, verifies its closed evidence, confirms cleanup,
+and uploads the evidence for inspection.
 
 ## License
 

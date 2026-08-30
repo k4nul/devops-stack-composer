@@ -52,6 +52,25 @@ The lock proves content identity, not that content is benign. Review upstream ch
 before updating a pin. The updater fetches and checks candidate markers and license,
 but adapter compatibility and security review remain human/test gates.
 
+## Local execution resources
+
+`execute` never selects an external registry or cluster. It creates a random-named
+registry bound to `127.0.0.1` and a random-named kind cluster using pinned images.
+Ownership records include immutable Docker container IDs, run ID labels, node names,
+roles, and image identity. Reuse and cleanup require the entire record to match;
+prefixes and names alone are not deletion authority.
+
+Docker, kind, kubectl, Syft, Trivy, Git, and GitHub CLI commands use argument arrays
+through the safe process runner. The runner has an executable allowlist, a reduced
+environment, project-contained working directories, per-command and overall
+deadlines, cooperative cancellation, process-group termination, bounded output, and
+structured errors. `GH_TOKEN`, when present for post-publication checks, is supplied
+only to GitHub CLI calls and included in output redaction.
+
+The loopback registry is HTTP and unauthenticated by design. It is suitable only for
+the isolated local test cluster and is removed by default. Do not expose its port,
+reuse it as a shared registry, or treat it as a production publication target.
+
 ## Secrets and credentials
 
 Plain deployment environment names that look sensitive are rejected by schema.
@@ -77,6 +96,11 @@ credentials. Inspect report files before publishing them: they intentionally con
 non-secret operational data such as project identity, source origins, commits,
 commands, and bounded stderr.
 
+Execution evidence additionally rejects sensitive filenames and common unredacted
+credential assignments before release packaging. Evidence contains non-secret image
+digests, container IDs, cluster names, commands, source commits, and scanner metadata;
+review these operational identifiers before sharing a local bundle.
+
 ## Generated workload security
 
 Generated Dockerfiles run as the configured positive UID. Existing Dockerfiles must
@@ -88,6 +112,20 @@ Namespaces enable the Kubernetes `restricted` Pod Security profile.
 These settings do not replace image vulnerability review, registry policy, network
 policy, admission controls, RBAC, or cluster hardening. The composer currently does
 not generate RBAC grants or NetworkPolicy objects.
+
+## Evidence and release integrity
+
+Every canonical run uses a closed relative-path inventory and SHA-256 digests. The
+verifier rejects unknown, missing, linked, changed, mixed-run, or schema-invalid
+material and separately reports whether the execution itself succeeded. Local
+checksums establish internal integrity but not creator identity.
+
+Release assembly reads regular files only, bounds archive members and uncompressed
+size, rejects links and traversal, validates package metadata and schemas, and
+re-verifies embedded run evidence in a private temporary directory. After GitHub
+publication, each downloaded file must match the local closed set and pass a
+GitHub/Sigstore attestation constrained to this repository, the release workflow,
+tag ref, and source commit. See [the threat model](THREAT_MODEL.md) for residual risk.
 
 ## Reporting a vulnerability
 

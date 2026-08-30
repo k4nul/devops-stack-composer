@@ -1,15 +1,15 @@
 # Roadmap
 
-DevOps Stack Composer `0.1.0` is an alpha integration with a deliberately small public
+DevOps Stack Composer `0.2.0` is an alpha integration with a deliberately small public
 contract: one schema version, three pinned adapters, three environments, Kustomize
-output, and Jenkins-owned delivery.
+output, Jenkins-owned delivery, and an explicit local execution/evidence path.
 
 ## Near-term priorities
 
 1. Add a reproducible controller-backed Jenkins Declarative and Job DSL validation
    fixture so plugin semantics can move from an explicit skip to executable evidence.
-2. Bind pre-push SBOM/scan evidence to the published digest, either through a
-   promote-without-rebuild interface or immutable post-push digest verification.
+2. Configure and verify PyPI trusted publishing after the owner establishes the
+   external publisher/environment; keep GitHub Release evidence independent.
 3. Coordinate an official cache interface in `docker-build-template`, then add cache
    projection only after upstream validation and end-to-end tests exist.
 4. Design a pre-publication multi-architecture SBOM and scan path that validates each

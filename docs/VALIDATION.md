@@ -19,6 +19,33 @@ Overall `passed` is true only when no check is `FAILED` or
 `BLOCKED_MISSING_REQUIRED_TOOL`. Skips remain visible in human output, JSON, the
 manifest summary, and reports; they are never upgraded to passes.
 
+## Cumulative execution profiles
+
+Static `generate` and `validate` remain the default workflow. The explicit `execute`
+command adds four cumulative profiles:
+
+- `static`: composition-only gates;
+- `supply-chain`: one pushed local build, canonical digest, SBOM, vulnerability
+  policy, file provenance, and artifact validation;
+- `kind-e2e`: a real owned cluster, server-side validation, apply, rollout, runtime
+  HTTP probes, rollback, digest attestation, evidence closure, and cleanup;
+- `release`: all preceding proof plus package, closed release set, fresh GitHub
+  download and attestation, clean worktree, and exact tag/commit gates.
+
+```sh
+devops-stack doctor --project examples/python-service --profile kind-e2e --json
+devops-stack execution plan \
+  --project examples/python-service --profile kind-e2e --environment staging
+devops-stack execute \
+  --project examples/python-service --profile kind-e2e --environment staging --json
+```
+
+The successful real run must show one build invocation and equality between the
+registry digest, rendered manifest image, applied workload image, and running Pod
+`imageID`. A registry push by itself is not a deployment pass. Full semantics and
+recovery commands are in [Execution](EXECUTION.md); bundle rules are in
+[Evidence](EVIDENCE.md).
+
 ## Validation layers
 
 ### Configuration schema
@@ -124,6 +151,12 @@ Buildx even when no local image build is requested. Java, Groovy, Kustomize,
 kubectl, kubeconform, Helm, Syft, Trivy, and Cosign are optional host probes. An
 enabled Jenkins SBOM or scan stage still requires Syft or Trivy, respectively, on
 the Jenkins agent; the local doctor probe does not prove controller/agent readiness.
+
+Profile-aware diagnosis promotes tools to required only when the selected execution
+profile needs them. `kind-e2e` requires kind, kubectl, kubeconform, Syft, and Trivy.
+`release` additionally requires GitHub CLI for fresh-download and signed-attestation
+verification. Cosign remains an optional standalone probe and is not misreported as
+proof for GitHub-hosted release attestations.
 
 The current generated Kubernetes source has a strong internal YAML validator even
 when external Kubernetes tools are absent. That internal pass does not change the
