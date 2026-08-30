@@ -264,6 +264,7 @@ class KubernetesExecutor:
         self.runner = runner
         self.store = evidence_store
         self.kubeconfig, self.context = self._private_kubeconfig(kubeconfig)
+        self.cache_dir = self._private_cache_directory(self.kubeconfig.parent)
         self.app_name = self._dns_label("app_name", app_name)
         self.deployment_name = self._dns_label("deployment_name", deployment_name)
         self.service_name = self._dns_label("service_name", service_name)
@@ -1581,6 +1582,8 @@ class KubernetesExecutor:
                 str(self.kubeconfig),
                 "--context",
                 self.context,
+                "--cache-dir",
+                str(self.cache_dir),
                 *arguments,
             ),
             cwd=self.store.project,
@@ -1601,6 +1604,8 @@ class KubernetesExecutor:
                 str(self.kubeconfig),
                 "--context",
                 self.context,
+                "--cache-dir",
+                str(self.cache_dir),
                 *arguments,
             ),
             cwd=self.store.project,
@@ -1834,6 +1839,25 @@ class KubernetesExecutor:
             if file_key in cluster or file_key in user:
                 raise ValueError("kubeconfig credential file references are not allowed")
         return resolved, context
+
+    @staticmethod
+    def _private_cache_directory(parent: Path) -> Path:
+        path = parent / "kubectl-cache"
+        try:
+            path.mkdir(mode=0o700, exist_ok=True)
+            metadata = path.lstat()
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError("kubectl cache directory could not be created safely") from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("kubectl cache path must be a non-symlink directory")
+        resolved_metadata = resolved.stat()
+        if os.name == "posix" and (
+            resolved_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(resolved_metadata.st_mode) & 0o077
+        ):
+            raise ValueError("kubectl cache directory must be private and user-owned")
+        return resolved
 
     @staticmethod
     def _dns_label(name: str, value: str) -> str:

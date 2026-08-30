@@ -186,7 +186,7 @@ class FakeKubectlRunner:
     ) -> ProcessResult:
         command = tuple(argv)
         self.calls.append(command)
-        action = command[5:]
+        action = command[7:]
         if action and action[0] == "apply" and any(
             value.endswith("rollback-failure.yaml") for value in action
         ):
@@ -244,7 +244,7 @@ class FakeKubectlRunner:
         del cwd, timeout
         command = tuple(argv)
         self.calls.append(command)
-        action = command[5:]
+        action = command[7:]
         if not action or action[0] != "port-forward":
             raise AssertionError("only port-forward may use the managed process API")
         self.forward_started.set()
@@ -495,7 +495,7 @@ users:
         self.assertEqual(result.pod_name, "service-abc")
         self.assertEqual(result.ready_replica_count, 1)
         self.assertTrue(self.runner.forward_stopped.wait(1))
-        actions = [call[5] for call in self.runner.calls]
+        actions = [call[7] for call in self.runner.calls]
         self.assertEqual(
             actions[:8],
             ["apply", "apply", "apply", "apply", "rollout", "get", "get", "get"],
@@ -505,7 +505,7 @@ users:
         self.assertIn("--dry-run=server", self.runner.calls[2])
         self.assertIn("port-forward", actions)
         forward_call = next(
-            call for call in self.runner.calls if call[5] == "port-forward"
+            call for call in self.runner.calls if call[7] == "port-forward"
         )
         self.assertIn(":8080", forward_call)
         self.assertNotIn("45123:8080", forward_call)
@@ -548,7 +548,7 @@ users:
             )
         )
         self.assertEqual(observation["command"]["category"], "nonzero")
-        rollback_actions = [call[5:7] for call in self.runner.calls]
+        rollback_actions = [call[7:9] for call in self.runner.calls]
         self.assertIn(("rollout", "undo"), rollback_actions)
         smoke = self.store.path("kubernetes/smoke.json").read_text(encoding="utf-8")
         self.assertNotIn("should-redact", smoke)

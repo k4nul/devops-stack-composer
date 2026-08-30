@@ -280,6 +280,7 @@ class KindCluster:
         self._runtime_directory: tempfile.TemporaryDirectory[str] | None = None
         self._config_path: Path | None = None
         self._kubeconfig_path: Path | None = None
+        self._kubectl_cache_path: Path | None = None
         self._create_attempted = False
         self._owned_nodes: tuple[_NodeIdentity, ...] = ()
         self._handle: KindClusterHandle | None = None
@@ -906,6 +907,8 @@ class KindCluster:
             os.chmod(directory, 0o700)
             config_path = directory / "kind-config.yaml"
             kubeconfig_path = directory / "kubeconfig"
+            kubectl_cache_path = directory / "kubectl-cache"
+            kubectl_cache_path.mkdir(mode=0o700)
             self._write_private_file(config_path, self._kind_config())
             self._write_private_file(kubeconfig_path, kubeconfig_content)
         except BaseException:
@@ -914,6 +917,7 @@ class KindCluster:
         self._runtime_directory = runtime
         self._config_path = config_path
         self._kubeconfig_path = kubeconfig_path
+        self._kubectl_cache_path = kubectl_cache_path
 
     def _regenerate_private_kubeconfig(self) -> None:
         result = self._run(["kind", "get", "kubeconfig", "--name", self.name])
@@ -1006,6 +1010,7 @@ class KindCluster:
         self._runtime_directory = None
         self._config_path = None
         self._kubeconfig_path = None
+        self._kubectl_cache_path = None
 
     def _run(
         self,
@@ -1014,6 +1019,12 @@ class KindCluster:
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         argv = list(command)
+        if argv and argv[0] == "kubectl":
+            if self._kubectl_cache_path is None:
+                raise KindClusterError("private kubectl cache directory is unavailable")
+            if len(argv) < 3 or argv[1] != "--kubeconfig":
+                raise KindClusterError("kubectl requires the private kind kubeconfig")
+            argv[3:3] = ("--cache-dir", str(self._kubectl_cache_path))
         try:
             return self._command_runner(
                 argv,

@@ -153,8 +153,16 @@ class FakeKindRunner:
                 return self._completed(command)
 
         if command[:3] == ["kubectl", "--kubeconfig", command[2]]:
-            if command[3:5] == ["apply", "-f"]:
-                manifest_path = Path(command[5])
+            if command[3] != "--cache-dir":
+                raise AssertionError("kubectl must use the private cache directory")
+            cache_path = Path(command[4])
+            if not cache_path.is_dir():
+                raise AssertionError("kubectl cache directory must exist")
+            if stat.S_IMODE(cache_path.stat().st_mode) != 0o700:
+                raise AssertionError("kubectl cache directory must be private")
+            action = command[5:]
+            if action[:2] == ["apply", "-f"]:
+                manifest_path = Path(action[2])
                 manifest = manifest_path.read_text(encoding="utf-8")
                 host_line = next(
                     line.strip()
@@ -171,7 +179,7 @@ class FakeKindRunner:
                     command,
                     stdout="configmap/local-registry-hosting configured\n",
                 )
-            if command[3:7] == ["get", "nodes", "-o", "json"]:
+            if action[:4] == ["get", "nodes", "-o", "json"]:
                 items = []
                 for names in self.nodes.values():
                     for name in names:
@@ -189,7 +197,7 @@ class FakeKindRunner:
                             }
                         )
                 return self._completed(command, stdout=json.dumps({"items": items}))
-            if command[3:6] == ["get", "configmap", "local-registry-hosting"]:
+            if action[:3] == ["get", "configmap", "local-registry-hosting"]:
                 return self._completed(
                     command,
                     stdout=json.dumps(
@@ -588,6 +596,10 @@ class KindClusterTests(unittest.TestCase):
             if command[0] == "kubectl" and "apply" in command
         )
         apply = runner.calls[apply_index]
+        cache_path = Path(apply[apply.index("--cache-dir") + 1])
+        kubeconfig_path = Path(apply[apply.index("--kubeconfig") + 1])
+        self.assertEqual(cache_path.parent, kubeconfig_path.parent)
+        self.assertEqual(stat.S_IMODE(cache_path.stat().st_mode), 0o700)
         manifest_path = Path(apply[apply.index("-f") + 1])
         manifest = manifest_path.read_text(encoding="utf-8")
         self.assertIn('host: "localhost:49153"', manifest)
