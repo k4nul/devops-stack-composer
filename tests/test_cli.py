@@ -76,7 +76,7 @@ class CliTests(unittest.TestCase):
             main(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(output.getvalue(), "devops-stack 0.1.0\n")
+        self.assertEqual(output.getvalue(), "devops-stack 0.2.0\n")
 
     def test_implicit_project_lock_cannot_cross_symlink_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -361,6 +361,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(verify.artifact, "out/execution/artifact.json")
         self.assertEqual(cluster.kind_command, "destroy")
         self.assertEqual(report.run, "20260830T120000Z-abcdef012345")
+
+        configured_execute = build_parser().parse_args(["execute"])
+        self.assertIsNone(configured_execute.profile)
+        self.assertIsNone(configured_execute.environment)
 
     def test_lifecycle_state_accepts_registry_only_after_checksum_verification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

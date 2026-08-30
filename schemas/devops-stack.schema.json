@@ -583,10 +583,10 @@
         "workDirectory": {"$ref": "#/definitions/relativePath"},
         "cleanup": {
           "type": "string",
-          "enum": ["always", "on-success", "never"],
+          "const": "always",
           "examples": ["always"]
         },
-        "retainFailureEvidence": {"type": "boolean", "examples": [true]}
+        "retainFailureEvidence": {"const": true, "examples": [true]}
       }
     },
     "registry": {
@@ -659,16 +659,17 @@
         "environment": {"type": "string", "enum": ["dev", "staging", "production"], "examples": ["staging"]},
         "serverSideDryRunEnvironments": {
           "type": "array",
-          "minItems": 1,
+          "minItems": 3,
+          "maxItems": 3,
           "uniqueItems": true,
           "items": {"type": "string", "enum": ["dev", "staging", "production"]},
           "examples": [["dev", "staging", "production"]]
         },
-        "rolloutTimeoutSeconds": {"type": "integer", "minimum": 1, "examples": [180]},
+        "rolloutTimeoutSeconds": {"type": "integer", "minimum": 5, "examples": [180]},
         "healthPath": {"type": "string", "pattern": "^/[^\\u0000-\\u001F\\u007F]*$", "examples": ["/health"]},
         "readinessPath": {"type": "string", "pattern": "^/[^\\u0000-\\u001F\\u007F]*$", "examples": ["/ready"]},
-        "rollbackTest": {"type": "boolean", "examples": [true]},
-        "cleanup": {"type": "string", "enum": ["always", "on-success", "never"], "examples": ["always"]}
+        "rollbackTest": {"const": true, "examples": [true]},
+        "cleanup": {"type": "string", "const": "always", "examples": ["always"]}
       }
     },
     "validationPolicy": {

@@ -169,15 +169,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_composition_arguments(execute)
     execute.add_argument(
         "--environment",
-        required=True,
         choices=("dev", "staging", "production"),
-        help="environment selected for an actual deployment",
+        help="environment selected for an actual deployment (default: configuration)",
     )
     execute.add_argument(
         "--profile",
-        required=True,
         choices=("static", "supply-chain", "kind-e2e", "release"),
-        help="strict cumulative execution profile",
+        help="strict cumulative execution profile (default: configuration)",
     )
     execute.add_argument(
         "--output",
@@ -595,11 +593,15 @@ def _run_execute(args: argparse.Namespace) -> int:
     work_directory = args.output or composition.loaded_config.model.execution[
         "workDirectory"
     ]
+    profile = args.profile or composition.loaded_config.model.execution["profile"]
+    environment = args.environment or composition.loaded_config.model.kubernetes_e2e[
+        "environment"
+    ]
     result = ExecutionOrchestrator().execute(
         composition,
         ExecutionOptions(
-            environment=args.environment,
-            profile=args.profile,
+            environment=environment,
+            profile=profile,
             work_directory=work_directory,
             image_tag=args.image_tag,
             approve_production=args.approve_production,

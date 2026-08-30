@@ -250,6 +250,27 @@ class V02ConfigTests(unittest.TestCase):
         validate_config(valid_alias)
         self.assertEqual(normalize_config(valid_alias).execution["profile"], "kind-e2e")
 
+    def test_execution_only_accepts_runtime_policies_it_enforces(self) -> None:
+        mutations = (
+            lambda value: value["execution"].__setitem__("cleanup", "on-success"),
+            lambda value: value["execution"].__setitem__("retainFailureEvidence", False),
+            lambda value: value["kubernetes"]["e2e"].__setitem__(
+                "serverSideDryRunEnvironments", ["staging"]
+            ),
+            lambda value: value["kubernetes"]["e2e"].__setitem__(
+                "rolloutTimeoutSeconds", 4
+            ),
+            lambda value: value["kubernetes"]["e2e"].__setitem__("rollbackTest", False),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                invalid = v02_config()
+                mutate(invalid)
+                if invalid["execution"]["cleanup"] != "always":
+                    invalid["kubernetes"]["e2e"]["cleanup"] = invalid["execution"]["cleanup"]
+                with self.assertRaises(ConfigValidationError):
+                    validate_config(invalid)
+
     def test_new_blocks_are_complete_when_present(self) -> None:
         required_fields = (
             ("execution", "cleanup"),
