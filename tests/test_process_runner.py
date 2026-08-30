@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -344,6 +345,110 @@ class SafeProcessRunnerTests(unittest.TestCase):
         self.assertNotIn("real-secret", result.stdout)
         self.assertIn("token=<redacted>", result.stdout)
         self.assertIn("done", result.stdout)
+
+    def test_managed_process_waits_for_its_own_output_then_reaps_on_close(self) -> None:
+        process = FakeProcess(
+            None,
+            stdout=b"Forwarding from 127.0.0.1:45123 -> 8080\n",
+        )
+        launcher = FakeLauncher(process)
+
+        def kill_group(_pid: int, requested_signal: int) -> None:
+            process.returncode = -requested_signal
+
+        runner = self.runner(launcher, process_group_kill=kill_group)
+        managed = runner.start(
+            ["tool", "port-forward", ":8080"],
+            cwd=self.child,
+            environment={"SAFE": "yes"},
+            timeout=10,
+        )
+
+        match = managed.wait_for_output(
+            re.compile(r"(?m)^Forwarding from 127\.0\.0\.1:([0-9]+) -> 8080$"),
+            timeout=1,
+        )
+
+        self.assertEqual(match.group(1), "45123")
+        self.assertTrue(managed.close(timeout=1))
+        self.assertIsNotNone(process.returncode)
+        command, options = launcher.calls[0]
+        self.assertEqual(command, ["tool", "port-forward", ":8080"])
+        self.assertEqual(options["cwd"], str(self.child.resolve()))
+        self.assertEqual(options["env"], {"PATH": "/trusted/bin", "SAFE": "yes"})
+        self.assertIs(options["shell"], False)
+
+    def test_managed_process_external_cancellation_is_classified_and_reaped(self) -> None:
+        token = CancellationToken()
+        process = FakeProcess(None, stderr=b"password=managed-secret\n")
+        launcher = FakeLauncher(process)
+
+        def kill_group(_pid: int, requested_signal: int) -> None:
+            process.returncode = -requested_signal
+
+        managed = self.runner(
+            launcher,
+            process_group_kill=kill_group,
+        ).start(["tool"], cancellation_token=token, timeout=10)
+        token.cancel()
+
+        with self.assertRaises(ProcessCancelledError) as raised:
+            managed.wait(timeout=1)
+
+        self.assertIsNotNone(process.returncode)
+        self.assertNotIn("managed-secret", raised.exception.result.stderr)
+        self.assertIn("<redacted>", raised.exception.result.stderr)
+
+    def test_managed_process_deadline_is_classified_and_reaped(self) -> None:
+        process = FakeProcess(None)
+        launcher = FakeLauncher(process)
+        clock = FakeClock()
+
+        def kill_group(_pid: int, requested_signal: int) -> None:
+            process.returncode = -requested_signal
+
+        managed = self.runner(
+            launcher,
+            monotonic=clock,
+            sleeper=clock.sleep,
+            process_group_kill=kill_group,
+        ).start(["tool"], timeout=0.025)
+
+        with self.assertRaises(ProcessTimeoutError) as raised:
+            managed.wait(timeout=1)
+
+        self.assertEqual(raised.exception.category, ProcessErrorCategory.TIMEOUT)
+        self.assertIsNotNone(process.returncode)
+
+    def test_real_managed_process_streams_readiness_before_exit(self) -> None:
+        runner = SafeProcessRunner(
+            self.root,
+            allowed_executables={sys.executable},
+            allowed_environment_keys=(),
+            inherited_environment_keys=(),
+            base_environment={},
+            max_output_bytes=256,
+        )
+        managed = runner.start(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import time; "
+                    "print('Forwarding from 127.0.0.1:45123 -> 8080', flush=True); "
+                    "time.sleep(10)"
+                ),
+            ],
+            timeout=2,
+        )
+
+        match = managed.wait_for_output(
+            re.compile(r"(?m)^Forwarding from 127\.0\.0\.1:([0-9]+) -> 8080$"),
+            timeout=1,
+        )
+
+        self.assertEqual(match.group(1), "45123")
+        self.assertTrue(managed.close(timeout=1))
 
 
 if __name__ == "__main__":

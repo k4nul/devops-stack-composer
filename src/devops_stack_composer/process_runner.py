@@ -184,11 +184,18 @@ class _ProcessHandle(Protocol):
 class _BoundedStream:
     """Drain a pipe completely while retaining only a fixed-size prefix."""
 
-    def __init__(self, stream: BinaryIO, limit: int):
+    def __init__(
+        self,
+        stream: BinaryIO,
+        limit: int,
+        on_update: Callable[[], None] | None = None,
+    ):
         self._stream = stream
         self._limit = limit
         self._value = bytearray()
-        self.truncated = False
+        self._truncated = False
+        self._lock = threading.Lock()
+        self._on_update = on_update
         self._thread = threading.Thread(target=self._read, daemon=True)
 
     def start(self) -> None:
@@ -203,7 +210,13 @@ class _BoundedStream:
 
     @property
     def value(self) -> bytes:
-        return bytes(self._value)
+        with self._lock:
+            return bytes(self._value)
+
+    @property
+    def truncated(self) -> bool:
+        with self._lock:
+            return self._truncated
 
     def _read(self) -> None:
         try:
@@ -211,11 +224,14 @@ class _BoundedStream:
                 chunk = self._stream.read(8192)
                 if not chunk:
                     return
-                remaining = self._limit - len(self._value)
-                if remaining > 0:
-                    self._value.extend(chunk[:remaining])
-                if len(chunk) > remaining:
-                    self.truncated = True
+                with self._lock:
+                    remaining = self._limit - len(self._value)
+                    if remaining > 0:
+                        self._value.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        self._truncated = True
+                if self._on_update is not None:
+                    self._on_update()
         except (OSError, ValueError):
             # A process killed at a deadline may close a pipe during a read.
             return
@@ -224,6 +240,8 @@ class _BoundedStream:
                 self._stream.close()
             except OSError:
                 pass
+            if self._on_update is not None:
+                self._on_update()
 
 
 def redact_process_output(value: str, secret_values: Iterable[str] = ()) -> str:
@@ -475,6 +493,104 @@ class SafeProcessRunner:
             )
             self._raise(ProcessErrorCategory.NONZERO, failed)
         return result
+
+    def start(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        deadline: float | None = None,
+        cancellation_token: CancellationToken | None = None,
+        redact_values: Iterable[str] = (),
+    ) -> ManagedProcess:
+        """Start one managed process whose output and lifetime remain bounded.
+
+        The returned handle continuously enforces cancellation and deadline
+        policy. Callers must close it (or use it as a context manager) so the
+        complete process group is terminated and reaped.
+        """
+
+        command = self._validate_argv(argv)
+        working_directory = self._resolve_cwd(cwd)
+        child_environment = self._environment(environment)
+        selected_timeout = self.default_timeout if timeout is None else timeout
+        self._validate_duration("timeout", selected_timeout, optional=True)
+        self._validate_deadline("deadline", deadline)
+        token = cancellation_token or self.cancellation_token
+        if token is not None and not isinstance(token, CancellationToken):
+            raise UnsafeProcessRequestError(
+                "cancellation_token must be a CancellationToken"
+            )
+        secrets = self._secret_values(environment, redact_values)
+        sanitized_argv = self._sanitize_argv(command, secrets)
+        started = self._clock()
+        effective_deadline = self._effective_deadline(started, selected_timeout, deadline)
+
+        if token is not None and token.is_cancelled():
+            self._raise_without_process(
+                ProcessErrorCategory.CANCELLED,
+                sanitized_argv,
+                working_directory,
+                started,
+            )
+        if effective_deadline is not None and started >= effective_deadline:
+            self._raise_without_process(
+                ProcessErrorCategory.TIMEOUT,
+                sanitized_argv,
+                working_directory,
+                started,
+            )
+
+        options: dict[str, object] = {
+            "cwd": str(working_directory),
+            "env": child_environment,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "shell": False,
+            "close_fds": True,
+            "bufsize": 0,
+        }
+        if self._uses_process_groups:
+            options["start_new_session"] = True
+        try:
+            process = self._launcher(list(command), **options)
+        except OSError as exc:
+            if isinstance(exc, FileNotFoundError) or exc.errno == errno.ENOENT:
+                self._raise_without_process(
+                    ProcessErrorCategory.COMMAND_NOT_FOUND,
+                    sanitized_argv,
+                    working_directory,
+                    started,
+                )
+            if isinstance(exc, PermissionError) or exc.errno in {errno.EACCES, errno.EPERM}:
+                self._raise_without_process(
+                    ProcessErrorCategory.PERMISSION,
+                    sanitized_argv,
+                    working_directory,
+                    started,
+                )
+            raise
+
+        if process.stdout is None or process.stderr is None:
+            self._terminate(process, ())
+            raise RuntimeError("process launcher did not provide captured output pipes")
+        try:
+            return ManagedProcess(
+                self,
+                process,
+                sanitized_argv,
+                working_directory,
+                started,
+                effective_deadline,
+                token,
+                secrets,
+            )
+        except BaseException:
+            self._terminate(process, ())
+            raise
 
     @staticmethod
     def _string_set(name: str, values: Iterable[str]) -> frozenset[str]:
@@ -763,6 +879,174 @@ class SafeProcessRunner:
             ProcessErrorCategory.NONZERO: NonZeroExitError,
         }
         raise errors[category](category, result)
+
+
+class ManagedProcess:
+    """A process kept alive under the same safety policy as synchronous runs."""
+
+    def __init__(
+        self,
+        runner: SafeProcessRunner,
+        process: _ProcessHandle,
+        argv: tuple[str, ...],
+        cwd: Path,
+        started: float,
+        deadline: float | None,
+        cancellation_token: CancellationToken | None,
+        secrets: tuple[str, ...],
+    ) -> None:
+        self._runner = runner
+        self._process = process
+        self._argv = argv
+        self._cwd = cwd
+        self._started = started
+        self._deadline = deadline
+        self._cancellation_token = cancellation_token
+        self._secrets = secrets
+        self._condition = threading.Condition()
+        self._stop_requested = threading.Event()
+        self._result_value: ProcessResult | None = None
+        self._monitor_error: BaseException | None = None
+        raw_limit = runner.max_output_bytes + _REDACTION_WINDOW_BYTES
+        self._stdout = _BoundedStream(
+            process.stdout,  # type: ignore[arg-type]
+            raw_limit,
+            self._notify,
+        )
+        self._stderr = _BoundedStream(
+            process.stderr,  # type: ignore[arg-type]
+            raw_limit,
+            self._notify,
+        )
+        self._collectors = (self._stdout, self._stderr)
+        self._monitor = threading.Thread(
+            target=self._monitor_process,
+            name=f"managed-process-{process.pid}",
+            daemon=True,
+        )
+        for collector in self._collectors:
+            collector.start()
+        self._monitor.start()
+
+    @property
+    def is_running(self) -> bool:
+        return self._process.poll() is None and self._result_value is None
+
+    def output(self) -> tuple[str, str]:
+        """Return the current sanitized, bounded stdout and stderr snapshots."""
+
+        stdout, _ = self._runner._render_capture(self._stdout, self._secrets)
+        stderr, _ = self._runner._render_capture(self._stderr, self._secrets)
+        return stdout, stderr
+
+    def wait_for_output(
+        self,
+        pattern: re.Pattern[str],
+        *,
+        timeout: float,
+    ) -> re.Match[str]:
+        """Wait for a pattern in this process's own stdout or stderr."""
+
+        if not isinstance(pattern, re.Pattern):
+            raise UnsafeProcessRequestError("pattern must be a compiled text regex")
+        self._runner._validate_duration("timeout", timeout)
+        stop_at = self._runner._clock() + timeout
+        while True:
+            stdout, stderr = self.output()
+            match = pattern.search(stdout) or pattern.search(stderr)
+            if match is not None and self.is_running:
+                return match
+            if self._result_value is not None or self._monitor_error is not None:
+                result = self.wait()
+                raise RuntimeError(
+                    "managed process exited before the requested output was observed: "
+                    f"exit code {result.returncode}"
+                )
+            remaining = stop_at - self._runner._clock()
+            if remaining <= 0:
+                raise TimeoutError("managed process output was not observed before timeout")
+            with self._condition:
+                self._condition.wait(min(self._runner.poll_interval, remaining))
+
+    def wait(self, timeout: float | None = None) -> ProcessResult:
+        """Wait for completion and raise the existing classified error on failure."""
+
+        self._runner._validate_duration("timeout", timeout, optional=True)
+        self._monitor.join(timeout)
+        if self._monitor.is_alive():
+            raise TimeoutError("managed process is still running")
+        if self._monitor_error is not None:
+            raise RuntimeError("managed process monitor failed") from self._monitor_error
+        result = self._result_value
+        if result is None:  # pragma: no cover - monitor invariant
+            raise RuntimeError("managed process completed without a result")
+        if result.error_category is not None:
+            self._runner._raise(result.error_category, result)
+        return result
+
+    def close(self, timeout: float | None = None) -> bool:
+        """Terminate and reap this process group; return false on cleanup timeout."""
+
+        self._runner._validate_duration("timeout", timeout, optional=True)
+        self._stop_requested.set()
+        self._notify()
+        self._monitor.join(timeout)
+        return not self._monitor.is_alive() and self._process.poll() is not None
+
+    def __enter__(self) -> ManagedProcess:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _notify(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    def _monitor_process(self) -> None:
+        category: ProcessErrorCategory | None = None
+        try:
+            while self._process.poll() is None:
+                now = self._runner._clock()
+                if self._stop_requested.is_set() or (
+                    self._cancellation_token is not None
+                    and self._cancellation_token.is_cancelled()
+                ):
+                    category = ProcessErrorCategory.CANCELLED
+                    break
+                if self._deadline is not None and now >= self._deadline:
+                    category = ProcessErrorCategory.TIMEOUT
+                    break
+                delay = self._runner.poll_interval
+                if self._deadline is not None:
+                    delay = min(delay, max(0.0, self._deadline - now))
+                self._runner._sleep(delay)
+
+            if category is not None:
+                self._runner._terminate(self._process, self._collectors)
+            else:
+                self._process.wait()
+                self._runner._join_collectors(self._process, self._collectors)
+
+            returncode = self._process.poll()
+            if returncode is None:
+                returncode = self._process.returncode
+            if category is None and returncode != 0:
+                category = ProcessErrorCategory.NONZERO
+            self._result_value = self._runner._result(
+                self._argv,
+                self._cwd,
+                returncode,
+                self._stdout,
+                self._stderr,
+                self._started,
+                category,
+                self._secrets,
+            )
+        except BaseException as exc:  # surfaced by wait(), never lost in a daemon
+            self._monitor_error = exc
+        finally:
+            self._notify()
 
 
 # A concise alias for callers that prefer the failure terminology.
