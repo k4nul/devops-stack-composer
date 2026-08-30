@@ -291,11 +291,11 @@ class ExecutionBundle:
 _T = TypeVar("_T")
 _Parser = Callable[[Mapping[str, Any], str], _T]
 
-_PLAN_PATH = "execution-plan.json"
+_PLAN_PATHS = ("plan.json", "execution-plan.json")
 _ARTIFACT_PATHS = ("artifact.json",)
 _SUPPLY_CHAIN_PATHS = ("supply-chain.json", "supply-chain-evidence.json")
-_DEPLOYMENT_PATHS = ("deployment.json",)
-_RUN_PATHS = ("execution-evidence.json", "report.json")
+_DEPLOYMENT_PATHS = ("deployment-evidence.json",)
+_RUN_PATHS = ("run.json", "execution-evidence.json", "report.json")
 _VERIFICATION_PATH = "verification.json"
 _EVIDENCE_RUN_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 
@@ -326,10 +326,15 @@ def load_execution_bundle(
         raise ExecutionBundleError("BUNDLE_CHECKSUM_INVALID", str(exc)) from exc
 
     records: dict[str, tuple[str, ...]] = {}
-    plan = None
-    if _PLAN_PATH in checksums:
-        plan = _parse_checked(store, checksums, _PLAN_PATH, _parse_plan)
-        records["executionPlan"] = (_PLAN_PATH,)
+    plan, paths = _load_matching_records(
+        store,
+        checksums,
+        _PLAN_PATHS,
+        _parse_plan,
+        "execution plan",
+    )
+    if paths:
+        records["executionPlan"] = paths
 
     artifact, paths = _load_matching_records(
         store,
@@ -1102,10 +1107,15 @@ def _verify_record_relationships(bundle: ExecutionBundle) -> None:
             )
         planned = tuple(stage.stage_id for stage in bundle.plan.stages)
         reported = tuple(stage.stage_id for stage in run.stage_results)
-        if planned != reported:
+        exact_stage_order = (
+            planned == reported
+            if run.final_status.value == "PASSED"
+            else reported == planned[: len(reported)]
+        )
+        if not exact_stage_order:
             raise ExecutionBundleError(
                 "BUNDLE_RECORD_MISMATCH",
-                "report stages do not exactly match execution-plan order",
+                "report stages are not the exact executed prefix of the plan",
             )
     if run is not None and run.final_status.value == "PASSED":
         failures = profile_policy(run.execution_profile).required_stage_failures(

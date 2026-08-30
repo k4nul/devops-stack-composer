@@ -20,6 +20,10 @@ from devops_stack_composer.composition import Composition
 from devops_stack_composer.config import canonical_hash
 from devops_stack_composer.errors import DevOpsStackError
 from devops_stack_composer.evidence_store import EvidenceStore
+from devops_stack_composer.evidence_bundle import (
+    EvidenceBundleVerification,
+    assemble_evidence_bundle,
+)
 from devops_stack_composer.evidence_validation import (
     ArtifactVerification,
     validate_artifact_contract,
@@ -34,6 +38,12 @@ from devops_stack_composer.execution_models import (
     SupplyChainEvidence,
 )
 from devops_stack_composer.execution_plan import ExecutionPlan
+from devops_stack_composer.execution_state import (
+    ExecutionErrorCategory,
+    ExecutionJournal,
+    ExecutionState,
+    StateTransition,
+)
 from devops_stack_composer.filesystem import (
     contained_path,
     normalize_relative_path,
@@ -53,7 +63,8 @@ from devops_stack_composer.policies import (
     VulnerabilityPolicy,
     profile_policy,
 )
-from devops_stack_composer.registry import EphemeralRegistry
+from devops_stack_composer.registry import EphemeralRegistry, RegistryHandle
+from devops_stack_composer.resource_recovery import ResourceRecoveryStore
 from devops_stack_composer.report import redact_sensitive
 from devops_stack_composer.process_compat import (
     SafeBuildCommandRunner,
@@ -61,7 +72,11 @@ from devops_stack_composer.process_compat import (
 )
 from devops_stack_composer.process_runner import (
     DEFAULT_ALLOWED_ENVIRONMENT_KEYS,
+    ProcessErrorCategory,
+    ProcessExecutionError,
+    ProcessResult,
     SafeProcessRunner,
+    redact_process_output,
 )
 from devops_stack_composer.supply_chain import SupplyChainGenerator
 
@@ -142,6 +157,7 @@ class ExecutionResult:
     run: ExecutionRun
     verification: ArtifactVerification | None = None
     retained_resources: bool = False
+    bundle_verification: EvidenceBundleVerification | None = None
 
     @property
     def passed(self) -> bool:
@@ -162,6 +178,11 @@ class ExecutionResult:
                 self.verification.to_dict() if self.verification is not None else None
             ),
             "retainedResources": self.retained_resources,
+            "bundleVerification": (
+                self.bundle_verification.to_dict()
+                if self.bundle_verification is not None
+                else None
+            ),
         }
 
 
@@ -279,6 +300,231 @@ def _safe_log(*values: bytes | str) -> str:
     if not isinstance(redacted, str):  # pragma: no cover - string input invariant
         return ""
     return redacted.replace("\x00", "")[-16000:]
+
+
+_PROCESS_ERROR_CATEGORIES = {
+    ProcessErrorCategory.COMMAND_NOT_FOUND: ExecutionErrorCategory.COMMAND_NOT_FOUND,
+    ProcessErrorCategory.PERMISSION: ExecutionErrorCategory.PERMISSION,
+    ProcessErrorCategory.TIMEOUT: ExecutionErrorCategory.TIMEOUT,
+    ProcessErrorCategory.CANCELLED: ExecutionErrorCategory.CANCELLED,
+    ProcessErrorCategory.NONZERO: ExecutionErrorCategory.NON_ZERO_EXIT,
+}
+
+
+class _ExecutionProgress:
+    """Persist the strict v0.2 state journal alongside the live kind run."""
+
+    def __init__(
+        self,
+        store: EvidenceStore,
+        plan: ExecutionPlan,
+        now: Callable[[], str],
+    ) -> None:
+        self.journal = ExecutionJournal(store)
+        self.plan = plan
+        self._now = now
+        self._attested = False
+
+    @property
+    def state(self) -> ExecutionState | None:
+        return self.journal.current_state
+
+    def start(self) -> None:
+        self._append(
+            ExecutionState.PLANNED,
+            outputs={"runId": self.plan.run_id},
+            checksum=self.plan.build_plan_hash,
+        )
+        self._append(
+            ExecutionState.VALIDATED,
+            outputs={"plannedStage": "generated-files"},
+        )
+
+    def building(self) -> None:
+        self._append(
+            ExecutionState.BUILDING,
+            outputs={"plannedStage": "registry-lifecycle"},
+            command=("docker", "<owned-registry-start>"),
+        )
+
+    def built_and_pushed(self) -> None:
+        self._append(
+            ExecutionState.BUILT,
+            outputs={"plannedStage": "build-once", "buildInvocationCount": 1},
+            command=("docker", "buildx", "build", "--push", "<project-context>"),
+        )
+        self._append(
+            ExecutionState.PUSHING,
+            outputs={"plannedStage": "build-once", "pushCompleted": True},
+            command=("docker", "buildx", "build", "--push", "<project-context>"),
+        )
+
+    def digest_resolved(self, digest: str) -> None:
+        self._append(
+            ExecutionState.DIGEST_RESOLVED,
+            outputs={"plannedStage": "resolve-digest", "digest": digest},
+            command=("docker", "buildx", "imagetools", "inspect", "<tag>"),
+            digest=digest,
+        )
+
+    def kubernetes_event(self, event: str, outputs: Mapping[str, Any]) -> None:
+        if event == "cluster_prepared":
+            self._append_if_next(
+                ExecutionState.CLUSTER_PREPARING,
+                outputs={"plannedStage": "server-side-dry-run", **dict(outputs)},
+                command=("kind", "create", "cluster", "<run-owned-cluster>"),
+            )
+        elif event == "applied":
+            self._append_if_next(
+                ExecutionState.APPLYING,
+                outputs={"plannedStage": "deployment", **dict(outputs)},
+                command=("kubectl", "apply", "<digest-pinned-manifest>"),
+            )
+        elif event == "ready":
+            self._append_if_next(
+                ExecutionState.WAITING_READY,
+                outputs={"plannedStage": "rollout", **dict(outputs)},
+                command=("kubectl", "rollout", "status", "<deployment>"),
+            )
+        elif event == "attested":
+            self._attested = True
+        elif event == "smoked":
+            self._append_if_next(
+                ExecutionState.SMOKE_TESTING,
+                outputs={"plannedStage": "health/readiness", **dict(outputs)},
+                command=("http", "GET", "<loopback-health-and-readiness>"),
+            )
+            if self._attested:
+                self._append_if_next(
+                    ExecutionState.ATTESTING,
+                    outputs={"plannedStage": "pod-image"},
+                    command=("kubectl", "get", "pods", "<digest-attestation>"),
+                )
+        elif event == "evidence_collected":
+            self._append_if_next(
+                ExecutionState.COLLECTING_EVIDENCE,
+                outputs={"plannedStage": "rollback", **dict(outputs)},
+            )
+
+    def complete_kubernetes(self) -> None:
+        for state, stage in (
+            (ExecutionState.CLUSTER_PREPARING, "server-side-dry-run"),
+            (ExecutionState.APPLYING, "deployment"),
+            (ExecutionState.WAITING_READY, "rollout"),
+            (ExecutionState.SMOKE_TESTING, "health/readiness"),
+            (ExecutionState.ATTESTING, "pod-image"),
+            (ExecutionState.COLLECTING_EVIDENCE, "rollback"),
+        ):
+            self._append_if_next(state, outputs={"plannedStage": stage})
+
+    def fail(self, stage: str, error: BaseException) -> None:
+        if self.state in {ExecutionState.FAILED, ExecutionState.CLEANED}:
+            return
+        process = self._process_result(error)
+        category = ExecutionErrorCategory.VALIDATION
+        if isinstance(error, ProcessExecutionError):
+            category = _PROCESS_ERROR_CATEGORIES[error.category]
+        elif process is not None and process.error_category is not None:
+            category = _PROCESS_ERROR_CATEGORIES[process.error_category]
+        elif "ownership" in type(error).__name__.lower():
+            category = ExecutionErrorCategory.OWNERSHIP
+        command = ()
+        stdout = ""
+        stderr = _safe_failure(error)
+        exit_code = None
+        if process is not None:
+            command = (
+                (process.argv[0], "<arguments-redacted>")
+                if process.argv
+                else ()
+            )
+            stdout = _safe_log(process.stdout)
+            stderr = _safe_log(process.stderr or str(error))
+            exit_code = process.returncode
+        self._append(
+            ExecutionState.FAILED,
+            outputs={"failedStage": stage},
+            command=command,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=category == ExecutionErrorCategory.TIMEOUT,
+            error_category=category,
+            retryable=category
+            in {ExecutionErrorCategory.TIMEOUT, ExecutionErrorCategory.CANCELLED},
+        )
+
+    def succeeded(self) -> None:
+        self._append(
+            ExecutionState.SUCCEEDED,
+            outputs={"finalStatus": StageStatus.PASSED.value},
+        )
+
+    def cleaned(self) -> None:
+        if self.state not in {ExecutionState.SUCCEEDED, ExecutionState.FAILED}:
+            return
+        self._append(
+            ExecutionState.CLEANED,
+            outputs={"cleanupPerformed": True},
+            command=("docker/kind", "<verified-owned-resource-cleanup>"),
+        )
+
+    def _append_if_next(
+        self,
+        state: ExecutionState,
+        *,
+        outputs: Mapping[str, Any],
+        command: Sequence[str] = (),
+    ) -> None:
+        if any(
+            transition.state == state
+            for transition in self.journal.machine.transitions
+        ):
+            return
+        self._append(state, outputs=outputs, command=command)
+
+    def _append(
+        self,
+        state: ExecutionState,
+        *,
+        outputs: Mapping[str, Any],
+        command: Sequence[str] = (),
+        exit_code: int | None = 0,
+        stdout: str = "",
+        stderr: str = "",
+        timed_out: bool = False,
+        error_category: ExecutionErrorCategory | None = None,
+        checksum: str | None = None,
+        digest: str | None = None,
+        retryable: bool = False,
+    ) -> None:
+        timestamp = self._now()
+        self.journal.append(
+            StateTransition(
+                state=state,
+                previous_state=self.state,
+                started_at=timestamp,
+                finished_at=timestamp,
+                input_subject=self.plan.build_plan_hash,
+                outputs=dict(outputs),
+                command=tuple(redact_process_output(value) for value in command),
+                exit_code=exit_code,
+                stdout=_safe_log(stdout),
+                stderr=_safe_log(stderr),
+                timed_out=timed_out,
+                error_category=error_category,
+                checksum=checksum,
+                digest=digest,
+                retryable=retryable,
+            )
+        )
+
+    @staticmethod
+    def _process_result(error: BaseException) -> ProcessResult | None:
+        if isinstance(error, ProcessExecutionError):
+            return error.result
+        value = getattr(error, "process_result", None)
+        return value if isinstance(value, ProcessResult) else None
 
 
 class ExecutionOrchestrator:
@@ -572,6 +818,17 @@ class ExecutionOrchestrator:
         evidence_paths = tuple(
             (
                 *manifest_paths,
+                *(
+                    ("kubernetes/server-side-dry-run.json",)
+                    if store.path("kubernetes/server-side-dry-run.json").is_file()
+                    else ()
+                ),
+                *(
+                    ("kind-cluster-ownership.json",)
+                    if store.path("kind-cluster-ownership.json").is_file()
+                    else ()
+                ),
+                *error.evidence_paths,
                 *diagnostic_paths,
                 *((error_record_path,) if error_record_path else ()),
             )
@@ -775,6 +1032,7 @@ class ExecutionOrchestrator:
         model = composition.loaded_config.model
         profile = options.profile
         assert isinstance(profile, ValidationProfile)
+        canonical_bundle = profile == ValidationProfile.KIND_E2E
         process_runner = self._process_runner(composition.project)
         subprocess_adapter = SafeSubprocessAdapter(process_runner)
         build_executor = self._build_executor or BuildOnceExecutor(
@@ -819,6 +1077,7 @@ class ExecutionOrchestrator:
         supply_chain: SupplyChainEvidence | None = None
         deployment: DeploymentEvidence | None = None
         verification: ArtifactVerification | None = None
+        bundle_verification: EvidenceBundleVerification | None = None
         registry: EphemeralRegistry | None = None
         cluster: KindCluster | None = None
         registry_endpoint = model.image_registry
@@ -830,6 +1089,11 @@ class ExecutionOrchestrator:
         plan: ExecutionPlan | None = None
         kubernetes_manifest_paths: tuple[str, ...] = ()
         cluster_started = started_at
+        progress: _ExecutionProgress | None = None
+        failure_error: BaseException | None = None
+        cleanup_completed = False
+        recovery = ResourceRecoveryStore(store) if canonical_bundle else None
+        recovery_recorded = False
 
         try:
             static_time = self._now()
@@ -858,6 +1122,18 @@ class ExecutionOrchestrator:
 
             dockerfile = self._write_build_inputs(store, composition)
             dockerfile_relative = dockerfile.relative_to(composition.project).as_posix()
+            input_paths = tuple(
+                path
+                for path in (
+                    "inputs/Dockerfile",
+                    "inputs/Dockerfile.dockerignore",
+                )
+                if store.path(path).is_file()
+            )
+            stage_results["generated-files"] = replace(
+                stage_results["generated-files"],
+                evidence_paths=input_paths,
+            )
             intent = ArtifactIntent(
                 application_name=model.application_name,
                 registry=registry_endpoint,
@@ -881,8 +1157,14 @@ class ExecutionOrchestrator:
             )
 
             if missing_tools:
-                store.write_json("execution-plan.json", plan.to_dict())
-                current_stage = missing_tools[0][1]
+                if canonical_bundle:
+                    store.write_json("plan.json", plan.to_dict())
+                    store.write_json("policy.json", profile_policy(profile).to_dict())
+                    progress = _ExecutionProgress(store, plan, self._now)
+                    progress.start()
+                else:
+                    store.write_json("execution-plan.json", plan.to_dict())
+                current_stage = "registry-lifecycle"
                 missing_names = ", ".join(tool for tool, _stage_id in missing_tools)
                 raise ExecutionError(
                     "REQUIRED_TOOL_MISSING",
@@ -898,6 +1180,9 @@ class ExecutionOrchestrator:
                     registry_endpoint = f"localhost:{handle.host_port}"
                     repository_path = model.registry["repository"]
                     store.write_json("registry-ownership.json", handle.to_dict())
+                    if recovery is not None and isinstance(handle, RegistryHandle):
+                        recovery.record_registry(handle)
+                        recovery_recorded = True
                     registry_output = (
                         "Isolated loopback registry started for local test execution"
                     )
@@ -931,7 +1216,13 @@ class ExecutionOrchestrator:
                 registry_output = "No execution registry is required by the static profile"
                 registry_evidence = ()
 
-            store.write_json("execution-plan.json", plan.to_dict())
+            if canonical_bundle:
+                store.write_json("plan.json", plan.to_dict())
+                store.write_json("policy.json", profile_policy(profile).to_dict())
+                progress = _ExecutionProgress(store, plan, self._now)
+                progress.start()
+            else:
+                store.write_json("execution-plan.json", plan.to_dict())
 
             if profile == ValidationProfile.STATIC:
                 # The static profile deliberately performs no image or cluster side effect.
@@ -946,6 +1237,8 @@ class ExecutionOrchestrator:
                     output=registry_output,
                     evidence_paths=registry_evidence,
                 )
+                if progress is not None:
+                    progress.building()
 
                 current_stage = "build-once"
                 build_started = self._now()
@@ -991,6 +1284,8 @@ class ExecutionOrchestrator:
                         "logs/build.log",
                     ),
                 )
+                if progress is not None:
+                    progress.built_and_pushed()
 
                 current_stage = "resolve-digest"
                 resolve_started = self._now()
@@ -1016,6 +1311,8 @@ class ExecutionOrchestrator:
                     output=f"Registry bytes resolved to {artifact.manifest_digest}",
                     evidence_paths=("artifact.json", "build-metadata.json"),
                 )
+                if progress is not None:
+                    progress.digest_resolved(artifact.manifest_digest)
 
                 current_stage = "sbom"
                 supply_started = self._now()
@@ -1172,6 +1469,11 @@ class ExecutionOrchestrator:
                     cluster = kind_factory(store.run_id)
                     cluster_handle = cluster.create()
                     store.write_json("kind-cluster-ownership.json", cluster_handle.to_dict())
+                    if recovery is not None and isinstance(cluster, KindCluster):
+                        cluster_identity = cluster.recovery_identity
+                        if cluster_identity is not None:
+                            recovery.record_kind(cluster_identity)
+                            recovery_recorded = True
                     cluster.configure_local_registry(registry)
                     kubeconfig = cluster.kubeconfig_path
                     if kubeconfig is None:
@@ -1194,6 +1496,11 @@ class ExecutionOrchestrator:
                             rollout_timeout_seconds=model.kubernetes_e2e[
                                 "rolloutTimeoutSeconds"
                             ],
+                            progress_callback=(
+                                progress.kubernetes_event
+                                if progress is not None
+                                else None
+                            ),
                         )
                     else:
                         kubernetes_executor = self._kubernetes_executor
@@ -1235,6 +1542,8 @@ class ExecutionOrchestrator:
                         dict.fromkeys(
                             (
                                 preflight_result.evidence_path,
+                                *preflight_result.evidence_paths,
+                                *kubernetes_result.evidence_paths,
                                 kubernetes_result.manifest_path,
                                 kubernetes_result.applied_deployment_path,
                                 kubernetes_result.applied_service_path,
@@ -1274,7 +1583,9 @@ class ExecutionOrchestrator:
                         final_digest=identity.runtime_digest,
                         diagnostics_paths=kubernetes_paths,
                     )
-                    store.write_json("deployment.json", deployment.to_dict())
+                    store.write_json(
+                        "deployment-evidence.json", deployment.to_dict()
+                    )
                     store.write_json(
                         "kubernetes/execution-result.json",
                         kubernetes_result.to_dict(),
@@ -1289,11 +1600,16 @@ class ExecutionOrchestrator:
                         verification.to_dict(),
                         overwrite=True,
                     )
-                    kubernetes_evidence = (
-                        *manifest_paths,
-                        "deployment.json",
-                        "kubernetes/execution-result.json",
-                        *kubernetes_paths,
+                    kubernetes_evidence = tuple(
+                        dict.fromkeys(
+                            (
+                                *manifest_paths,
+                                "kind-cluster-ownership.json",
+                                "deployment-evidence.json",
+                                "kubernetes/execution-result.json",
+                                *kubernetes_paths,
+                            )
+                        )
                     )
                     for stage_id in (
                         "server-side-dry-run",
@@ -1329,9 +1645,12 @@ class ExecutionOrchestrator:
                             }[stage_id],
                             evidence_paths=kubernetes_evidence,
                         )
+                    if progress is not None:
+                        progress.complete_kubernetes()
 
         except KubernetesExecutionError as error:
             assert plan is not None
+            failure_error = error
             current_stage, failure_reason = self._record_kubernetes_failure(
                 error=error,
                 store=store,
@@ -1340,19 +1659,33 @@ class ExecutionOrchestrator:
                 manifest_paths=kubernetes_manifest_paths,
                 started=cluster_started,
             )
+            if progress is not None:
+                progress.fail(current_stage, error)
         except BaseException as error:
+            failure_error = error
             failure_reason = _safe_failure(error)
             if getattr(error, "code", None) == "REQUIRED_TOOL_MISSING":
                 failure_status = StageStatus.BLOCKED_MISSING_REQUIRED_TOOL
             if plan is not None and current_stage in {
                 stage.stage_id for stage in plan.stages
             } and current_stage not in stage_results:
+                failure_evidence = tuple(
+                    path
+                    for path in (
+                        *kubernetes_manifest_paths,
+                        "kind-cluster-ownership.json",
+                    )
+                    if store.path(path).is_file()
+                )
                 stage_results[current_stage] = self._stage(
                     plan,
                     current_stage,
                     failure_status,
+                    evidence_paths=failure_evidence,
                     failure_reason=failure_reason,
                 )
+            if progress is not None:
+                progress.fail(current_stage, error)
         finally:
             if plan is None:
                 # No external side effect occurs before a plan can be created except
@@ -1442,9 +1775,24 @@ class ExecutionOrchestrator:
                             cleanup_failures.append(
                                 f"registry cleanup: {_safe_failure(error)}"
                             )
+                    if recovery is not None and recovery_recorded and not cleanup_failures:
+                        try:
+                            recovered = recovery.cleanup(
+                                command_runner=subprocess_adapter,
+                                command_timeout_seconds=60.0,
+                            )
+                            if not recovered.complete:
+                                cleanup_failures.append(
+                                    "resource recovery record did not confirm complete cleanup"
+                                )
+                        except BaseException as error:
+                            cleanup_failures.append(
+                                f"resource recovery state: {_safe_failure(error)}"
+                            )
                     cleanup_failure = (
                         "; ".join(cleanup_failures) if cleanup_failures else None
                     )
+                    cleanup_completed = cleanup_failure is None
                     stage_results["cleanup"] = self._stage(
                         plan,
                         "cleanup",
@@ -1477,15 +1825,53 @@ class ExecutionOrchestrator:
                         )
 
         assert plan is not None
-        for planned in plan.stages:
-            if planned.stage_id not in stage_results:
-                stage_results[planned.stage_id] = self._stage(
-                    plan,
-                    planned.stage_id,
-                    StageStatus.NOT_APPLICABLE,
-                    output="Stage did not execute because an earlier required stage failed",
+        if canonical_bundle and failure_reason is not None:
+            cleanup_result = stage_results.get("cleanup")
+            if cleanup_result is not None and cleanup_result.evidence_paths:
+                failed_result = next(
+                    (
+                        result
+                        for result in stage_results.values()
+                        if result.status != StageStatus.PASSED
+                        and result.stage_id != "cleanup"
+                    ),
+                    None,
                 )
-        ordered_stages = tuple(stage_results[stage.stage_id] for stage in plan.stages)
+                if failed_result is not None:
+                    stage_results[failed_result.stage_id] = replace(
+                        failed_result,
+                        evidence_paths=tuple(
+                            dict.fromkeys(
+                                (
+                                    *failed_result.evidence_paths,
+                                    *cleanup_result.evidence_paths,
+                                )
+                            )
+                        ),
+                    )
+            strict_prefix: list[StageResult] = []
+            for planned in plan.stages:
+                result = stage_results.get(planned.stage_id)
+                if result is None:
+                    break
+                strict_prefix.append(result)
+                if result.status != StageStatus.PASSED:
+                    break
+            ordered_stages = tuple(strict_prefix)
+        else:
+            for planned in plan.stages:
+                if planned.stage_id not in stage_results:
+                    stage_results[planned.stage_id] = self._stage(
+                        plan,
+                        planned.stage_id,
+                        StageStatus.NOT_APPLICABLE,
+                        output=(
+                            "Stage did not execute because an earlier required stage failed"
+                        ),
+                    )
+            ordered_stages = tuple(
+                stage_results[stage.stage_id] for stage in plan.stages
+            )
         policy_failures = profile_policy(profile).required_stage_failures(ordered_stages)
         if policy_failures and failure_reason is None:
             failure_reason = "Required stages did not pass: " + ", ".join(
@@ -1524,18 +1910,34 @@ class ExecutionOrchestrator:
             deployment_evidence=deployment,
             failure_reason=failure_reason,
         )
-        self._write_final_records(
-            store=store,
-            plan=plan,
-            run=run,
-            composition=composition,
-            verification=verification,
-            retained_resources=retained_resources,
-        )
+        if canonical_bundle:
+            assert progress is not None
+            if final_status == StageStatus.PASSED:
+                progress.complete_kubernetes()
+                progress.succeeded()
+            else:
+                terminal_error = failure_error or ExecutionError(
+                    "EXECUTION_POLICY_FAILED",
+                    failure_reason or "one or more required stages did not pass",
+                )
+                progress.fail(current_stage, terminal_error)
+            if cleanup_completed:
+                progress.cleaned()
+            bundle_verification = assemble_evidence_bundle(store, plan, run)
+        else:
+            self._write_final_records(
+                store=store,
+                plan=plan,
+                run=run,
+                composition=composition,
+                verification=verification,
+                retained_resources=retained_resources,
+            )
         return ExecutionResult(
             store=store,
             plan=plan,
             run=run,
             verification=verification,
             retained_resources=retained_resources,
+            bundle_verification=bundle_verification,
         )

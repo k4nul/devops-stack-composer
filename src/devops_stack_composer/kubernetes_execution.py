@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import stat
 from dataclasses import dataclass, replace
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
 import yaml
@@ -130,6 +130,7 @@ class KubernetesExecutionResult:
     final_revision: str
     health: HttpSmokeResult
     readiness: HttpSmokeResult
+    evidence_paths: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -151,6 +152,7 @@ class KubernetesExecutionResult:
             "identity": self.identity.to_dict(),
             "health": self.health.to_dict(),
             "readiness": self.readiness.to_dict(),
+            "evidencePaths": list(self.evidence_paths),
             "passed": True,
         }
 
@@ -162,6 +164,7 @@ class KubernetesPreflightResult:
     environments: tuple[str, ...]
     namespaces: tuple[str, ...]
     evidence_path: str
+    evidence_paths: tuple[str, ...] = ()
 
 
 class KubernetesExecutionError(DevOpsStackError):
@@ -176,12 +179,14 @@ class KubernetesExecutionError(DevOpsStackError):
         identity: KubernetesArtifactIdentity,
         process_result: ProcessResult | None = None,
         diagnostics_paths: Sequence[str] = (),
+        evidence_paths: Sequence[str] = (),
     ) -> None:
         self.code = code
         self.stage = stage
         self.identity = identity
         self.process_result = process_result
         self.diagnostics_paths = tuple(diagnostics_paths)
+        self.evidence_paths = tuple(evidence_paths)
         super().__init__(f"{code} during {stage}: {message}")
 
     def to_dict(self) -> dict[str, object]:
@@ -192,6 +197,7 @@ class KubernetesExecutionError(DevOpsStackError):
             "message": str(self),
             "identity": self.identity.to_dict(),
             "diagnosticsPaths": list(self.diagnostics_paths),
+            "evidencePaths": list(self.evidence_paths),
             "process": (
                 {
                     "argv": list(self.process_result.argv),
@@ -209,6 +215,7 @@ class KubernetesExecutionError(DevOpsStackError):
 
 
 HttpGetter = Callable[[str, int, str, float], HttpSmokeResult]
+ProgressCallback = Callable[[str, Mapping[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -259,6 +266,7 @@ class KubernetesExecutor:
         port_forward_cleanup_timeout_seconds: float = 5.0,
         http_timeout_seconds: float = 5.0,
         http_getter: HttpGetter | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> None:
         if not isinstance(evidence_store, EvidenceStore):
             raise ValueError("evidence_store must be an EvidenceStore")
@@ -295,6 +303,9 @@ class KubernetesExecutor:
         )
         self.http_timeout = self._duration("http_timeout_seconds", http_timeout_seconds)
         self._http_get = http_getter or _loopback_http_get
+        if progress_callback is not None and not callable(progress_callback):
+            raise ValueError("progress_callback must be callable or null")
+        self._progress_callback = progress_callback
 
     def server_side_dry_run(
         self,
@@ -434,10 +445,18 @@ class KubernetesExecutor:
                 "passed": True,
             },
         )
+        self._notify_progress(
+            "cluster_prepared",
+            {
+                "environments": list(environments),
+                "evidencePath": evidence_path.relative_to(self.store.root).as_posix(),
+            },
+        )
         return KubernetesPreflightResult(
             environments=tuple(environments),
             namespaces=tuple(namespaces),
             evidence_path=evidence_path.relative_to(self.store.root).as_posix(),
+            evidence_paths=self._evidence_paths(),
         )
 
     def execute(
@@ -520,6 +539,10 @@ class KubernetesExecutor:
                 "--output",
                 "name",
             )
+            self._notify_progress(
+                "applied",
+                {"manifestPath": manifest_relative, "namespace": manifest.namespace},
+            )
 
             stage = "rollout"
             self._kubectl(
@@ -531,6 +554,13 @@ class KubernetesExecutor:
                 "--timeout",
                 f"{math.ceil(self.rollout_timeout)}s",
                 timeout=self.rollout_timeout + 5.0,
+            )
+            self._notify_progress(
+                "ready",
+                {
+                    "deployment": self.deployment_name,
+                    "namespace": manifest.namespace,
+                },
             )
 
             stage = "applied-deployment"
@@ -621,6 +651,14 @@ class KubernetesExecutor:
                     f"pod image digest {runtime_digest} does not match the expected digest",
                     identity=identity,
                 )
+            self._notify_progress(
+                "attested",
+                {
+                    "digest": runtime_digest,
+                    "pod": pod_name,
+                    "readyReplicaCount": ready_replica_count,
+                },
+            )
 
             stage = "smoke"
             health, readiness = self._smoke(
@@ -642,6 +680,13 @@ class KubernetesExecutor:
                     "schemaVersion": "1.0.0",
                     "health": health.to_dict(),
                     "readiness": readiness.to_dict(),
+                },
+            )
+            self._notify_progress(
+                "smoked",
+                {
+                    "healthStatus": health.status_code,
+                    "readinessStatus": readiness.status_code,
                 },
             )
 
@@ -673,12 +718,17 @@ class KubernetesExecutor:
             )
             stage = "persist-result"
             self.store.write_json("kubernetes/deployment.json", result.to_dict())
-            return result
+            self._notify_progress(
+                "evidence_collected",
+                {"rollbackPath": rollback_path, "finalDigest": identity.runtime_digest},
+            )
+            return replace(result, evidence_paths=self._evidence_paths())
         except KubernetesExecutionError as exc:
             if resources_may_exist:
                 exc.diagnostics_paths = tuple(
                     dict.fromkeys((*exc.diagnostics_paths, *self._collect_diagnostics()))
                 )
+            exc.evidence_paths = self._evidence_paths()
             raise
         except ProcessExecutionError as exc:
             diagnostics = self._write_process_failure(stage, exc.result)
@@ -691,6 +741,7 @@ class KubernetesExecutor:
                 identity=identity,
                 process_result=exc.result,
                 diagnostics_paths=tuple(dict.fromkeys(diagnostics)),
+                evidence_paths=self._evidence_paths(),
             ) from exc
         except (DevOpsStackError, OSError) as exc:
             diagnostics = self._collect_diagnostics() if resources_may_exist else ()
@@ -700,6 +751,7 @@ class KubernetesExecutor:
                 "execution evidence could not be persisted safely",
                 identity=identity,
                 diagnostics_paths=diagnostics,
+                evidence_paths=self._evidence_paths(),
             ) from exc
 
     def _validate_manifest_identity(
@@ -1435,10 +1487,9 @@ class KubernetesExecutor:
         )
         return evidence_path.relative_to(self.store.root).as_posix()
 
-    @staticmethod
-    def _process_summary(result: ProcessResult) -> dict[str, object]:
+    def _process_summary(self, result: ProcessResult) -> dict[str, object]:
         return {
-            "argv": list(result.argv),
+            "argv": [self._evidence_argument(value) for value in result.argv],
             "returnCode": result.returncode,
             "category": (
                 result.error_category.value if result.error_category is not None else None
@@ -1446,6 +1497,34 @@ class KubernetesExecutor:
             "stdoutTruncated": result.stdout_truncated,
             "stderrTruncated": result.stderr_truncated,
         }
+
+    def _evidence_argument(self, value: str) -> str:
+        if value == str(self.kubeconfig):
+            return "<private-kubeconfig>"
+        if value == str(self.cache_dir):
+            return "<private-kubectl-cache>"
+        try:
+            candidate = Path(value)
+            if candidate.is_absolute() and candidate.is_relative_to(self.store.root):
+                return candidate.relative_to(self.store.root).as_posix()
+        except (OSError, ValueError):
+            pass
+        return redact_process_output(value)
+
+    def _notify_progress(self, event: str, outputs: Mapping[str, Any]) -> None:
+        callback = self._progress_callback
+        if callback is not None:
+            callback(event, dict(outputs))
+
+    def _evidence_paths(self) -> tuple[str, ...]:
+        values: list[str] = []
+        for directory in (self.store.path("kubernetes"), self.store.path("diagnostics")):
+            for path in sorted(directory.rglob("*")):
+                if path.is_symlink():
+                    raise DevOpsStackError("Kubernetes evidence contains a symbolic link")
+                if path.is_file():
+                    values.append(path.relative_to(self.store.root).as_posix())
+        return tuple(values)
 
     def _deployment_revision(
         self,

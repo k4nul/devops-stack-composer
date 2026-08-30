@@ -410,7 +410,7 @@ users:
         self.runner = FakeKubectlRunner(self.project)
         self.http = FakeHttpGetter()
 
-    def executor(self) -> KubernetesExecutor:
+    def executor(self, *, progress_callback=None) -> KubernetesExecutor:
         return KubernetesExecutor(
             self.runner,
             self.store,
@@ -422,6 +422,7 @@ users:
             health_path="/health",
             readiness_path="/ready",
             http_getter=self.http,
+            progress_callback=progress_callback,
         )
 
     def test_server_side_dry_run_covers_every_environment_without_workload_apply(
@@ -466,6 +467,42 @@ users:
             [item["environment"] for item in evidence["environments"]],
             ["development", "staging", "production"],
         )
+        serialized = json.dumps(evidence, sort_keys=True)
+        self.assertNotIn(str(self.kubeconfig), serialized)
+        self.assertNotIn(str(self.project / "kubectl-cache"), serialized)
+        self.assertIn("<private-kubeconfig>", serialized)
+        self.assertIn("<private-kubectl-cache>", serialized)
+        self.assertIn(result.evidence_path, result.evidence_paths)
+
+    def test_reports_ordered_progress_and_complete_evidence_inventory(self) -> None:
+        events: list[tuple[str, dict[str, object]]] = []
+        executor = self.executor(
+            progress_callback=lambda event, outputs: events.append(
+                (event, dict(outputs))
+            )
+        )
+
+        preflight = executor.server_side_dry_run((environment_manifest("staging"),))
+        result = executor.execute(
+            resolved_manifest(),
+            expected_image_reference=REFERENCE,
+            expected_digest=DIGEST,
+        )
+
+        self.assertEqual(
+            [event for event, _outputs in events],
+            [
+                "cluster_prepared",
+                "applied",
+                "ready",
+                "attested",
+                "smoked",
+                "evidence_collected",
+            ],
+        )
+        self.assertIn(preflight.evidence_path, result.evidence_paths)
+        self.assertIn("kubernetes/deployment.json", result.evidence_paths)
+        self.assertIn("kubernetes/rollback.json", result.evidence_paths)
 
     def test_server_side_dry_run_validates_the_whole_set_before_namespace_apply(
         self,

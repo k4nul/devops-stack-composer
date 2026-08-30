@@ -21,8 +21,10 @@ from devops_stack_composer.execution import (
     vulnerability_policy_from_model,
 )
 from devops_stack_composer.execution_bundle import verify_execution_bundle
+from devops_stack_composer.evidence_bundle import verify_evidence_bundle
 from devops_stack_composer.execution_models import StageStatus, SupplyChainEvidence
 from devops_stack_composer.evidence_store import EvidenceStore
+from devops_stack_composer.execution_state import ExecutionJournal, ExecutionState
 from devops_stack_composer.kubernetes_execution import (
     HttpSmokeResult,
     KubernetesArtifactIdentity,
@@ -391,6 +393,9 @@ class SuccessfulKubernetesExecutor(FailingKubernetesExecutor):
             final_revision="3",
             health=HttpSmokeResult("/health", 200, '{"status":"healthy"}'),
             readiness=HttpSmokeResult("/ready", 200, '{"status":"ready"}'),
+            # The real executor returns a complete inventory which overlaps the
+            # legacy named path fields. The orchestrator must deduplicate it.
+            evidence_paths=tuple(paths),
         )
 
 
@@ -535,7 +540,7 @@ class ExecutionTests(unittest.TestCase):
                 StageStatus.BLOCKED_MISSING_REQUIRED_TOOL,
             )
             self.assertEqual(
-                self.stage(result, "server-side-dry-run").status,
+                self.stage(result, "registry-lifecycle").status,
                 StageStatus.BLOCKED_MISSING_REQUIRED_TOOL,
             )
             self.assertIn("REQUIRED_TOOL_MISSING", result.run.failure_reason)
@@ -543,7 +548,18 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(registry_factory.calls, 0)
             self.assertEqual(build.execute_count, 0)
             self.assertFalse(result.store.path("registry-ownership.json").exists())
-            result.store.verify_checksums()
+            self.assertEqual(
+                [stage.stage_id for stage in result.run.stage_results],
+                [
+                    "config-schema",
+                    "template-lock",
+                    "adapter-contracts",
+                    "generated-files",
+                    "registry-lifecycle",
+                ],
+            )
+            self.assertFalse(result.bundle_verification.execution_succeeded)
+            verify_evidence_bundle(result.store)
 
     def test_kubernetes_failure_persists_diagnostics_and_truthful_stage_progress(self) -> None:
         registry_factory = FakeRegistryFactory()
@@ -590,9 +606,8 @@ class ExecutionTests(unittest.TestCase):
                 self.stage(result, "readiness").status,
                 StageStatus.FAILED,
             )
-            self.assertEqual(
-                self.stage(result, "rollback").status,
-                StageStatus.NOT_APPLICABLE,
+            self.assertNotIn(
+                "rollback", [stage.stage_id for stage in result.run.stage_results]
             )
             self.assertIn("READINESS_PROBE_FAILED", result.run.failure_reason)
             self.assertEqual(
@@ -621,7 +636,7 @@ class ExecutionTests(unittest.TestCase):
             )
             self.assertEqual(kind_factory.instance.destroy_count, 1)
             self.assertEqual(registry_factory.instance.cleanup_count, 1)
-            result.store.verify_checksums()
+            verify_evidence_bundle(result.store)
 
     def test_kind_success_maps_managed_runtime_identity_into_closed_evidence(self) -> None:
         registry_factory = FakeRegistryFactory()
@@ -675,7 +690,15 @@ class ExecutionTests(unittest.TestCase):
             )
             self.assertEqual(kind_factory.instance.destroy_count, 1)
             self.assertEqual(registry_factory.instance.cleanup_count, 1)
-            result.store.verify_checksums()
+            self.assertTrue(result.bundle_verification.execution_succeeded)
+            self.assertTrue(result.store.path("run.json").is_file())
+            self.assertTrue(result.store.path("state.json").is_file())
+            self.assertFalse(result.store.path("execution-evidence.json").exists())
+            self.assertEqual(
+                ExecutionJournal.open(result.store).current_state,
+                ExecutionState.CLEANED,
+            )
+            verify_evidence_bundle(result.store)
 
     def test_cleanup_attempts_are_independent_and_aggregate_write_and_remove_failures(self) -> None:
         registry_factory = FakeRegistryFactory()
@@ -717,17 +740,16 @@ class ExecutionTests(unittest.TestCase):
 
             self.assertEqual(kind_factory.instance.destroy_count, 1)
             self.assertEqual(registry_factory.instance.cleanup_count, 1)
-            cleanup = self.stage(result, "cleanup")
-            self.assertEqual(cleanup.status, StageStatus.FAILED)
-            self.assertIn("kind diagnostic write failed", cleanup.failure_reason)
-            self.assertIn("kind destroy failed", cleanup.failure_reason)
-            self.assertIn("registry log write failed", cleanup.failure_reason)
-            self.assertIn("registry cleanup failed", cleanup.failure_reason)
+            self.assertNotIn(
+                "cleanup", [stage.stage_id for stage in result.run.stage_results]
+            )
             self.assertIn("kind destroy failed", result.run.failure_reason)
             self.assertIn("registry cleanup failed", result.run.failure_reason)
-            self.assertNotIn("diagnostics/kind-lifecycle.log", cleanup.evidence_paths)
-            self.assertNotIn("logs/registry.log", cleanup.evidence_paths)
-            result.store.verify_checksums()
+            self.assertEqual(
+                ExecutionJournal.open(result.store).current_state,
+                ExecutionState.FAILED,
+            )
+            verify_evidence_bundle(result.store)
 
     def test_legacy_and_current_vulnerability_shapes_map_explicitly(self) -> None:
         legacy = vulnerability_policy_from_model(
