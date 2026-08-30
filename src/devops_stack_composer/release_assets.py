@@ -15,6 +15,8 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email import policy
+from email.parser import Parser
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 import zipfile
@@ -996,30 +998,33 @@ def _safe_archive_name(value: str) -> PurePosixPath:
     return path
 
 
-def _metadata_headers(payload: bytes, source: str) -> dict[str, str]:
+def _metadata_identity(payload: bytes, source: str) -> tuple[str, str]:
     try:
-        lines = payload.decode("utf-8").splitlines()
+        text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ReleaseAssetError(
             "RELEASE_PACKAGE_INVALID", f"{source} is not UTF-8"
         ) from exc
-    headers: dict[str, str] = {}
-    for line in lines:
-        if not line:
-            break
-        if line.startswith((" ", "\t")):
-            continue
-        name, separator, value = line.partition(":")
-        if not separator:
+    if "\x00" in text:
+        raise ReleaseAssetError("RELEASE_PACKAGE_INVALID", f"invalid {source} header")
+    message = Parser(policy=policy.default).parsestr(text, headersonly=True)
+    if message.defects:
+        raise ReleaseAssetError("RELEASE_PACKAGE_INVALID", f"invalid {source} header")
+    identity: list[str] = []
+    for name in ("Name", "Version"):
+        values = message.get_all(name, failobj=[])
+        if len(values) != 1:
             raise ReleaseAssetError(
-                "RELEASE_PACKAGE_INVALID", f"invalid {source} header"
+                "RELEASE_PACKAGE_INVALID",
+                f"{source} must contain exactly one {name} header",
             )
-        if name in headers:
+        value = str(values[0]).strip()
+        if not value or any(character in value for character in "\r\n\x00"):
             raise ReleaseAssetError(
-                "RELEASE_PACKAGE_INVALID", f"duplicate {source} header: {name}"
+                "RELEASE_PACKAGE_INVALID", f"invalid {source} {name} header"
             )
-        headers[name] = value.strip()
-    return headers
+        identity.append(value)
+    return identity[0], identity[1]
 
 
 def _validate_wheel_payload(compressed: bytes, version: str) -> None:
@@ -1075,8 +1080,8 @@ def _validate_wheel_payload(compressed: bytes, version: str) -> None:
         raise ReleaseAssetError(
             "RELEASE_PACKAGE_INVALID", "wheel must contain exactly one METADATA file"
         )
-    headers = _metadata_headers(metadata[0], "wheel METADATA")
-    if headers.get("Name") != _DISTRIBUTION or headers.get("Version") != version:
+    name, metadata_version = _metadata_identity(metadata[0], "wheel METADATA")
+    if name != _DISTRIBUTION or metadata_version != version:
         raise ReleaseAssetError(
             "RELEASE_VERSION_MISMATCH", "wheel metadata name or version does not match"
         )
@@ -1146,8 +1151,8 @@ def _validate_sdist_payload(compressed: bytes, version: str) -> None:
         raise ReleaseAssetError(
             "RELEASE_PACKAGE_INVALID", "sdist needs one root and one root PKG-INFO"
         )
-    headers = _metadata_headers(metadata[0], "sdist PKG-INFO")
-    if headers.get("Name") != _DISTRIBUTION or headers.get("Version") != version:
+    name, metadata_version = _metadata_identity(metadata[0], "sdist PKG-INFO")
+    if name != _DISTRIBUTION or metadata_version != version:
         raise ReleaseAssetError(
             "RELEASE_VERSION_MISMATCH", "sdist metadata name or version does not match"
         )

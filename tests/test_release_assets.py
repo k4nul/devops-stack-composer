@@ -26,9 +26,11 @@ VERSION = "0.2.0"
 REPOSITORY = "https://github.com/k4nul/devops-stack-composer"
 
 
-def _wheel(path: Path) -> None:
+def _wheel(path: Path, extra_metadata: str = "") -> None:
     metadata = (
-        f"Metadata-Version: 2.1\nName: devops-stack-composer\nVersion: {VERSION}\n\n"
+        f"Metadata-Version: 2.1\nName: devops-stack-composer\nVersion: {VERSION}\n"
+        "Classifier: Programming Language :: Python :: 3\n"
+        f"Classifier: Programming Language :: Python :: 3.12\n{extra_metadata}\n"
     )
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
@@ -38,9 +40,11 @@ def _wheel(path: Path) -> None:
         archive.writestr("devops_stack_composer/__init__.py", "__version__ = '0.2.0'\n")
 
 
-def _sdist(path: Path) -> None:
+def _sdist(path: Path, extra_metadata: str = "") -> None:
     metadata = (
-        f"Metadata-Version: 2.1\nName: devops-stack-composer\nVersion: {VERSION}\n\n"
+        f"Metadata-Version: 2.1\nName: devops-stack-composer\nVersion: {VERSION}\n"
+        "Classifier: Programming Language :: Python :: 3\n"
+        f"Classifier: Programming Language :: Python :: 3.12\n{extra_metadata}\n"
     ).encode()
     root = f"devops_stack_composer-{VERSION}"
     with tarfile.open(path, "w:gz") as archive:
@@ -189,6 +193,14 @@ class ReleaseAssetTests(unittest.TestCase):
             archive.writestr("../outside.txt", "escape")
 
         with self.assertRaisesRegex(ReleaseAssetError, "RELEASE_ARCHIVE_UNSAFE"):
+            self.materials()
+
+        self.assertFalse((self.project / "dist" / "materials").exists())
+
+    def test_repeated_package_identity_header_is_rejected(self) -> None:
+        _wheel(self.wheel, "Name: substituted-distribution\n")
+
+        with self.assertRaisesRegex(ReleaseAssetError, "exactly one Name header"):
             self.materials()
 
         self.assertFalse((self.project / "dist" / "materials").exists())
