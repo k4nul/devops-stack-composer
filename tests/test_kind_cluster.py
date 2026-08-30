@@ -143,14 +143,19 @@ class FakeKindRunner:
                     content = self.copy_round_trip_override
                 return self._completed(command, stdout=content)
 
-        if command[:4] == ["docker", "exec", "-i", NODE_ID]:
-            if command[4:6] == ["cp", "/dev/stdin"]:
-                self.container_files[(NODE_ID, command[6])] = str(kwargs.get("input") or "")
+        if command[:2] == ["docker", "cp"]:
+            source = Path(command[2])
+            container_id, separator, destination = command[3].partition(":")
+            if container_id == NODE_ID and separator:
+                self.container_files[(NODE_ID, destination)] = source.read_text(
+                    encoding="utf-8"
+                )
                 return self._completed(command)
 
         if command[:3] == ["kubectl", "--kubeconfig", command[2]]:
-            if command[3:6] == ["apply", "-f", "-"]:
-                manifest = str(kwargs.get("input") or "")
+            if command[3:5] == ["apply", "-f"]:
+                manifest_path = Path(command[5])
+                manifest = manifest_path.read_text(encoding="utf-8")
                 host_line = next(
                     line.strip()
                     for line in manifest.splitlines()
@@ -282,7 +287,7 @@ class KindClusterTests(unittest.TestCase):
             self.assertFalse(options["check"])
             self.assertTrue(options["capture_output"])
             self.assertTrue(options["text"])
-            self.assertIn("input", options)
+            self.assertNotIn("input", options)
         cluster.destroy()
 
     def test_generated_names_are_unique_dns_safe_and_run_scoped(self) -> None:
@@ -554,10 +559,17 @@ class KindClusterTests(unittest.TestCase):
             ["docker", "exec", NODE_ID, "mkdir", "-p", registry_directory],
             runner.calls,
         )
-        copy_index = runner.calls.index(
-            ["docker", "exec", "-i", NODE_ID, "cp", "/dev/stdin", hosts_path]
+        copy_index = next(
+            index
+            for index, command in enumerate(runner.calls)
+            if command[:2] == ["docker", "cp"]
         )
-        self.assertEqual(runner.call_options[copy_index]["input"], expected_hosts)
+        copy = runner.calls[copy_index]
+        hosts_source = Path(copy[2])
+        self.assertEqual(copy[3], f"{NODE_ID}:{hosts_path}")
+        self.assertEqual(hosts_source.read_text(encoding="utf-8"), expected_hosts)
+        self.assertEqual(stat.S_IMODE(hosts_source.stat().st_mode), 0o600)
+        self.assertNotIn("input", runner.call_options[copy_index])
         self.assertIn(["docker", "exec", NODE_ID, "cat", hosts_path], runner.calls)
         self.assertEqual(registry.connect_calls, [KIND_NETWORK_NAME])
         apply_index = next(
@@ -565,10 +577,14 @@ class KindClusterTests(unittest.TestCase):
             for index, command in enumerate(runner.calls)
             if command[0] == "kubectl" and "apply" in command
         )
-        manifest = str(runner.call_options[apply_index]["input"])
+        apply = runner.calls[apply_index]
+        manifest_path = Path(apply[apply.index("-f") + 1])
+        manifest = manifest_path.read_text(encoding="utf-8")
         self.assertIn('host: "localhost:49153"', manifest)
         self.assertIn("name: local-registry-hosting", manifest)
         self.assertIn("namespace: kube-public", manifest)
+        self.assertEqual(stat.S_IMODE(manifest_path.stat().st_mode), 0o600)
+        self.assertNotIn("input", runner.call_options[apply_index])
         self.assertEqual(configured.host_endpoint, "localhost:49153")
         self.assertEqual(
             configured.container_endpoint,

@@ -182,6 +182,26 @@ class LocalRegistryConfiguration:
 
 
 @dataclass(frozen=True)
+class KindNodeRecoveryIdentity:
+    """Non-secret immutable identity used to recover one kind node safely."""
+
+    name: str
+    container_id: str
+    role: str
+
+
+@dataclass(frozen=True)
+class KindClusterRecoveryIdentity:
+    """Non-secret cluster identity suitable for durable cleanup records."""
+
+    run_id: str
+    name: str
+    context: str
+    node_image: str
+    nodes: tuple[KindNodeRecoveryIdentity, ...]
+
+
+@dataclass(frozen=True)
 class _NodeIdentity:
     name: str
     container_id: str
@@ -285,6 +305,23 @@ class KindCluster:
     @property
     def registry_configuration(self) -> LocalRegistryConfiguration | None:
         return self._registry_configuration
+
+    @property
+    def recovery_identity(self) -> KindClusterRecoveryIdentity | None:
+        """Return only the non-secret identity needed for restart-safe cleanup."""
+
+        if self._handle is None or not self._owned_nodes:
+            return None
+        return KindClusterRecoveryIdentity(
+            run_id=self.run_id,
+            name=self.name,
+            context=self._handle.context,
+            node_image=self._handle.node_image,
+            nodes=tuple(
+                KindNodeRecoveryIdentity(node.name, node.container_id, node.role)
+                for node in self._owned_nodes
+            ),
+        )
 
     @property
     def diagnostics(self) -> str:
@@ -492,6 +529,7 @@ class KindCluster:
         hosts_toml = (
             f'[host."http://{registry_handle.name}:{REGISTRY_CONTAINER_PORT}"]\n'
         )
+        hosts_source = self._write_runtime_file("registry-hosts.toml", hosts_toml)
         for node in nodes:
             mkdir = self._run(
                 ["docker", "exec", node.container_id, "mkdir", "-p", registry_directory]
@@ -500,14 +538,10 @@ class KindCluster:
             copy = self._run(
                 [
                     "docker",
-                    "exec",
-                    "-i",
-                    node.container_id,
                     "cp",
-                    "/dev/stdin",
-                    hosts_path,
-                ],
-                stdin=hosts_toml,
+                    str(hosts_source),
+                    f"{node.container_id}:{hosts_path}",
+                ]
             )
             self._require_success(copy, f"write containerd registry alias on {node.name}")
             read_back = self._run(
@@ -530,10 +564,20 @@ class KindCluster:
             )
 
         manifest, configmap_data = self._registry_configmap(registry_handle.host_port)
+        manifest_path = self._write_runtime_file(
+            "local-registry-hosting.yaml",
+            manifest,
+        )
         kubeconfig = self._require_kubeconfig_path()
         apply_result = self._run(
-            ["kubectl", "--kubeconfig", str(kubeconfig), "apply", "-f", "-"],
-            stdin=manifest,
+            [
+                "kubectl",
+                "--kubeconfig",
+                str(kubeconfig),
+                "apply",
+                "-f",
+                str(manifest_path),
+            ],
         )
         self._require_success(apply_result, "publish local-registry-hosting ConfigMap")
         self._verify_registry_configmap(configmap_data)
@@ -935,6 +979,19 @@ class KindCluster:
             raise KindClusterError("private kind kubeconfig is unavailable")
         return self._kubeconfig_path
 
+    def _write_runtime_file(self, name: str, content: str) -> Path:
+        runtime = self._runtime_directory
+        if runtime is None or name not in {
+            "registry-hosts.toml",
+            "local-registry-hosting.yaml",
+        }:
+            raise KindClusterError("private kind runtime directory is unavailable")
+        path = Path(runtime.name) / name
+        if path.exists() or path.is_symlink():
+            raise KindClusterError(f"private runtime file already exists: {name}")
+        self._write_private_file(path, content)
+        return path
+
     def _cleanup_runtime_files(self) -> None:
         runtime = self._runtime_directory
         if runtime is None:
@@ -954,7 +1011,6 @@ class KindCluster:
         self,
         command: Sequence[str],
         *,
-        stdin: str | None = None,
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         argv = list(command)
@@ -964,7 +1020,6 @@ class KindCluster:
                 check=False,
                 capture_output=True,
                 text=True,
-                input=stdin,
                 timeout=self._command_timeout if timeout is None else timeout,
             )
         except FileNotFoundError as exc:
@@ -1023,7 +1078,9 @@ __all__ = [
     "KindClusterError",
     "KindClusterHandle",
     "KindClusterOwnershipError",
+    "KindClusterRecoveryIdentity",
     "KindClusterStatus",
+    "KindNodeRecoveryIdentity",
     "KindVersionError",
     "LocalRegistryConfiguration",
 ]
