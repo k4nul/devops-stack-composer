@@ -21,7 +21,7 @@ def v02_config() -> dict:
     config["execution"] = {
         "profile": "local-kind",
         "workDirectory": ".devops-stack/runs",
-        "cleanup": "on-success",
+        "cleanup": "always",
         "retainFailureEvidence": True,
     }
     config["registry"] = {
@@ -130,7 +130,10 @@ class V02ConfigTests(unittest.TestCase):
         model = normalize_config(raw)
 
         self.assertEqual(model.validation_profile, "kind-e2e")
-        self.assertEqual(model.execution, raw["execution"])
+        self.assertEqual(
+            model.execution,
+            {**raw["execution"], "profile": "kind-e2e"},
+        )
         self.assertEqual(model.registry, raw["registry"])
         self.assertEqual(model.kubernetes_e2e, raw["kubernetes"]["e2e"])
         self.assertTrue(model.supply_chain["sbom"]["enabled"])
@@ -229,6 +232,23 @@ class V02ConfigTests(unittest.TestCase):
                 invalid["supplyChain"][capability]["enabled"] = False
                 with self.assertRaises(ConfigValidationError):
                     validate_config(invalid)
+
+    def test_execution_profile_and_cleanup_policies_cannot_diverge(self) -> None:
+        invalid_profile = v02_config()
+        invalid_profile["execution"]["profile"] = "supply-chain"
+        with self.assertRaises(ConfigValidationError) as profile_error:
+            validate_config(invalid_profile)
+        self.assertIn("$.execution.profile", str(profile_error.exception))
+
+        invalid_cleanup = v02_config()
+        invalid_cleanup["kubernetes"]["e2e"]["cleanup"] = "on-success"
+        with self.assertRaises(ConfigValidationError) as cleanup_error:
+            validate_config(invalid_cleanup)
+        self.assertIn("$.kubernetes.e2e.cleanup", str(cleanup_error.exception))
+
+        valid_alias = v02_config()
+        validate_config(valid_alias)
+        self.assertEqual(normalize_config(valid_alias).execution["profile"], "kind-e2e")
 
     def test_new_blocks_are_complete_when_present(self) -> None:
         required_fields = (

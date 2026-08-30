@@ -184,6 +184,61 @@ def _issue(error: ValidationError) -> ValidationIssue:
     )
 
 
+def _cross_field_issues(config: dict[str, Any]) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    validation_profile = config.get("validation", {}).get("profile", "static")
+    configured_execution = config.get("execution")
+    execution_profile = (
+        configured_execution.get("profile", validation_profile)
+        if isinstance(configured_execution, dict)
+        else validation_profile
+    )
+    canonical_execution_profile = (
+        "kind-e2e" if execution_profile == "local-kind" else execution_profile
+    )
+    if canonical_execution_profile != validation_profile:
+        issues.append(
+            ValidationIssue(
+                path="$.execution.profile",
+                expected=f"the validation profile {validation_profile!r}",
+                received=json.dumps(execution_profile),
+                example=json.dumps(validation_profile),
+                message=(
+                    "execution and validation profiles must select the same policy; "
+                    "local-kind is only an alias for kind-e2e"
+                ),
+            )
+        )
+
+    execution_cleanup = (
+        configured_execution.get("cleanup", "always")
+        if isinstance(configured_execution, dict)
+        else "always"
+    )
+    configured_kubernetes = config.get("kubernetes")
+    kubernetes_e2e = (
+        configured_kubernetes.get("e2e", {})
+        if isinstance(configured_kubernetes, dict)
+        else {}
+    )
+    kubernetes_cleanup = (
+        kubernetes_e2e.get("cleanup", execution_cleanup)
+        if isinstance(kubernetes_e2e, dict)
+        else execution_cleanup
+    )
+    if kubernetes_cleanup != execution_cleanup:
+        issues.append(
+            ValidationIssue(
+                path="$.kubernetes.e2e.cleanup",
+                expected=f"the authoritative execution cleanup policy {execution_cleanup!r}",
+                received=json.dumps(kubernetes_cleanup),
+                example=json.dumps(execution_cleanup),
+                message="execution.cleanup and kubernetes.e2e.cleanup must match",
+            )
+        )
+    return issues
+
+
 def parse_config(text: str, *, source: str = "<memory>") -> dict[str, Any]:
     try:
         value = yaml.load(text, Loader=StrictSafeLoader)
@@ -212,6 +267,8 @@ def validate_config(config: dict[str, Any], *, schema: dict[str, Any] | None = N
     errors = sorted(validator.iter_errors(config), key=lambda error: list(error.absolute_path))
     issues = [_issue(error) for error in errors]
     issues.extend(_non_finite_issues(config))
+    if not issues:
+        issues.extend(_cross_field_issues(config))
     if issues:
         raise ConfigValidationError(issues)
     registry = config.get("image", {}).get("registry")

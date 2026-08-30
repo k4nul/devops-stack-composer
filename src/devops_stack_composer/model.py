@@ -193,6 +193,8 @@ def normalize_config(config: dict[str, Any]) -> NormalizedDevOpsModel:
             },
         )
     )
+    if execution["profile"] == "local-kind":
+        execution["profile"] = "kind-e2e"
     registry = deepcopy(
         config.get(
             "registry",
@@ -216,7 +218,7 @@ def normalize_config(config: dict[str, Any]) -> NormalizedDevOpsModel:
                     "healthPath": environments[1].health_path,
                     "readinessPath": environments[1].readiness_path,
                     "rollbackTest": True,
-                    "cleanup": "always",
+                    "cleanup": execution["cleanup"],
                 }
             },
         )["e2e"]
