@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import subprocess
-from dataclasses import dataclass
+import shutil
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -38,6 +39,7 @@ from devops_stack_composer.filesystem import (
     sha256_file,
 )
 from devops_stack_composer.kind_cluster import KindCluster
+from devops_stack_composer.kubernetes_execution import KubernetesExecutionError
 from devops_stack_composer.kubernetes_runtime import render_resolved_environment
 from devops_stack_composer.oci import validate_tag
 from devops_stack_composer.policies import (
@@ -56,6 +58,7 @@ SourceRevisionResolver = Callable[[Path], str]
 RegistryFactory = Callable[[str], EphemeralRegistry]
 KindFactory = Callable[[str], KindCluster]
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+ToolResolver = Callable[[str], str | None]
 
 
 class ExecutionError(DevOpsStackError):
@@ -254,6 +257,7 @@ class ExecutionOrchestrator:
         kind_factory: KindFactory = KindCluster,
         kubernetes_executor: object | None = None,
         schema_command_runner: CommandRunner | None = None,
+        tool_resolver: ToolResolver | None = None,
         source_revision_resolver: SourceRevisionResolver | None = None,
         clock: Clock | None = None,
     ) -> None:
@@ -263,6 +267,7 @@ class ExecutionOrchestrator:
         self._kind_factory = kind_factory
         self._kubernetes_executor = kubernetes_executor
         self._schema_command_runner = schema_command_runner or subprocess.run
+        self._tool_resolver = tool_resolver or shutil.which
         self._source_revision_resolver = (
             source_revision_resolver or _default_source_revision
         )
@@ -393,6 +398,163 @@ class ExecutionOrchestrator:
                 "RELEASE_RESOURCE_RETENTION_FORBIDDEN",
                 "release validation cannot retain run-owned resources",
             )
+
+    def _missing_required_tools(
+        self,
+        profile: ValidationProfile,
+        *,
+        registry_mode: str,
+    ) -> tuple[tuple[str, str], ...]:
+        if profile == ValidationProfile.STATIC:
+            return ()
+        required: list[tuple[str, str]] = [
+            (
+                "docker",
+                "registry-lifecycle"
+                if registry_mode == "ephemeral-local"
+                else "build-once",
+            ),
+            ("syft", "sbom"),
+            ("trivy", "vulnerability-scan"),
+        ]
+        if profile in {ValidationProfile.KIND_E2E, ValidationProfile.RELEASE}:
+            required.extend(
+                (
+                    ("kubeconform", "kubernetes-schema"),
+                    ("kind", "server-side-dry-run"),
+                    ("kubectl", "server-side-dry-run"),
+                )
+            )
+        if profile == ValidationProfile.RELEASE:
+            required.extend(
+                (
+                    ("cosign", "release-assets"),
+                    ("gh", "release-download-verification"),
+                )
+            )
+        return tuple(
+            (tool, stage_id)
+            for tool, stage_id in required
+            if not self._tool_resolver(tool)
+        )
+
+    @staticmethod
+    def _kubernetes_progress(
+        error: KubernetesExecutionError,
+    ) -> tuple[tuple[str, ...], str]:
+        initial_stages = (
+            "server-side-dry-run",
+            "deployment",
+            "rollout",
+            "pod-image",
+            "health",
+            "readiness",
+        )
+        phase = error.phase
+        if phase in {"preflight", "namespace-bootstrap", "server-side-dry-run"}:
+            return (), "server-side-dry-run"
+        if phase == "apply":
+            return initial_stages[:1], "deployment"
+        if phase == "rollout":
+            if error.code == "DEPLOYMENT_IMAGE_DIGEST_MISMATCH":
+                return initial_stages[:1], "deployment"
+            if error.code.startswith("POD_"):
+                return initial_stages[:3], "pod-image"
+            return initial_stages[:2], "rollout"
+        if phase == "health":
+            return initial_stages[:4], "health"
+        if phase == "readiness":
+            return initial_stages[:5], "readiness"
+        if phase in {
+            "rollback-smoke",
+            "rollback",
+            "post-rollback-health",
+            "post-rollback-readiness",
+        }:
+            return initial_stages, "rollback"
+        return (), "server-side-dry-run"
+
+    def _record_kubernetes_failure(
+        self,
+        *,
+        error: KubernetesExecutionError,
+        store: EvidenceStore,
+        plan: ExecutionPlan,
+        stage_results: dict[str, StageResult],
+        manifest_paths: Sequence[str],
+        started: str,
+    ) -> tuple[str, str]:
+        completed_stages, failure_stage = self._kubernetes_progress(error)
+        persistence_failures: list[str] = []
+        diagnostic_paths: list[str] = []
+        for record in error.diagnostics:
+            try:
+                store.write_text(record.path, record.content)
+                diagnostic_paths.append(record.path)
+            except BaseException as write_error:
+                persistence_failures.append(
+                    f"{record.path}: {_safe_failure(write_error)}"
+                )
+
+        error_record_path = "kubernetes/execution-error.json"
+        try:
+            store.write_json(
+                error_record_path,
+                {
+                    "schemaVersion": "1.0.0",
+                    "code": error.code,
+                    "phase": error.phase,
+                    "failureStage": failure_stage,
+                    "completedStages": list(completed_stages),
+                    "rollbackAttempted": error.rollback_attempted,
+                    "rollbackSucceeded": error.rollback_succeeded,
+                    "diagnosticsPaths": diagnostic_paths,
+                    "failureReason": _safe_failure(error),
+                },
+            )
+        except BaseException as write_error:
+            persistence_failures.append(
+                f"{error_record_path}: {_safe_failure(write_error)}"
+            )
+            error_record_path = ""
+
+        evidence_paths = tuple(
+            (
+                *manifest_paths,
+                *diagnostic_paths,
+                *((error_record_path,) if error_record_path else ()),
+            )
+        )
+        for stage_id in completed_stages:
+            if stage_id not in stage_results:
+                stage_results[stage_id] = self._stage(
+                    plan,
+                    stage_id,
+                    StageStatus.PASSED,
+                    started=started,
+                    tool="kubectl",
+                    output=(
+                        f"The Kubernetes executor completed {stage_id} before "
+                        f"the reported {error.phase} failure"
+                    ),
+                    evidence_paths=evidence_paths,
+                )
+
+        failure_reason = f"{error.code}: {_safe_failure(error)}"
+        if persistence_failures:
+            failure_reason += "; diagnostics persistence: " + "; ".join(
+                persistence_failures
+            )
+        stage_results[failure_stage] = self._stage(
+            plan,
+            failure_stage,
+            StageStatus.FAILED,
+            started=started,
+            tool="kubectl",
+            evidence_paths=evidence_paths,
+            failure_reason=failure_reason,
+        )
+        return failure_stage, failure_reason
 
     def _write_build_inputs(self, store: EvidenceStore, composition: Composition) -> Path:
         dockerfile = store.write_text(
@@ -562,6 +724,10 @@ class ExecutionOrchestrator:
         model = composition.loaded_config.model
         profile = options.profile
         assert isinstance(profile, ValidationProfile)
+        missing_tools = self._missing_required_tools(
+            profile,
+            registry_mode=model.registry["mode"],
+        )
         source_revision = self._source_revision_resolver(composition.project)
         store = EvidenceStore.create(
             composition.project,
@@ -586,6 +752,8 @@ class ExecutionOrchestrator:
         failure_status = StageStatus.FAILED
         current_stage = "config-schema"
         plan: ExecutionPlan | None = None
+        kubernetes_manifest_paths: tuple[str, ...] = ()
+        cluster_started = started_at
 
         try:
             static_time = self._now()
@@ -612,32 +780,6 @@ class ExecutionOrchestrator:
                     end_time=self._now(),
                 )
 
-            if profile != ValidationProfile.STATIC:
-                current_stage = "registry-lifecycle"
-                registry_started = self._now()
-                if model.registry["mode"] == "ephemeral-local":
-                    registry = self._registry_factory(store.run_id)
-                    handle = registry.start()
-                    registry_endpoint = f"localhost:{handle.host_port}"
-                    repository_path = model.registry["repository"]
-                    store.write_json("registry-ownership.json", handle.to_dict())
-                    registry_output = (
-                        "Isolated loopback registry started for local test execution"
-                    )
-                    registry_evidence = ("registry-ownership.json",)
-                else:
-                    registry_endpoint = model.registry["host"]
-                    repository_path = model.registry["repository"]
-                    registry_output = (
-                        "Existing registry selected; authentication remains delegated "
-                        "to the Docker credential helper"
-                    )
-                    registry_evidence = ()
-            else:
-                registry_started = self._now()
-                registry_output = "No execution registry is required by the static profile"
-                registry_evidence = ()
-
             dockerfile = self._write_build_inputs(store, composition)
             dockerfile_relative = dockerfile.relative_to(composition.project).as_posix()
             intent = ArtifactIntent(
@@ -661,6 +803,58 @@ class ExecutionOrchestrator:
                 artifact_intent=intent,
                 production_apply_approved=options.approve_production,
             )
+
+            if missing_tools:
+                store.write_json("execution-plan.json", plan.to_dict())
+                current_stage = missing_tools[0][1]
+                missing_names = ", ".join(tool for tool, _stage_id in missing_tools)
+                raise ExecutionError(
+                    "REQUIRED_TOOL_MISSING",
+                    f"profile {profile.value} requires unavailable tools: {missing_names}",
+                )
+
+            if profile != ValidationProfile.STATIC:
+                current_stage = "registry-lifecycle"
+                registry_started = self._now()
+                if model.registry["mode"] == "ephemeral-local":
+                    registry = self._registry_factory(store.run_id)
+                    handle = registry.start()
+                    registry_endpoint = f"localhost:{handle.host_port}"
+                    repository_path = model.registry["repository"]
+                    store.write_json("registry-ownership.json", handle.to_dict())
+                    registry_output = (
+                        "Isolated loopback registry started for local test execution"
+                    )
+                    registry_evidence = ("registry-ownership.json",)
+                else:
+                    registry_endpoint = model.registry["host"]
+                    repository_path = model.registry["repository"]
+                    registry_output = (
+                        "Existing registry selected; authentication remains delegated "
+                        "to the Docker credential helper"
+                    )
+                    registry_evidence = ()
+                if (
+                    registry_endpoint != intent.registry
+                    or repository_path != intent.repository
+                ):
+                    intent = replace(
+                        intent,
+                        registry=registry_endpoint,
+                        repository=repository_path,
+                    )
+                    plan = ExecutionPlan.create(
+                        run_id=store.run_id,
+                        profile=profile,
+                        environment=options.environment,
+                        artifact_intent=intent,
+                        production_apply_approved=options.approve_production,
+                    )
+            else:
+                registry_started = self._now()
+                registry_output = "No execution registry is required by the static profile"
+                registry_evidence = ()
+
             store.write_json("execution-plan.json", plan.to_dict())
 
             if profile == ValidationProfile.STATIC:
@@ -861,6 +1055,7 @@ class ExecutionOrchestrator:
                         relative = f"kubernetes/{manifest.environment}.yaml"
                         store.write_text(relative, manifest.content)
                         manifest_paths.append(relative)
+                    kubernetes_manifest_paths = tuple(manifest_paths)
                     schema_result = self._schema_command_runner(
                         [
                             "kubeconform",
@@ -999,6 +1194,16 @@ class ExecutionOrchestrator:
                             evidence_paths=kubernetes_evidence,
                         )
 
+        except KubernetesExecutionError as error:
+            assert plan is not None
+            current_stage, failure_reason = self._record_kubernetes_failure(
+                error=error,
+                store=store,
+                plan=plan,
+                stage_results=stage_results,
+                manifest_paths=kubernetes_manifest_paths,
+                started=cluster_started,
+            )
         except BaseException as error:
             failure_reason = _safe_failure(error)
             if getattr(error, "code", None) == "REQUIRED_TOOL_MISSING":
@@ -1058,6 +1263,8 @@ class ExecutionOrchestrator:
                         ),
                     )
                 else:
+                    cleanup_failures: list[str] = []
+                    cleanup_evidence: list[str] = []
                     if cluster is not None:
                         try:
                             if cluster.diagnostics:
@@ -1065,21 +1272,43 @@ class ExecutionOrchestrator:
                                     "diagnostics/kind-lifecycle.log",
                                     cluster.diagnostics,
                                 )
+                                cleanup_evidence.append(
+                                    "diagnostics/kind-lifecycle.log"
+                                )
+                        except BaseException as error:
+                            cleanup_failures.append(
+                                f"cluster diagnostics: {_safe_failure(error)}"
+                            )
+                        try:
                             cluster.destroy()
                         except BaseException as error:
-                            cleanup_failure = _safe_failure(error)
+                            cleanup_failures.append(
+                                f"cluster cleanup: {_safe_failure(error)}"
+                            )
                     if registry is not None:
                         try:
                             registry_log = registry.logs()
-                            store.write_text("logs/registry.log", registry_log or "")
+                        except BaseException as error:
+                            cleanup_failures.append(
+                                f"registry diagnostics: {_safe_failure(error)}"
+                            )
+                        else:
+                            try:
+                                store.write_text("logs/registry.log", registry_log or "")
+                                cleanup_evidence.append("logs/registry.log")
+                            except BaseException as error:
+                                cleanup_failures.append(
+                                    f"registry diagnostics: {_safe_failure(error)}"
+                                )
+                        try:
                             registry.cleanup()
                         except BaseException as error:
-                            detail = _safe_failure(error)
-                            cleanup_failure = (
-                                f"{cleanup_failure}; {detail}"
-                                if cleanup_failure
-                                else detail
+                            cleanup_failures.append(
+                                f"registry cleanup: {_safe_failure(error)}"
                             )
+                    cleanup_failure = (
+                        "; ".join(cleanup_failures) if cleanup_failures else None
+                    )
                     stage_results["cleanup"] = self._stage(
                         plan,
                         "cleanup",
@@ -1095,19 +1324,7 @@ class ExecutionOrchestrator:
                             if cleanup_failure is not None
                             else "All run-owned resources were removed or none were created"
                         ),
-                        evidence_paths=tuple(
-                            path
-                            for path in (
-                                "logs/registry.log" if registry is not None else None,
-                                (
-                                    "diagnostics/kind-lifecycle.log"
-                                    if cluster is not None
-                                    and store.path("diagnostics/kind-lifecycle.log").exists()
-                                    else None
-                                ),
-                            )
-                            if path is not None
-                        ),
+                        evidence_paths=tuple(cleanup_evidence),
                         failure_reason=cleanup_failure,
                         remediation=(
                             "Inspect persisted ownership records and remove only verified "

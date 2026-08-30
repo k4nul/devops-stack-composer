@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from devops_stack_composer.adapters.base import AdapterResult, GeneratedArtifact
 from devops_stack_composer.build_once import BuildResult, PlatformDescriptor
@@ -18,7 +21,13 @@ from devops_stack_composer.execution import (
     vulnerability_policy_from_model,
 )
 from devops_stack_composer.execution_bundle import verify_execution_bundle
-from devops_stack_composer.execution_models import SupplyChainEvidence
+from devops_stack_composer.execution_models import StageStatus, SupplyChainEvidence
+from devops_stack_composer.evidence_store import EvidenceStore
+from devops_stack_composer.kubernetes_execution import (
+    DiagnosticRecord,
+    KubernetesExecutionError,
+)
+from devops_stack_composer.kubernetes_runtime import ResolvedKubernetesManifest
 from devops_stack_composer.locks import TemplateLock
 from devops_stack_composer.sources import SourceResolution
 from devops_stack_composer.validation import CheckResult, ValidationReport, ValidationStatus
@@ -93,6 +102,32 @@ def composition(project: Path) -> Composition:
     return Composition(project, loaded, lock, sources, results, artifacts, validation)
 
 
+def kind_composition(project: Path) -> Composition:
+    value = composition(project)
+    model = replace(
+        value.loaded_config.model,
+        registry={
+            "mode": "ephemeral-local",
+            "host": "localhost",
+            "repository": value.loaded_config.model.image_repository,
+            "insecureLocalhostOnly": True,
+        },
+    )
+    return replace(value, loaded_config=replace(value.loaded_config, model=model))
+
+
+def resolved_manifest(_artifacts, _model, environment, immutable_reference):
+    content = f"apiVersion: v1\nkind: List\nmetadata:\n  name: {environment}\n"
+    return ResolvedKubernetesManifest(
+        environment=environment,
+        namespace=f"sample-api-{environment}",
+        immutable_image_reference=immutable_reference,
+        content=content,
+        sha256=hashlib.sha256(content.encode()).hexdigest(),
+        resource_ids=(f"v1/List//{environment}",),
+    )
+
+
 class FakeBuildExecutor:
     def __init__(self) -> None:
         self.execute_count = 0
@@ -164,14 +199,172 @@ class FakeSupplyChainGenerator:
         )
 
 
+class FakeRegistryHandle:
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.name = "fake-registry"
+        self.container_id = "d" * 64
+        self.host_port = 5001
+
+    def to_dict(self):
+        return {
+            "runId": self.run_id,
+            "name": self.name,
+            "containerId": self.container_id,
+            "hostPort": self.host_port,
+        }
+
+
+class FakeRegistry:
+    def __init__(self, run_id: str) -> None:
+        self.handle = FakeRegistryHandle(run_id)
+        self.start_count = 0
+        self.cleanup_count = 0
+        self.cleanup_error: BaseException | None = None
+
+    def start(self):
+        self.start_count += 1
+        return self.handle
+
+    def logs(self):
+        return "registry diagnostics"
+
+    def cleanup(self):
+        self.cleanup_count += 1
+        if self.cleanup_error is not None:
+            raise self.cleanup_error
+        return True
+
+
+class FakeRegistryFactory:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.instance: FakeRegistry | None = None
+        self.cleanup_error: BaseException | None = None
+
+    def __call__(self, run_id: str):
+        self.calls += 1
+        self.instance = FakeRegistry(run_id)
+        self.instance.cleanup_error = self.cleanup_error
+        return self.instance
+
+
+class FakeKindHandle:
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.name = "fake-kind"
+
+    def to_dict(self):
+        return {
+            "runId": self.run_id,
+            "name": self.name,
+            "nodeImage": "fake@sha256:" + "e" * 64,
+            "nodes": [],
+        }
+
+
+class FakeKindCluster:
+    def __init__(self, run_id: str) -> None:
+        self.handle = FakeKindHandle(run_id)
+        self.kubeconfig_path = Path("/private/fake-kubeconfig")
+        self.diagnostics = "kind diagnostics"
+        self.create_count = 0
+        self.destroy_count = 0
+        self.detach_count = 0
+        self.destroy_error: BaseException | None = None
+
+    def create(self):
+        self.create_count += 1
+        return self.handle
+
+    def configure_local_registry(self, registry):
+        return None
+
+    def destroy(self):
+        self.destroy_count += 1
+        if self.destroy_error is not None:
+            raise self.destroy_error
+        return True
+
+    def detach(self):
+        self.detach_count += 1
+
+
+class FakeKindFactory:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.instance: FakeKindCluster | None = None
+        self.destroy_error: BaseException | None = None
+
+    def __call__(self, run_id: str):
+        self.calls += 1
+        self.instance = FakeKindCluster(run_id)
+        self.instance.destroy_error = self.destroy_error
+        return self.instance
+
+
+class FailingKubernetesExecutor:
+    def __init__(
+        self,
+        *,
+        code: str = "READINESS_PROBE_FAILED",
+        phase: str = "readiness",
+        diagnostics: tuple[DiagnosticRecord, ...] = (),
+    ) -> None:
+        self.code = code
+        self.phase = phase
+        self.diagnostics = diagnostics
+        self.execute_count = 0
+
+    def execute(self, request):
+        self.execute_count += 1
+        raise KubernetesExecutionError(
+            self.code,
+            self.phase,
+            "the requested endpoint did not become ready",
+            diagnostics=self.diagnostics,
+        )
+
+
+def schema_success(command, **kwargs):
+    return subprocess.CompletedProcess(command, 0, stdout="schema passed\n", stderr="")
+
+
 class ExecutionTests(unittest.TestCase):
-    def orchestrator(self, *, build_executor=None, supply_chain_generator=None):
+    def orchestrator(
+        self,
+        *,
+        build_executor=None,
+        supply_chain_generator=None,
+        registry_factory=None,
+        kind_factory=None,
+        kubernetes_executor=None,
+        schema_command_runner=None,
+        tool_resolver=None,
+    ):
         return ExecutionOrchestrator(
             build_executor=build_executor,
             supply_chain_generator=supply_chain_generator,
+            **(
+                {"registry_factory": registry_factory}
+                if registry_factory is not None
+                else {}
+            ),
+            **({"kind_factory": kind_factory} if kind_factory is not None else {}),
+            kubernetes_executor=kubernetes_executor,
+            **(
+                {"schema_command_runner": schema_command_runner}
+                if schema_command_runner is not None
+                else {}
+            ),
+            tool_resolver=tool_resolver or (lambda name: f"/tools/{name}"),
             source_revision_resolver=lambda project: REVISION,
             clock=lambda: NOW,
         )
+
+    @staticmethod
+    def stage(result, stage_id: str):
+        return next(stage for stage in result.run.stage_results if stage.stage_id == stage_id)
 
     def test_static_profile_closes_a_verifiable_run_without_external_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -249,6 +442,163 @@ class ExecutionTests(unittest.TestCase):
             )
 
         self.assertEqual(build.execute_count, 0)
+
+    def test_required_tool_preflight_blocks_before_registry_or_build_side_effects(self) -> None:
+        build = FakeBuildExecutor()
+        registry_factory = FakeRegistryFactory()
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.orchestrator(
+                build_executor=build,
+                supply_chain_generator=FakeSupplyChainGenerator(),
+                registry_factory=registry_factory,
+                tool_resolver=(
+                    lambda name: None if name == "kubectl" else f"/tools/{name}"
+                ),
+            ).execute(
+                kind_composition(Path(directory)),
+                ExecutionOptions(
+                    profile="kind-e2e",
+                    run_id="20260830T120000Z-111111111111",
+                ),
+            )
+
+            self.assertEqual(
+                result.run.final_status,
+                StageStatus.BLOCKED_MISSING_REQUIRED_TOOL,
+            )
+            self.assertEqual(
+                self.stage(result, "server-side-dry-run").status,
+                StageStatus.BLOCKED_MISSING_REQUIRED_TOOL,
+            )
+            self.assertIn("REQUIRED_TOOL_MISSING", result.run.failure_reason)
+            self.assertIn("kubectl", result.run.failure_reason)
+            self.assertEqual(registry_factory.calls, 0)
+            self.assertEqual(build.execute_count, 0)
+            self.assertFalse(result.store.path("registry-ownership.json").exists())
+            result.store.verify_checksums()
+
+    def test_kubernetes_failure_persists_diagnostics_and_truthful_stage_progress(self) -> None:
+        registry_factory = FakeRegistryFactory()
+        kind_factory = FakeKindFactory()
+        kubernetes = FailingKubernetesExecutor(
+            diagnostics=(
+                DiagnosticRecord(
+                    "kubernetes/diagnostics/events.txt",
+                    "bounded readiness diagnostics\n",
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "devops_stack_composer.execution.render_resolved_environment",
+            side_effect=resolved_manifest,
+        ):
+            result = self.orchestrator(
+                build_executor=FakeBuildExecutor(),
+                supply_chain_generator=FakeSupplyChainGenerator(),
+                registry_factory=registry_factory,
+                kind_factory=kind_factory,
+                kubernetes_executor=kubernetes,
+                schema_command_runner=schema_success,
+            ).execute(
+                kind_composition(Path(directory)),
+                ExecutionOptions(
+                    profile="kind-e2e",
+                    run_id="20260830T120000Z-222222222222",
+                ),
+            )
+
+            for stage_id in (
+                "server-side-dry-run",
+                "deployment",
+                "rollout",
+                "pod-image",
+                "health",
+            ):
+                self.assertEqual(self.stage(result, stage_id).status, StageStatus.PASSED)
+            self.assertEqual(
+                self.stage(result, "readiness").status,
+                StageStatus.FAILED,
+            )
+            self.assertEqual(
+                self.stage(result, "rollback").status,
+                StageStatus.NOT_APPLICABLE,
+            )
+            self.assertIn("READINESS_PROBE_FAILED", result.run.failure_reason)
+            self.assertEqual(
+                result.store.path("kubernetes/diagnostics/events.txt").read_text(
+                    encoding="utf-8"
+                ),
+                "bounded readiness diagnostics\n",
+            )
+            error_record = json.loads(
+                result.store.path("kubernetes/execution-error.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(error_record["code"], "READINESS_PROBE_FAILED")
+            self.assertEqual(error_record["phase"], "readiness")
+            self.assertEqual(error_record["failureStage"], "readiness")
+            self.assertEqual(
+                error_record["completedStages"],
+                [
+                    "server-side-dry-run",
+                    "deployment",
+                    "rollout",
+                    "pod-image",
+                    "health",
+                ],
+            )
+            self.assertEqual(kind_factory.instance.destroy_count, 1)
+            self.assertEqual(registry_factory.instance.cleanup_count, 1)
+            result.store.verify_checksums()
+
+    def test_cleanup_attempts_are_independent_and_aggregate_write_and_remove_failures(self) -> None:
+        registry_factory = FakeRegistryFactory()
+        kind_factory = FakeKindFactory()
+        registry_factory.cleanup_error = RuntimeError("registry cleanup failed")
+        kind_factory.destroy_error = RuntimeError("kind destroy failed")
+        kubernetes = FailingKubernetesExecutor()
+        original_write_text = EvidenceStore.write_text
+
+        def failing_lifecycle_writes(store, relative, content, **kwargs):
+            if relative == "diagnostics/kind-lifecycle.log":
+                raise OSError("kind diagnostic write failed")
+            if relative == "logs/registry.log":
+                raise OSError("registry log write failed")
+            return original_write_text(store, relative, content, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "devops_stack_composer.execution.render_resolved_environment",
+            side_effect=resolved_manifest,
+        ), patch.object(EvidenceStore, "write_text", new=failing_lifecycle_writes):
+            result = self.orchestrator(
+                build_executor=FakeBuildExecutor(),
+                supply_chain_generator=FakeSupplyChainGenerator(),
+                registry_factory=registry_factory,
+                kind_factory=kind_factory,
+                kubernetes_executor=kubernetes,
+                schema_command_runner=schema_success,
+            ).execute(
+                kind_composition(Path(directory)),
+                ExecutionOptions(
+                    profile="kind-e2e",
+                    run_id="20260830T120000Z-333333333333",
+                ),
+            )
+
+            self.assertEqual(kind_factory.instance.destroy_count, 1)
+            self.assertEqual(registry_factory.instance.cleanup_count, 1)
+            cleanup = self.stage(result, "cleanup")
+            self.assertEqual(cleanup.status, StageStatus.FAILED)
+            self.assertIn("kind diagnostic write failed", cleanup.failure_reason)
+            self.assertIn("kind destroy failed", cleanup.failure_reason)
+            self.assertIn("registry log write failed", cleanup.failure_reason)
+            self.assertIn("registry cleanup failed", cleanup.failure_reason)
+            self.assertIn("kind destroy failed", result.run.failure_reason)
+            self.assertIn("registry cleanup failed", result.run.failure_reason)
+            self.assertNotIn("diagnostics/kind-lifecycle.log", cleanup.evidence_paths)
+            self.assertNotIn("logs/registry.log", cleanup.evidence_paths)
+            result.store.verify_checksums()
 
     def test_legacy_and_current_vulnerability_shapes_map_explicitly(self) -> None:
         legacy = vulnerability_policy_from_model(
