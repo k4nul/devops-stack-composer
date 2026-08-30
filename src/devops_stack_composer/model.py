@@ -14,6 +14,7 @@ TAG_EXPRESSIONS = {
     "git-sha": "${GIT_COMMIT_SHA}",
     "semver": "${VERSION}",
 }
+IMAGE_TAG_PLACEHOLDER = "__IMAGE_TAG__"
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -37,7 +38,11 @@ class EnvironmentModel:
     service_type: str
     service_port: int
     health_path: str
+    health_initial_delay_seconds: int
+    health_period_seconds: int
     readiness_path: str
+    readiness_initial_delay_seconds: int
+    readiness_period_seconds: int
     environment: dict[str, str | int | float | bool]
     secret_names: tuple[str, ...]
     secret_refs: tuple[dict[str, Any], ...]
@@ -62,6 +67,7 @@ class NormalizedDevOpsModel:
     image_registry: str
     image_repository: str
     image_tag: str
+    image_tag_expression: str
     image_tag_strategy: str
     architectures: tuple[str, ...]
     runtime_user: int
@@ -125,9 +131,9 @@ class NormalizedDevOpsModel:
 
 def normalize_config(config: dict[str, Any]) -> NormalizedDevOpsModel:
     tag = config["image"]["tag"]
-    image_tag = (
-        tag["value"] if tag["strategy"] == "fixed" else TAG_EXPRESSIONS[tag["strategy"]]
-    )
+    is_fixed_tag = tag["strategy"] == "fixed"
+    image_tag = tag["value"] if is_fixed_tag else IMAGE_TAG_PLACEHOLDER
+    image_tag_expression = tag["value"] if is_fixed_tag else TAG_EXPRESSIONS[tag["strategy"]]
 
     environments: list[EnvironmentModel] = []
     for name in ENVIRONMENT_ORDER:
@@ -142,7 +148,11 @@ def normalize_config(config: dict[str, Any]) -> NormalizedDevOpsModel:
                 service_type=values["service"]["type"],
                 service_port=values["service"]["port"],
                 health_path=values["health"]["path"],
+                health_initial_delay_seconds=values["health"]["initialDelaySeconds"],
+                health_period_seconds=values["health"]["periodSeconds"],
                 readiness_path=values["readiness"]["path"],
+                readiness_initial_delay_seconds=values["readiness"]["initialDelaySeconds"],
+                readiness_period_seconds=values["readiness"]["periodSeconds"],
                 environment=deepcopy(values["environment"]),
                 secret_names=tuple(item["name"] for item in secret_refs),
                 secret_refs=secret_refs,
@@ -169,6 +179,7 @@ def normalize_config(config: dict[str, Any]) -> NormalizedDevOpsModel:
         image_registry=config["image"]["registry"].rstrip("/"),
         image_repository=config["image"]["repository"].strip("/"),
         image_tag=image_tag,
+        image_tag_expression=image_tag_expression,
         image_tag_strategy=tag["strategy"],
         architectures=tuple(config["image"]["architectures"]),
         runtime_user=config["security"]["runAsUser"],

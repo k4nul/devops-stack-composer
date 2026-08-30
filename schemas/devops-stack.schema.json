@@ -119,7 +119,12 @@
       "additionalProperties": false,
       "required": ["registry", "repository", "tag", "architectures"],
       "properties": {
-        "registry": {"type": "string", "minLength": 1, "examples": ["ghcr.io"]},
+        "registry": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?$",
+          "examples": ["ghcr.io"]
+        },
         "repository": {
           "type": "string",
           "minLength": 1,
@@ -475,7 +480,7 @@
         "runAsUser": {"type": "integer", "minimum": 1, "examples": [10001]},
         "readOnlyRootFilesystem": {"type": "boolean", "examples": [true]},
         "allowPrivilegeEscalation": {"type": "boolean", "examples": [false]},
-        "seccompProfile": {"type": "string", "enum": ["RuntimeDefault", "Localhost"], "examples": ["RuntimeDefault"]},
+        "seccompProfile": {"type": "string", "const": "RuntimeDefault", "examples": ["RuntimeDefault"]},
         "serviceAccount": {"$ref": "#/definitions/dnsLabel"}
       }
     },

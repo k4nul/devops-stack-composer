@@ -22,7 +22,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(loaded.model.image_name, "ghcr.io/k4nul/sample-api")
         self.assertEqual(
             loaded.model.image_reference,
-            "ghcr.io/k4nul/sample-api:${BRANCH_SLUG}-${GIT_COMMIT_SHA}",
+            "ghcr.io/k4nul/sample-api:__IMAGE_TAG__",
+        )
+        self.assertEqual(
+            loaded.model.image_tag_expression,
+            "${BRANCH_SLUG}-${GIT_COMMIT_SHA}",
         )
         self.assertEqual(loaded.model.environment("production").replicas, 3)
 
@@ -49,6 +53,14 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("expected integer", message)
         self.assertIn('received "8080"', message)
         self.assertIn("example 8080", message)
+
+    def test_registry_rejects_shell_and_url_syntax(self) -> None:
+        for registry in ("https://ghcr.io", "ghcr.io;touch-pwned", "ghcr.io\nPUSH=true"):
+            with self.subTest(registry=registry):
+                invalid = copy.deepcopy(self.raw)
+                invalid["image"]["registry"] = registry
+                with self.assertRaises(ConfigValidationError):
+                    validate_config(invalid)
 
     def test_fixed_tag_requires_value(self) -> None:
         self.raw["image"]["tag"] = {"strategy": "fixed"}
@@ -92,7 +104,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_normalized_contract_covers_shared_values(self) -> None:
         validate_config(self.raw)
-        contract = normalize_config(self.raw).contract()
+        model = normalize_config(self.raw)
+        contract = model.contract()
 
         self.assertEqual(contract["applicationName"], "sample-api")
         self.assertEqual(contract["architectures"], ["linux/amd64", "linux/arm64"])
@@ -100,6 +113,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(contract["namespaces"]["dev"], "sample-api-dev")
         self.assertEqual(contract["secretNames"]["staging"], ["sample-api-secrets"])
         self.assertEqual(contract["branchEnvironmentMap"]["production"], ["main"])
+        self.assertEqual(model.environment("dev").health_initial_delay_seconds, 5)
+        self.assertEqual(model.environment("production").readiness_period_seconds, 5)
 
     def test_error_values_for_sensitive_paths_are_redacted(self) -> None:
         invalid = copy.deepcopy(self.raw)
