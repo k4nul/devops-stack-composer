@@ -57,7 +57,8 @@
             "PASSED": {"type": "integer", "minimum": 0},
             "FAILED": {"type": "integer", "minimum": 0},
             "SKIPPED_MISSING_OPTIONAL_TOOL": {"type": "integer", "minimum": 0},
-            "BLOCKED_MISSING_REQUIRED_TOOL": {"type": "integer", "minimum": 0}
+            "BLOCKED_MISSING_REQUIRED_TOOL": {"type": "integer", "minimum": 0},
+            "NOT_APPLICABLE": {"type": "integer", "minimum": 0}
           }
         }
       }

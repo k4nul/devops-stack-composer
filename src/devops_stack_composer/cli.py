@@ -158,6 +158,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_project_argument(doctor)
     _add_source_arguments(doctor)
     doctor.add_argument("--remote", action="store_true", help="also query template remotes")
+    doctor.add_argument(
+        "--profile",
+        choices=("static", "supply-chain", "kind-e2e", "release"),
+        help="classify tools against one v0.2 validation profile",
+    )
     doctor.add_argument("--json", action="store_true", dest="json_output")
     doctor.set_defaults(handler=_run_doctor)
 
@@ -469,6 +474,7 @@ def _run_doctor(args: argparse.Namespace) -> int:
         resolver=resolver,
         check_remote=args.remote,
         fetch_templates=not args.no_fetch,
+        profile=args.profile,
     )
     if args.json_output:
         print(_safe_json(report.to_dict()), end="")

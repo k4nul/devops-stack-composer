@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from devops_stack_composer.locks import TemplateLock
+from devops_stack_composer.policies import ValidationProfile
 from devops_stack_composer.sources import ENVIRONMENT_PATHS, SourceResolver
 from devops_stack_composer.validation import CheckResult, ValidationReport, ValidationStatus
 
@@ -90,6 +91,7 @@ def run_doctor(
     probe: ToolProbe | None = None,
     check_remote: bool = False,
     fetch_templates: bool = False,
+    profile: str | ValidationProfile | None = None,
 ) -> ValidationReport:
     environment = dict(os.environ if environment is None else environment)
     probe = probe or ToolProbe()
@@ -101,6 +103,42 @@ def run_doctor(
             scope="doctor",
         )
     ]
+    selected_profile = ValidationProfile.parse(profile) if profile is not None else None
+    required_by_profile = {
+        ValidationProfile.STATIC: frozenset(),
+        ValidationProfile.SUPPLY_CHAIN: frozenset(
+            {"git", "pwsh", "docker", "buildx", "syft", "trivy"}
+        ),
+        ValidationProfile.KIND_E2E: frozenset(
+            {
+                "git",
+                "pwsh",
+                "docker",
+                "buildx",
+                "syft",
+                "trivy",
+                "kind",
+                "kubectl",
+                "kubeconform",
+            }
+        ),
+        ValidationProfile.RELEASE: frozenset(
+            {
+                "git",
+                "pwsh",
+                "docker",
+                "buildx",
+                "syft",
+                "trivy",
+                "kind",
+                "kubectl",
+                "kubeconform",
+                "cosign",
+                "gh",
+            }
+        ),
+    }
+    profile_required = required_by_profile.get(selected_profile, frozenset())
     specifications = (
         ("git", ("git", "--version"), True, "template resolution and lock verification are blocked"),
         ("pwsh", ("pwsh", "--version"), True, "Jenkins and Kubernetes upstream adapters are blocked"),
@@ -120,13 +158,15 @@ def run_doctor(
         ("syft", ("syft", "version"), False, "standalone SBOM inspection will be skipped"),
         ("trivy", ("trivy", "version"), False, "standalone image vulnerability scanning will be skipped"),
         ("cosign", ("cosign", "version"), False, "standalone provenance verification will be skipped"),
+        ("kind", ("kind", "version"), False, "kind cluster execution will be skipped"),
+        ("gh", ("gh", "--version"), False, "GitHub artifact attestation verification will be skipped"),
     )
     checks.extend(
         _tool_check(
             probe,
             name=name,
             command=command,
-            required=required,
+            required=(name in profile_required if selected_profile is not None else required),
             purpose=purpose,
         )
         for name, command, required, purpose in specifications

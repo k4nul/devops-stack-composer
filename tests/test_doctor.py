@@ -75,6 +75,48 @@ class DoctorTests(unittest.TestCase):
         )
         self.assertEqual(environment.details["set"], True)
 
+    def test_static_profile_has_no_required_external_execution_tools(self) -> None:
+        lock = TemplateLock.load(ROOT / "templates.lock.json")
+        with tempfile.TemporaryDirectory() as directory:
+            report = run_doctor(
+                lock=lock,
+                resolver=FakeResolver(lock, Path(directory)),  # type: ignore[arg-type]
+                probe=FakeProbe(set()),
+                profile="static",
+            )
+
+        tool_checks = [check for check in report.checks if check.check.startswith("doctor.tool.")]
+        self.assertTrue(tool_checks)
+        self.assertTrue(
+            all(
+                check.status == ValidationStatus.SKIPPED_MISSING_OPTIONAL_TOOL
+                for check in tool_checks
+            )
+        )
+        self.assertTrue(report.passed)
+
+    def test_kind_profile_blocks_every_missing_required_tool(self) -> None:
+        lock = TemplateLock.load(ROOT / "templates.lock.json")
+        with tempfile.TemporaryDirectory() as directory:
+            report = run_doctor(
+                lock=lock,
+                resolver=FakeResolver(lock, Path(directory)),  # type: ignore[arg-type]
+                probe=FakeProbe({"git", "pwsh"}),
+                profile="kind-e2e",
+            )
+
+        statuses = {check.check: check.status for check in report.checks}
+        for name in ("docker", "buildx", "syft", "trivy", "kind", "kubectl", "kubeconform"):
+            self.assertEqual(
+                statuses[f"doctor.tool.{name}"],
+                ValidationStatus.BLOCKED_MISSING_REQUIRED_TOOL,
+            )
+        self.assertEqual(
+            statuses["doctor.tool.cosign"],
+            ValidationStatus.SKIPPED_MISSING_OPTIONAL_TOOL,
+        )
+        self.assertFalse(report.passed)
+
 
 if __name__ == "__main__":
     unittest.main()
