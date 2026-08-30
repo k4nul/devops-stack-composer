@@ -61,6 +61,13 @@ from devops_stack_composer.report import (
     write_report_files,
 )
 from devops_stack_composer.registry import EphemeralRegistry, RegistryHandle
+from devops_stack_composer.release_assets import (
+    ReleaseAssemblyRequest,
+    ReleaseMaterialRequest,
+    assemble_release_assets,
+    prepare_release_materials,
+    verify_release_assets,
+)
 from devops_stack_composer.resource_recovery import ResourceRecoveryStore
 from devops_stack_composer.resources import default_lock_path
 from devops_stack_composer.sources import SourceResolver
@@ -364,6 +371,81 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evidence_verify.add_argument("--json", action="store_true", dest="json_output")
     evidence_verify.set_defaults(handler=_run_evidence_verify)
+
+    release = commands.add_parser(
+        "release",
+        help="prepare, assemble, or verify a closed release asset set",
+    )
+    release_commands = release.add_subparsers(dest="release_command", required=True)
+    release_materials = release_commands.add_parser(
+        "materials",
+        help="generate digest-bound package SBOM and file provenance",
+    )
+    _add_project_argument(release_materials)
+    release_materials.add_argument("--version", default=__version__)
+    release_materials.add_argument("--commit", help="full source commit (default: HEAD)")
+    release_materials.add_argument("--wheel", help="wheel path relative to the project")
+    release_materials.add_argument("--sdist", help="sdist path relative to the project")
+    release_materials.add_argument(
+        "--repository-url",
+        default="https://github.com/k4nul/devops-stack-composer",
+        help="credential-free HTTPS source repository URL",
+    )
+    release_materials.add_argument(
+        "--created-at",
+        help="RFC 3339 creation time (default: source commit time)",
+    )
+    release_materials.add_argument(
+        "--output",
+        default="dist/release-materials",
+        help="new output directory relative to the project",
+    )
+    release_materials.add_argument("--json", action="store_true", dest="json_output")
+    release_materials.set_defaults(handler=_run_release_materials)
+
+    release_assemble = release_commands.add_parser(
+        "assemble",
+        help="assemble and re-verify the complete v0.2 release asset set",
+    )
+    _add_project_argument(release_assemble)
+    release_assemble.add_argument("--version", default=__version__)
+    release_assemble.add_argument("--commit", help="full source commit (default: HEAD)")
+    release_assemble.add_argument("--wheel", help="wheel path relative to the project")
+    release_assemble.add_argument("--sdist", help="sdist path relative to the project")
+    release_assemble.add_argument(
+        "--materials",
+        default="dist/release-materials",
+        help="directory containing package.spdx.json and provenance-verification.json",
+    )
+    release_assemble.add_argument(
+        "--evidence-run", required=True, help="successful kind-e2e run ID"
+    )
+    release_assemble.add_argument(
+        "--evidence-output",
+        default=".devops-stack/runs",
+        help="evidence run directory root relative to the project",
+    )
+    release_assemble.add_argument(
+        "--example-config",
+        default="examples/python-service/devops-stack.yaml",
+    )
+    release_assemble.add_argument(
+        "--output",
+        help="new release directory (default: dist/release-vVERSION)",
+    )
+    release_assemble.add_argument("--json", action="store_true", dest="json_output")
+    release_assemble.set_defaults(handler=_run_release_assemble)
+
+    release_verify = release_commands.add_parser(
+        "verify",
+        help="offline-verify a release directory, including archived example evidence",
+    )
+    _add_project_argument(release_verify)
+    release_verify.add_argument("--directory", required=True)
+    release_verify.add_argument("--version")
+    release_verify.add_argument("--commit")
+    release_verify.add_argument("--json", action="store_true", dest="json_output")
+    release_verify.set_defaults(handler=_run_release_verify)
 
     cluster = commands.add_parser("cluster", help="manage verified local clusters")
     cluster_commands = cluster.add_subparsers(dest="cluster_command", required=True)
@@ -894,6 +976,168 @@ def _run_evidence_verify(args: argparse.Namespace) -> int:
         print(f"artifact-digest: {canonical.artifact_digest or 'none'}")
         print(f"checksummed-files: {canonical.material_file_count}")
         print("authenticity: NOT_ESTABLISHED")
+    return 0
+
+
+def _release_package_paths(
+    project: Path,
+    version: str,
+    wheel_value: str | None,
+    sdist_value: str | None,
+) -> tuple[str, str]:
+    def select(explicit: str | None, patterns: tuple[str, ...], label: str) -> str:
+        if explicit is not None:
+            candidate = contained_path(project, explicit)
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError(f"{label} is not a regular project file")
+            return candidate.relative_to(project).as_posix()
+        distribution = contained_path(project, "dist")
+        if not distribution.is_dir() or distribution.is_symlink():
+            raise ValueError("dist is missing; build wheel and sdist first")
+        matches = tuple(
+            sorted(
+                {
+                    path
+                    for pattern in patterns
+                    for path in distribution.glob(pattern)
+                    if path.is_file() and not path.is_symlink()
+                }
+            )
+        )
+        if len(matches) != 1:
+            raise ValueError(
+                f"expected exactly one {label} for version {version}; found {len(matches)}"
+            )
+        return matches[0].relative_to(project).as_posix()
+
+    return (
+        select(
+            wheel_value,
+            (f"devops_stack_composer-{version}-*.whl",),
+            "wheel",
+        ),
+        select(
+            sdist_value,
+            (
+                f"devops_stack_composer-{version}.tar.gz",
+                f"devops-stack-composer-{version}.tar.gz",
+            ),
+            "sdist",
+        ),
+    )
+
+
+def _release_commit_time(project: Path, commit: str) -> str:
+    runner = SafeProcessRunner(
+        project,
+        allowed_executables=("git",),
+        max_output_bytes=4096,
+        default_timeout=20.0,
+    )
+    result = runner.run(
+        ("git", "show", "-s", "--format=%cI", commit),
+        cwd=project,
+    )
+    value = result.stdout.strip()
+    if not value:
+        raise ValueError("Git returned no source commit timestamp")
+    return value
+
+
+def _run_release_materials(args: argparse.Namespace) -> int:
+    project = _resolved_project(args)
+    commit = args.commit or _default_source_revision(project)
+    wheel, sdist = _release_package_paths(
+        project, args.version, args.wheel, args.sdist
+    )
+    result = prepare_release_materials(
+        ReleaseMaterialRequest(
+            project=project,
+            output_directory=args.output,
+            version=args.version,
+            source_commit=commit,
+            source_repository=args.repository_url,
+            created_at=args.created_at or _release_commit_time(project, commit),
+            wheel_path=wheel,
+            sdist_path=sdist,
+        )
+    )
+    value = {
+        **result.to_dict(),
+        "packageSbom": result.package_sbom.relative_to(project).as_posix(),
+        "provenanceVerification": (
+            result.provenance_verification.relative_to(project).as_posix()
+        ),
+        "version": args.version,
+        "sourceCommit": commit,
+    }
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        print(f"package-sbom: {value['packageSbom']}")
+        print(f"provenance-verification: {value['provenanceVerification']}")
+        print("cryptographically-verified: false")
+    return 0
+
+
+def _run_release_assemble(args: argparse.Namespace) -> int:
+    project = _resolved_project(args)
+    commit = args.commit or _default_source_revision(project)
+    wheel, sdist = _release_package_paths(
+        project, args.version, args.wheel, args.sdist
+    )
+    materials = args.materials.rstrip("/")
+    output = args.output or f"dist/release-v{args.version}"
+    result = assemble_release_assets(
+        ReleaseAssemblyRequest(
+            project=project,
+            output_directory=output,
+            version=args.version,
+            source_commit=commit,
+            wheel_path=wheel,
+            sdist_path=sdist,
+            configuration_schema_path="schemas/devops-stack.schema.json",
+            report_schema_path="schemas/execution-report.schema.json",
+            execution_evidence_schema_path="schemas/execution-evidence.schema.json",
+            example_config_path=args.example_config,
+            package_sbom_path=f"{materials}/package.spdx.json",
+            provenance_verification_path=(
+                f"{materials}/provenance-verification.json"
+            ),
+            evidence_run_id=args.evidence_run,
+            evidence_work_directory=args.evidence_output,
+        )
+    )
+    value = result.to_dict()
+    value["directory"] = result.directory.relative_to(project).as_posix()
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        print(f"release-directory: {value['directory']}")
+        print(f"tag: {value['tag']}")
+        print(f"source-commit: {value['sourceCommit']}")
+        print(f"checks: {', '.join(value['checks'])}")
+    return 0
+
+
+def _run_release_verify(args: argparse.Namespace) -> int:
+    project = _resolved_project(args)
+    result = verify_release_assets(
+        project,
+        args.directory,
+        expected_version=args.version,
+        expected_commit=args.commit,
+    )
+    value = result.to_dict()
+    value["directory"] = result.directory.relative_to(project).as_posix()
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        print("passed: true")
+        print(f"tag: {value['tag']}")
+        print(f"source-commit: {value['sourceCommit']}")
+        print(f"evidence-digest: {value['evidenceDigest']}")
+        print(f"checks: {', '.join(value['checks'])}")
     return 0
 
 

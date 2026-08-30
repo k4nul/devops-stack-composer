@@ -380,6 +380,14 @@ class CliTests(unittest.TestCase):
         evidence = build_parser().parse_args(
             ["evidence", "verify", "--run", "20260830T120000Z-abcdef012345"]
         )
+        release = build_parser().parse_args(
+            [
+                "release",
+                "assemble",
+                "--evidence-run",
+                "20260830T120000Z-abcdef012345",
+            ]
+        )
 
         self.assertEqual(execute.profile, "kind-e2e")
         self.assertTrue(execute.keep_resources)
@@ -391,6 +399,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(show.execution_command, "show")
         self.assertEqual(cleanup.execution_command, "cleanup")
         self.assertEqual(evidence.evidence_command, "verify")
+        self.assertEqual(release.release_command, "assemble")
+        self.assertEqual(release.version, "0.2.0")
 
         configured_execute = build_parser().parse_args(["execute"])
         self.assertIsNone(configured_execute.profile)
