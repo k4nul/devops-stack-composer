@@ -638,6 +638,44 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(registry_factory.instance.cleanup_count, 1)
             verify_evidence_bundle(result.store)
 
+    def test_keep_environment_on_failure_retains_only_a_failed_run(self) -> None:
+        registry_factory = FakeRegistryFactory()
+        kind_factory = FakeKindFactory()
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "devops_stack_composer.execution.render_resolved_environment",
+            side_effect=resolved_manifest,
+        ):
+            project = Path(directory)
+            run_id = "20260830T120000Z-333333333333"
+            result = self.orchestrator(
+                build_executor=FakeBuildExecutor(),
+                supply_chain_generator=FakeSupplyChainGenerator(),
+                registry_factory=registry_factory,
+                kind_factory=kind_factory,
+                kubernetes_executor=FailingKubernetesExecutor(
+                    project / ".devops-stack" / "runs" / run_id
+                ),
+                schema_command_runner=schema_success,
+            ).execute(
+                kind_composition(project),
+                ExecutionOptions(
+                    profile="kind-e2e",
+                    run_id=run_id,
+                    keep_environment_on_failure=True,
+                ),
+            )
+
+            self.assertFalse(result.passed)
+            self.assertTrue(result.retained_resources)
+            self.assertEqual(kind_factory.instance.destroy_count, 0)
+            self.assertEqual(kind_factory.instance.detach_count, 1)
+            self.assertEqual(registry_factory.instance.cleanup_count, 0)
+            self.assertEqual(
+                ExecutionJournal.open(result.store).current_state,
+                ExecutionState.FAILED,
+            )
+            verify_evidence_bundle(result.store)
+
     def test_kind_success_maps_managed_runtime_identity_into_closed_evidence(self) -> None:
         registry_factory = FakeRegistryFactory()
         kind_factory = FakeKindFactory()
@@ -659,7 +697,11 @@ class ExecutionTests(unittest.TestCase):
                 schema_command_runner=schema_success,
             ).execute(
                 kind_composition(project),
-                ExecutionOptions(profile="kind-e2e", run_id=run_id),
+                ExecutionOptions(
+                    profile="kind-e2e",
+                    run_id=run_id,
+                    keep_environment_on_failure=True,
+                ),
             )
 
             self.assertTrue(result.passed)

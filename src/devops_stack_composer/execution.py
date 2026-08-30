@@ -127,6 +127,7 @@ class ExecutionOptions:
     image_tag: str | None = None
     approve_production: bool = False
     keep_resources: bool = False
+    keep_environment_on_failure: bool = False
     run_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -144,6 +145,12 @@ class ExecutionOptions:
             raise ValueError("approve_production must be boolean")
         if not isinstance(self.keep_resources, bool):
             raise ValueError("keep_resources must be boolean")
+        if not isinstance(self.keep_environment_on_failure, bool):
+            raise ValueError("keep_environment_on_failure must be boolean")
+        if self.keep_resources and self.keep_environment_on_failure:
+            raise ValueError(
+                "keep_resources and keep_environment_on_failure are mutually exclusive"
+            )
         if self.run_id is not None and not isinstance(self.run_id, str):
             raise ValueError("run_id must be a string")
 
@@ -690,7 +697,9 @@ class ExecutionOrchestrator:
                 "PRODUCTION_APPROVAL_REQUIRED",
                 "production apply requires --approve-production",
             )
-        if options.keep_resources and profile == ValidationProfile.RELEASE:
+        if (
+            options.keep_resources or options.keep_environment_on_failure
+        ) and profile == ValidationProfile.RELEASE:
             raise ExecutionError(
                 "RELEASE_RESOURCE_RETENTION_FORBIDDEN",
                 "release validation cannot retain run-owned resources",
@@ -1705,7 +1714,10 @@ class ExecutionOrchestrator:
                 cleanup_started = self._now()
                 cleanup_failure: str | None = None
                 current_stage = "cleanup"
-                if options.keep_resources and (cluster is not None or registry is not None):
+                retain_resources = options.keep_resources or (
+                    options.keep_environment_on_failure and failure_reason is not None
+                )
+                if retain_resources and (cluster is not None or registry is not None):
                     if cluster is not None:
                         cluster.detach()
                     retained_resources = True
@@ -1715,8 +1727,8 @@ class ExecutionOrchestrator:
                         StageStatus.NOT_APPLICABLE,
                         started=cleanup_started,
                         output=(
-                            "Operator requested resource retention; this required stage "
-                            "therefore does not pass"
+                            "Operator policy retained run-owned resources; this required "
+                            "stage therefore does not pass"
                         ),
                         evidence_paths=tuple(
                             path

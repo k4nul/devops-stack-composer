@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from devops_stack_composer.composition import _preflight_local_build_output
 from devops_stack_composer.config import load_config
 from devops_stack_composer.errors import GeneratedFileConflictError
 from devops_stack_composer.evidence_store import EvidenceStore, EvidenceStoreError
+from devops_stack_composer.execution import ExecutionOrchestrator
 from devops_stack_composer.locks import TemplateLock
 from devops_stack_composer.registry import EphemeralRegistry, RegistryHandle
 from devops_stack_composer.sources import SourceResolution
@@ -354,6 +356,30 @@ class CliTests(unittest.TestCase):
         report = build_parser().parse_args(
             ["report", "--run", "20260830T120000Z-abcdef012345", "--json"]
         )
+        plan = build_parser().parse_args(
+            [
+                "execution",
+                "plan",
+                "--profile",
+                "kind-e2e",
+                "--run",
+                "20260830T120000Z-abcdef012345",
+            ]
+        )
+        show = build_parser().parse_args(
+            ["execution", "show", "--run", "20260830T120000Z-abcdef012345"]
+        )
+        cleanup = build_parser().parse_args(
+            [
+                "execution",
+                "cleanup",
+                "--run",
+                "20260830T120000Z-abcdef012345",
+            ]
+        )
+        evidence = build_parser().parse_args(
+            ["evidence", "verify", "--run", "20260830T120000Z-abcdef012345"]
+        )
 
         self.assertEqual(execute.profile, "kind-e2e")
         self.assertTrue(execute.keep_resources)
@@ -361,10 +387,50 @@ class CliTests(unittest.TestCase):
         self.assertEqual(verify.artifact, "out/execution/artifact.json")
         self.assertEqual(cluster.kind_command, "destroy")
         self.assertEqual(report.run, "20260830T120000Z-abcdef012345")
+        self.assertEqual(plan.execution_command, "plan")
+        self.assertEqual(show.execution_command, "show")
+        self.assertEqual(cleanup.execution_command, "cleanup")
+        self.assertEqual(evidence.evidence_command, "verify")
 
         configured_execute = build_parser().parse_args(["execute"])
         self.assertIsNone(configured_execute.profile)
         self.assertIsNone(configured_execute.environment)
+
+    def test_execute_dry_run_prints_plan_without_creating_a_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = io.StringIO()
+            with patch(
+                "devops_stack_composer.cli._execution_composition",
+                return_value=fake_composition(root),
+            ), patch(
+                "devops_stack_composer.cli._default_source_revision",
+                return_value="a" * 40,
+            ), patch.object(ExecutionOrchestrator, "execute") as execute:
+                with contextlib.redirect_stdout(output):
+                    result = main(
+                        [
+                            "execute",
+                            "--project",
+                            str(root),
+                            "--profile",
+                            "static",
+                            "--run",
+                            "20260830T120000Z-fedcba987654",
+                            "--dry-run",
+                            "--json",
+                        ]
+                    )
+
+            self.assertEqual(result, 0)
+            execute.assert_not_called()
+            value = json.loads(output.getvalue())
+            self.assertFalse(value["sideEffects"])
+            self.assertEqual(value["plan"]["profile"], "static")
+            self.assertEqual(
+                value["plan"]["runId"], "20260830T120000Z-fedcba987654"
+            )
+            self.assertFalse((root / ".devops-stack").exists())
 
     def test_lifecycle_state_accepts_registry_only_after_checksum_verification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

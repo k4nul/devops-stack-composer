@@ -22,10 +22,12 @@ from devops_stack_composer.composition import (
 from devops_stack_composer.diffing import diff_artifacts, render_human, render_json
 from devops_stack_composer.doctor import run_doctor
 from devops_stack_composer.errors import DevOpsStackError, UnsafePathError
-from devops_stack_composer.evidence_store import EvidenceStore
+from devops_stack_composer.evidence_bundle import verify_evidence_bundle
+from devops_stack_composer.evidence_store import EvidenceStore, new_run_id
 from devops_stack_composer.execution import (
     ExecutionOptions,
     ExecutionOrchestrator,
+    _default_source_revision,
     vulnerability_policy_from_model,
 )
 from devops_stack_composer.execution_bundle import (
@@ -33,6 +35,12 @@ from devops_stack_composer.execution_bundle import (
     load_strict_json_file,
     verify_execution_bundle,
 )
+from devops_stack_composer.execution_planning import (
+    PlannedExecution,
+    create_execution_plan,
+    validate_local_kind_plan,
+)
+from devops_stack_composer.execution_state import ExecutionJournal
 from devops_stack_composer.explain import explain_config_value, explain_generated_file
 from devops_stack_composer.filesystem import (
     atomic_write,
@@ -45,12 +53,15 @@ from devops_stack_composer.jenkins_evidence import verify_jenkins_artifact_files
 from devops_stack_composer.kind_cluster import KindCluster, KindClusterHandle
 from devops_stack_composer.locks import TEMPLATE_KEYS, TemplateLock
 from devops_stack_composer.manifest import ArtifactWriter, GeneratedManifest
+from devops_stack_composer.process_compat import SafeSubprocessAdapter
+from devops_stack_composer.process_runner import SafeProcessRunner
 from devops_stack_composer.report import (
     build_report,
     redact_sensitive,
     write_report_files,
 )
 from devops_stack_composer.registry import EphemeralRegistry, RegistryHandle
+from devops_stack_composer.resource_recovery import ResourceRecoveryStore
 from devops_stack_composer.resources import default_lock_path
 from devops_stack_composer.sources import SourceResolver
 from devops_stack_composer.validation import (
@@ -182,15 +193,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="run directory root relative to the project (default: configuration value)",
     )
     execute.add_argument("--image-tag", help="informational tag for the one pushed build")
+    execute.add_argument("--run", help="explicit safe execution run ID")
+    execute.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and print the logical plan without writes or runtime side effects",
+    )
     execute.add_argument(
         "--approve-production",
         action="store_true",
         help="explicitly approve a production apply; dry-run does not require this",
     )
-    execute.add_argument(
+    retention = execute.add_mutually_exclusive_group()
+    retention.add_argument(
         "--keep-resources",
         action="store_true",
         help="retain verified run-owned resources for debugging; cleanup will not pass",
+    )
+    retention.add_argument(
+        "--keep-environment-on-failure",
+        action="store_true",
+        help="retain run-owned resources only when execution fails",
     )
     execute.add_argument("--json", action="store_true", dest="json_output")
     execute.set_defaults(handler=_run_execute)
@@ -231,6 +254,57 @@ def build_parser() -> argparse.ArgumentParser:
     _add_source_arguments(templates_path)
     templates_path.add_argument("template_name", choices=TEMPLATE_KEYS)
     templates_path.set_defaults(handler=_run_templates_path)
+
+    execution = commands.add_parser(
+        "execution",
+        help="plan, inspect, or safely clean one execution run",
+    )
+    execution_commands = execution.add_subparsers(
+        dest="execution_command", required=True
+    )
+    execution_plan = execution_commands.add_parser(
+        "plan",
+        help="validate and print a side-effect-free logical execution plan",
+    )
+    _add_composition_arguments(execution_plan)
+    execution_plan.add_argument(
+        "--environment",
+        choices=("dev", "staging", "production"),
+        help="environment selected by the plan (default: configuration)",
+    )
+    execution_plan.add_argument(
+        "--profile",
+        choices=("static", "supply-chain", "kind-e2e", "release"),
+        help="validation profile selected by the plan (default: configuration)",
+    )
+    execution_plan.add_argument("--image-tag", help="requested image tag")
+    execution_plan.add_argument("--run", help="explicit safe execution run ID")
+    execution_plan.add_argument(
+        "--approve-production",
+        action="store_true",
+        help="record explicit production approval in the plan",
+    )
+    execution_plan.add_argument("--json", action="store_true", dest="json_output")
+    execution_plan.set_defaults(handler=_run_execution_plan)
+
+    for name, help_text, handler in (
+        ("show", "freshly verify and show one execution run", _run_execution_show),
+        (
+            "cleanup",
+            "remove only resources whose exact ownership is sealed in a run",
+            _run_execution_cleanup,
+        ),
+    ):
+        command = execution_commands.add_parser(name, help=help_text)
+        _add_project_argument(command)
+        command.add_argument("--run", required=True, help="execution run ID")
+        command.add_argument(
+            "--output",
+            default=".devops-stack/runs",
+            help="run directory root relative to the project",
+        )
+        command.add_argument("--json", action="store_true", dest="json_output")
+        command.set_defaults(handler=handler)
 
     artifact = commands.add_parser("artifact", help="inspect or verify immutable evidence")
     artifact_commands = artifact.add_subparsers(dest="artifact_command", required=True)
@@ -274,6 +348,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     artifact_verify.add_argument("--json", action="store_true", dest="json_output")
     artifact_verify.set_defaults(handler=_run_artifact_verify)
+
+    evidence = commands.add_parser("evidence", help="verify canonical execution evidence")
+    evidence_commands = evidence.add_subparsers(dest="evidence_command", required=True)
+    evidence_verify = evidence_commands.add_parser(
+        "verify",
+        help="verify closed inventory and same-digest semantics offline",
+    )
+    _add_project_argument(evidence_verify)
+    evidence_verify.add_argument("--run", required=True, help="execution run ID")
+    evidence_verify.add_argument(
+        "--output",
+        default=".devops-stack/runs",
+        help="run directory root relative to the project",
+    )
+    evidence_verify.add_argument("--json", action="store_true", dest="json_output")
+    evidence_verify.set_defaults(handler=_run_evidence_verify)
 
     cluster = commands.add_parser("cluster", help="manage verified local clusters")
     cluster_commands = cluster.add_subparsers(dest="cluster_command", required=True)
@@ -577,19 +667,76 @@ def _run_validate(args: argparse.Namespace) -> int:
     return 0 if validation.passed else 1
 
 
-def _run_execute(args: argparse.Namespace) -> int:
+def _execution_composition(
+    args: argparse.Namespace,
+    *,
+    fetch_templates: bool,
+) -> Composition:
     project = _resolved_project(args)
-    composition = compose(
+    return compose(
         project=project,
         config_path=contained_path(project, args.config),
         lock=_load_lock(args, project),
         explicit_template_paths=_explicit_templates(args),
-        fetch_templates=not args.no_fetch,
+        fetch_templates=fetch_templates,
         # Execution reuses only immutable adapter output and runs its own runtime
         # validators. Read-only upstream smoke queries remain part of `validate`,
         # where transient template-tool latency cannot occur after resources start.
         validate_upstream=False,
     )
+
+
+def _planned_execution(
+    args: argparse.Namespace,
+    composition: Composition,
+) -> PlannedExecution:
+    planned = create_execution_plan(
+        composition,
+        run_id=args.run or new_run_id(),
+        source_revision=_default_source_revision(composition.project),
+        profile=args.profile,
+        environment=args.environment,
+        image_tag=args.image_tag,
+        production_apply_approved=args.approve_production,
+    )
+    if planned.plan.profile.value == "kind-e2e":
+        validate_local_kind_plan(planned)
+    return planned
+
+
+def _run_execution_plan(
+    args: argparse.Namespace,
+    *,
+    composition: Composition | None = None,
+) -> int:
+    selected = composition or _execution_composition(args, fetch_templates=False)
+    planned = _planned_execution(args, selected)
+    value = {**planned.to_dict(), "sideEffects": False}
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        plan = planned.plan
+        print(f"run: {plan.run_id}")
+        print(f"profile: {plan.profile.value}")
+        print(f"environment: {plan.environment}")
+        print(f"registry: {plan.artifact_intent.registry} (logical; not allocated)")
+        print(f"image-tag: {plan.artifact_intent.requested_tag}")
+        print("side-effects: false")
+        print("stages:")
+        for stage in plan.stages:
+            print(f"- {stage.stage_id}: {stage.description}")
+    return 0
+
+
+def _run_execute(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        if args.keep_resources or args.keep_environment_on_failure:
+            raise ValueError("resource retention options are not valid with --dry-run")
+        return _run_execution_plan(
+            args,
+            composition=_execution_composition(args, fetch_templates=False),
+        )
+    composition = _execution_composition(args, fetch_templates=not args.no_fetch)
     work_directory = args.output or composition.loaded_config.model.execution[
         "workDirectory"
     ]
@@ -606,6 +753,8 @@ def _run_execute(args: argparse.Namespace) -> int:
             image_tag=args.image_tag,
             approve_production=args.approve_production,
             keep_resources=args.keep_resources,
+            keep_environment_on_failure=args.keep_environment_on_failure,
+            run_id=args.run,
         ),
     )
     value = result.to_dict()
@@ -622,6 +771,130 @@ def _run_execute(args: argparse.Namespace) -> int:
         if value.get("failureReason"):
             print(f"failure: {value['failureReason']}", file=sys.stderr)
     return 0 if result.passed else 1
+
+
+def _run_execution_show(args: argparse.Namespace) -> int:
+    project = _resolved_project(args)
+    store = EvidenceStore.open(
+        project,
+        args.run,
+        work_directory=args.output,
+    )
+    subject_verification = verify_execution_bundle(
+        project,
+        args.run,
+        work_directory=args.output,
+    )
+    summary = inspect_execution_bundle(
+        project,
+        args.run,
+        work_directory=args.output,
+    ).to_dict()
+    canonical = None
+    state = None
+    resources = None
+    if store.path("checksums.json").is_file():
+        canonical = verify_evidence_bundle(store).to_dict()
+        journal = ExecutionJournal.open(store)
+        state = journal.machine.to_dict(store.run_id)
+        if store.path("resources.json").is_file():
+            owned = ResourceRecoveryStore(store).load()
+            resources = {
+                "cleaned": owned.cleaned,
+                "kindStatus": owned.kind.status if owned.kind is not None else None,
+                "registryStatus": (
+                    owned.registry.status if owned.registry is not None else None
+                ),
+            }
+    value = {
+        "summary": summary,
+        "bundleVerification": canonical,
+        "subjectVerification": subject_verification.to_dict(),
+        "state": state,
+        "resources": resources,
+    }
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        print(f"run: {summary['runId']}")
+        print(f"profile: {summary['profile']}")
+        print(f"status: {summary['finalStatus']}")
+        print(f"digest: {summary['digest'] or 'none'}")
+        print(
+            "state: "
+            + (state["currentState"] if state is not None else "legacy-unavailable")
+        )
+        if resources is not None:
+            print(f"resources-cleaned: {str(resources['cleaned']).lower()}")
+        print(f"checksummed-files: {summary['checksumFileCount']}")
+    return 0
+
+
+def _run_execution_cleanup(args: argparse.Namespace) -> int:
+    project = _resolved_project(args)
+    store = EvidenceStore.open(
+        project,
+        args.run,
+        work_directory=args.output,
+    )
+    recovery = ResourceRecoveryStore(store)
+    recovery.load()
+    runner = SafeProcessRunner(
+        project,
+        allowed_executables=("docker", "kind"),
+        max_output_bytes=1024 * 1024,
+        default_timeout=60.0,
+    )
+    result = recovery.cleanup(
+        command_runner=SafeSubprocessAdapter(runner),
+        command_timeout_seconds=60.0,
+    )
+    verification = verify_evidence_bundle(store)
+    value = {
+        "runId": result.run_id,
+        "kindRemoved": result.kind_removed,
+        "registryRemoved": result.registry_removed,
+        "complete": result.complete,
+        "bundleVerification": verification.to_dict(),
+    }
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        print(f"run: {result.run_id}")
+        print(f"kind-removed: {str(result.kind_removed).lower()}")
+        print(f"registry-removed: {str(result.registry_removed).lower()}")
+        print(f"cleanup-complete: {str(result.complete).lower()}")
+    return 0 if result.complete else 1
+
+
+def _run_evidence_verify(args: argparse.Namespace) -> int:
+    project = _resolved_project(args)
+    store = EvidenceStore.open(
+        project,
+        args.run,
+        work_directory=args.output,
+    )
+    canonical = verify_evidence_bundle(store)
+    subjects = verify_execution_bundle(
+        project,
+        args.run,
+        work_directory=args.output,
+    )
+    value = {
+        "bundleVerification": canonical.to_dict(),
+        "subjectVerification": subjects.to_dict(),
+    }
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        print("verified: true")
+        print(f"execution-succeeded: {str(canonical.execution_succeeded).lower()}")
+        print(f"final-status: {canonical.final_status}")
+        print(f"incomplete: {str(canonical.incomplete).lower()}")
+        print(f"artifact-digest: {canonical.artifact_digest or 'none'}")
+        print(f"checksummed-files: {canonical.material_file_count}")
+        print("authenticity: NOT_ESTABLISHED")
+    return 0
 
 
 def _run_artifact_inspect(args: argparse.Namespace) -> int:
@@ -666,6 +939,13 @@ def _run_artifact_verify(args: argparse.Namespace) -> int:
             work_directory=args.output,
         )
         value = verification.to_dict()
+        store = EvidenceStore.open(
+            project,
+            args.run,
+            work_directory=args.output,
+        )
+        if store.path("checksums.json").is_file():
+            value["bundleVerification"] = verify_evidence_bundle(store).to_dict()
     else:
         vulnerability_policy = None
         if args.scan is not None:
@@ -1123,8 +1403,9 @@ def _run_report(args: argparse.Namespace) -> int:
             args.run,
             work_directory=args.output,
         )
-        report_json = store.path("report.json")
-        report_markdown = store.path("report.md")
+        canonical = store.path("run.json").is_file()
+        report_json = store.path("run.json" if canonical else "report.json")
+        report_markdown = store.path("summary.md" if canonical else "report.md")
         if args.json_output:
             print(report_json.read_text(encoding="utf-8"), end="")
         else:

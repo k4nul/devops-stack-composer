@@ -12,6 +12,7 @@ from typing import Any
 from devops_stack_composer.composition import Composition
 from devops_stack_composer.execution_models import ArtifactIntent
 from devops_stack_composer.execution_plan import ExecutionPlan
+from devops_stack_composer.policies import ValidationProfile
 
 
 _GIT_REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -54,6 +55,9 @@ def create_execution_plan(
     *,
     run_id: str,
     source_revision: str,
+    profile: str | ValidationProfile | None = None,
+    environment: str | None = None,
+    image_tag: str | None = None,
     production_apply_approved: bool = False,
 ) -> PlannedExecution:
     """Create the deterministic logical plan before any runtime port is allocated."""
@@ -74,9 +78,13 @@ def create_execution_plan(
         raise ExecutionPlanningError(
             "normalized execution and validation profiles must match"
         )
+    selected_profile = ValidationProfile.parse(
+        profile if profile is not None else model.execution["profile"]
+    )
+    selected_environment = environment or model.kubernetes_e2e["environment"]
     registry = model.registry
     logical_registry = "auto" if registry["mode"] == "ephemeral-local" else registry["host"]
-    requested_tag = f"run-{run_id.lower()}"
+    requested_tag = image_tag or f"run-{run_id.lower()}"
     build_arguments = {
         "OCI_REVISION": source_revision,
         "OCI_TITLE": model.application_name,
@@ -99,8 +107,8 @@ def create_execution_plan(
     )
     plan = ExecutionPlan.create(
         run_id=run_id,
-        profile=model.execution["profile"],
-        environment=model.kubernetes_e2e["environment"],
+        profile=selected_profile,
+        environment=selected_environment,
         artifact_intent=intent,
         production_apply_approved=production_apply_approved,
     )

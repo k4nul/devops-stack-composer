@@ -117,6 +117,21 @@ class ExecutionPlanningTests(unittest.TestCase):
             second.plan.artifact_intent.requested_tag,
         )
 
+    def test_operator_overrides_are_reflected_without_runtime_allocation(self) -> None:
+        planned = create_execution_plan(
+            self.with_v02_model(),
+            run_id=RUN_ID,
+            source_revision=SOURCE_REVISION,
+            profile="supply-chain",
+            environment="dev",
+            image_tag="candidate-2",
+        )
+
+        self.assertEqual(planned.plan.profile.value, "supply-chain")
+        self.assertEqual(planned.plan.environment, "dev")
+        self.assertEqual(planned.plan.artifact_intent.requested_tag, "candidate-2")
+        self.assertEqual(planned.plan.artifact_intent.registry, "auto")
+
     def test_local_kind_rejects_multi_platform_before_side_effects(self) -> None:
         planned = create_execution_plan(
             self.with_v02_model(platforms=("linux/amd64", "linux/arm64")),
