@@ -452,11 +452,15 @@ class ResourceRecoveryTests(unittest.TestCase):
 
     def test_capture_refuses_cross_run_replacement_and_identity_collision(self) -> None:
         self.recovery.record_registry(registry_handle())
+        other_run = "20260830T120000Z-000000000000"
         with self.assertRaisesRegex(ResourceRecordError, "different run"):
             self.recovery.record_registry(
                 RegistryHandle(
-                    run_id="20260830T120000Z-000000000000",
-                    name=REGISTRY_NAME,
+                    run_id=other_run,
+                    name=(
+                        f"devops-stack-registry-{_slug(other_run, 20)}-"
+                        "000000000000"
+                    ),
                     container_id=REGISTRY_ID,
                     host_port=49153,
                 )
@@ -473,21 +477,14 @@ class ResourceRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ResourceRecordError, "replace"):
             self.recovery.record_registry(changed)
 
-        non_local = RegistryHandle(
-            run_id=RUN_ID,
-            name=REGISTRY_NAME,
-            container_id=REGISTRY_ID,
-            host_port=49153,
-            local_test_only=False,
-        )
-        with self.assertRaisesRegex(ResourceRecordError, "local test"):
-            ResourceRecoveryStore(
-                EvidenceStore.create(
-                    self.project,
-                    work_directory=".devops-stack/other-runs",
-                    run_id=RUN_ID,
-                )
-            ).record_registry(non_local)
+        with self.assertRaisesRegex(ValueError, "local test"):
+            RegistryHandle(
+                run_id=RUN_ID,
+                name=REGISTRY_NAME,
+                container_id=REGISTRY_ID,
+                host_port=49153,
+                local_test_only=False,
+            )
 
 
 if __name__ == "__main__":
