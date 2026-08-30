@@ -179,7 +179,7 @@ jobs:
           python -m json.tool "$RUNNER_TEMP/release-verification.json"
 
       - name: Retry exact owned-resource cleanup
-        if: ${{ always() }}
+        if: ${{ always() && env.RUN_ID != '' }}
         run: |
           run_directory="examples/python-service/.devops-stack/release-runs/$RUN_ID"
           if [[ -d "$run_directory" ]]; then
@@ -296,6 +296,7 @@ jobs:
     timeout-minutes: 50
     permissions:
       actions: read
+      attestations: read
       contents: read
     env:
       GH_TOKEN: ${{ github.token }}
