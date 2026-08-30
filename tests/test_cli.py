@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from devops_stack_composer.adapters.base import AdapterResult, GeneratedArtifact
-from devops_stack_composer.cli import main
+from devops_stack_composer.cli import build_parser, main
 from devops_stack_composer.composition import Composition
 from devops_stack_composer.composition import _preflight_local_build_output
 from devops_stack_composer.config import load_config
@@ -320,6 +320,45 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("alice:swordfish", rendered)
             self.assertNotIn("bob:hunter2", rendered)
             self.assertIn("<redacted>", rendered)
+
+    def test_execution_and_evidence_subcommands_have_closed_argument_shapes(self) -> None:
+        execute = build_parser().parse_args(
+            [
+                "execute",
+                "--environment",
+                "staging",
+                "--profile",
+                "kind-e2e",
+                "--keep-resources",
+                "--json",
+            ]
+        )
+        inspect = build_parser().parse_args(
+            ["artifact", "inspect", "--run", "20260830T120000Z-abcdef012345"]
+        )
+        verify = build_parser().parse_args(
+            [
+                "artifact",
+                "verify",
+                "--artifact",
+                "out/execution/artifact.json",
+                "--sbom",
+                "out/supply-chain/sbom.json",
+            ]
+        )
+        cluster = build_parser().parse_args(
+            ["cluster", "kind", "destroy", "--run", "20260830T120000Z-abcdef012345"]
+        )
+        report = build_parser().parse_args(
+            ["report", "--run", "20260830T120000Z-abcdef012345", "--json"]
+        )
+
+        self.assertEqual(execute.profile, "kind-e2e")
+        self.assertTrue(execute.keep_resources)
+        self.assertEqual(inspect.artifact_command, "inspect")
+        self.assertEqual(verify.artifact, "out/execution/artifact.json")
+        self.assertEqual(cluster.kind_command, "destroy")
+        self.assertEqual(report.run, "20260830T120000Z-abcdef012345")
 
 
 if __name__ == "__main__":

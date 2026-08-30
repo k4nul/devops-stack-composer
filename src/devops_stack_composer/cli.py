@@ -22,6 +22,16 @@ from devops_stack_composer.composition import (
 from devops_stack_composer.diffing import diff_artifacts, render_human, render_json
 from devops_stack_composer.doctor import run_doctor
 from devops_stack_composer.errors import DevOpsStackError, UnsafePathError
+from devops_stack_composer.evidence_store import EvidenceStore
+from devops_stack_composer.execution import (
+    ExecutionOptions,
+    ExecutionOrchestrator,
+)
+from devops_stack_composer.execution_bundle import (
+    inspect_execution_bundle,
+    load_strict_json_file,
+    verify_execution_bundle,
+)
 from devops_stack_composer.explain import explain_config_value, explain_generated_file
 from devops_stack_composer.filesystem import (
     atomic_write,
@@ -30,6 +40,8 @@ from devops_stack_composer.filesystem import (
     sha256_file,
 )
 from devops_stack_composer.inspector import initial_config, inspect_application
+from devops_stack_composer.jenkins_evidence import verify_jenkins_artifact_files
+from devops_stack_composer.kind_cluster import KindCluster, KindClusterHandle
 from devops_stack_composer.locks import TEMPLATE_KEYS, TemplateLock
 from devops_stack_composer.manifest import ArtifactWriter, GeneratedManifest
 from devops_stack_composer.report import (
@@ -37,6 +49,7 @@ from devops_stack_composer.report import (
     redact_sensitive,
     write_report_files,
 )
+from devops_stack_composer.registry import EphemeralRegistry, RegistryHandle
 from devops_stack_composer.resources import default_lock_path
 from devops_stack_composer.sources import SourceResolver
 from devops_stack_composer.validation import (
@@ -148,6 +161,41 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--json", action="store_true", dest="json_output")
     validate.set_defaults(handler=_run_validate)
 
+    execute = commands.add_parser(
+        "execute",
+        help="run build-once supply-chain and Kubernetes validation profiles",
+    )
+    _add_composition_arguments(execute)
+    execute.add_argument(
+        "--environment",
+        required=True,
+        choices=("dev", "staging", "production"),
+        help="environment selected for an actual deployment",
+    )
+    execute.add_argument(
+        "--profile",
+        required=True,
+        choices=("static", "supply-chain", "kind-e2e", "release"),
+        help="strict cumulative execution profile",
+    )
+    execute.add_argument(
+        "--output",
+        help="run directory root relative to the project (default: configuration value)",
+    )
+    execute.add_argument("--image-tag", help="informational tag for the one pushed build")
+    execute.add_argument(
+        "--approve-production",
+        action="store_true",
+        help="explicitly approve a production apply; dry-run does not require this",
+    )
+    execute.add_argument(
+        "--keep-resources",
+        action="store_true",
+        help="retain verified run-owned resources for debugging; cleanup will not pass",
+    )
+    execute.add_argument("--json", action="store_true", dest="json_output")
+    execute.set_defaults(handler=_run_execute)
+
     diff = commands.add_parser("diff", help="compare planned artifacts with a baseline")
     _add_composition_arguments(diff)
     diff.add_argument("--against", choices=("generated", "project"), default="generated")
@@ -185,6 +233,76 @@ def build_parser() -> argparse.ArgumentParser:
     templates_path.add_argument("template_name", choices=TEMPLATE_KEYS)
     templates_path.set_defaults(handler=_run_templates_path)
 
+    artifact = commands.add_parser("artifact", help="inspect or verify immutable evidence")
+    artifact_commands = artifact.add_subparsers(dest="artifact_command", required=True)
+    artifact_inspect = artifact_commands.add_parser(
+        "inspect",
+        help="inspect one closed execution bundle",
+    )
+    _add_project_argument(artifact_inspect)
+    artifact_inspect.add_argument("--run", required=True, help="execution run ID")
+    artifact_inspect.add_argument(
+        "--output",
+        default=".devops-stack/runs",
+        help="run directory root relative to the project",
+    )
+    artifact_inspect.add_argument("--json", action="store_true", dest="json_output")
+    artifact_inspect.set_defaults(handler=_run_artifact_inspect)
+
+    artifact_verify = artifact_commands.add_parser(
+        "verify",
+        help="freshly verify a bundle or Jenkins evidence files offline",
+    )
+    _add_project_argument(artifact_verify)
+    verification_source = artifact_verify.add_mutually_exclusive_group(required=True)
+    verification_source.add_argument("--run", help="execution run ID")
+    verification_source.add_argument(
+        "--artifact",
+        help="Jenkins artifact JSON path relative to the project",
+    )
+    artifact_verify.add_argument("--sbom", help="Jenkins SBOM JSON path")
+    artifact_verify.add_argument("--scan", help="Jenkins vulnerability JSON path")
+    artifact_verify.add_argument("--provenance", help="Jenkins provenance JSON path")
+    artifact_verify.add_argument(
+        "--output",
+        default=".devops-stack/runs",
+        help="run directory root relative to the project",
+    )
+    artifact_verify.add_argument("--json", action="store_true", dest="json_output")
+    artifact_verify.set_defaults(handler=_run_artifact_verify)
+
+    cluster = commands.add_parser("cluster", help="manage verified local clusters")
+    cluster_commands = cluster.add_subparsers(dest="cluster_command", required=True)
+    cluster_kind = cluster_commands.add_parser("kind", help="manage a run-owned kind cluster")
+    kind_commands = cluster_kind.add_subparsers(dest="kind_command", required=True)
+    kind_create = kind_commands.add_parser(
+        "create",
+        help="create a pinned kind cluster and isolated registry",
+    )
+    _add_project_argument(kind_create)
+    kind_create.add_argument("--run", help="explicit safe run ID")
+    kind_create.add_argument(
+        "--output",
+        default=".devops-stack/runs",
+        help="run directory root relative to the project",
+    )
+    kind_create.add_argument("--json", action="store_true", dest="json_output")
+    kind_create.set_defaults(handler=_run_cluster_kind_create)
+    for name, help_text, handler in (
+        ("status", "inspect exact persisted resource ownership", _run_cluster_kind_status),
+        ("destroy", "delete only exact persisted run-owned resources", _run_cluster_kind_destroy),
+    ):
+        command = kind_commands.add_parser(name, help=help_text)
+        _add_project_argument(command)
+        command.add_argument("--run", required=True, help="execution run ID")
+        command.add_argument(
+            "--output",
+            default=".devops-stack/runs",
+            help="run directory root relative to the project",
+        )
+        command.add_argument("--json", action="store_true", dest="json_output")
+        command.set_defaults(handler=handler)
+
     explain = commands.add_parser("explain", help="explain a generated file or configuration value")
     _add_project_argument(explain)
     _add_config_argument(explain)
@@ -194,6 +312,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     report = commands.add_parser("report", help="write Markdown and JSON validation reports")
     _add_composition_arguments(report)
+    report.add_argument("--run", help="read and freshly verify an execution run")
+    report.add_argument(
+        "--output",
+        default=".devops-stack/runs",
+        help="run directory root used together with --run",
+    )
     report.add_argument("--force", action="store_true", help="replace existing report files")
     report.add_argument("--json", action="store_true", dest="json_output")
     report.set_defaults(handler=_run_report)
@@ -449,6 +573,272 @@ def _run_validate(args: argparse.Namespace) -> int:
     return 0 if validation.passed else 1
 
 
+def _run_execute(args: argparse.Namespace) -> int:
+    project = _resolved_project(args)
+    composition = compose(
+        project=project,
+        config_path=contained_path(project, args.config),
+        lock=_load_lock(args, project),
+        explicit_template_paths=_explicit_templates(args),
+        fetch_templates=not args.no_fetch,
+    )
+    work_directory = args.output or composition.loaded_config.model.execution[
+        "workDirectory"
+    ]
+    result = ExecutionOrchestrator().execute(
+        composition,
+        ExecutionOptions(
+            environment=args.environment,
+            profile=args.profile,
+            work_directory=work_directory,
+            image_tag=args.image_tag,
+            approve_production=args.approve_production,
+            keep_resources=args.keep_resources,
+        ),
+    )
+    value = result.to_dict()
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        print(f"run: {value['runId']}")
+        print(f"evidence: {value['runDirectory']}")
+        print(f"status: {value['finalStatus']}")
+        artifact = value.get("artifact")
+        if isinstance(artifact, dict):
+            print(f"image: {artifact['immutableImageReference']}")
+            print(f"build-invocations: {artifact['buildInvocationCount']}")
+        if value.get("failureReason"):
+            print(f"failure: {value['failureReason']}", file=sys.stderr)
+    return 0 if result.passed else 1
+
+
+def _run_artifact_inspect(args: argparse.Namespace) -> int:
+    value = inspect_execution_bundle(
+        _resolved_project(args),
+        args.run,
+        work_directory=args.output,
+    ).to_dict()
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        for key in (
+            "runId",
+            "profile",
+            "finalStatus",
+            "repository",
+            "tag",
+            "digest",
+            "platform",
+            "configDigest",
+            "sbom",
+            "scan",
+            "provenance",
+            "verificationStatus",
+            "deploymentEnvironment",
+            "checksumFileCount",
+        ):
+            print(f"{key}: {value[key] if value[key] is not None else 'none'}")
+    return 0
+
+
+def _run_artifact_verify(args: argparse.Namespace) -> int:
+    project = _resolved_project(args)
+    if args.run is not None:
+        if any((args.sbom, args.scan, args.provenance)):
+            raise ValueError(
+                "--sbom, --scan, and --provenance are only valid with --artifact"
+            )
+        verification = verify_execution_bundle(
+            project,
+            args.run,
+            work_directory=args.output,
+        )
+        value = verification.to_dict()
+    else:
+        verification = verify_jenkins_artifact_files(
+            project,
+            args.artifact,
+            sbom_path=args.sbom,
+            scan_path=args.scan,
+            provenance_path=args.provenance,
+        )
+        value = verification.to_dict()
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        print(f"passed: {str(value['passed']).lower()}")
+        print(f"authoritative-digest: {value['authoritativeDigest']}")
+        for name, subject in sorted(value["subjects"].items()):
+            print(f"subject.{name}: {subject}")
+    return 0
+
+
+def _lifecycle_values(project: Path, run_id: str, work_directory: str):
+    store = EvidenceStore.open(
+        project,
+        run_id,
+        work_directory=work_directory,
+    )
+    cluster_value = load_strict_json_file(
+        project,
+        f"{store.relative_root}/kind-cluster-ownership.json",
+    )
+    registry_value = load_strict_json_file(
+        project,
+        f"{store.relative_root}/registry-ownership.json",
+    )
+    return (
+        store,
+        KindClusterHandle.from_dict(cluster_value),
+        RegistryHandle.from_dict(registry_value),
+    )
+
+
+def _run_cluster_kind_create(args: argparse.Namespace) -> int:
+    project = _resolved_project(args)
+    store = EvidenceStore.create(
+        project,
+        work_directory=args.output,
+        run_id=args.run,
+    )
+    registry = EphemeralRegistry(store.run_id)
+    cluster = KindCluster(store.run_id)
+    registry_handle = None
+    cluster_handle = None
+    try:
+        registry_handle = registry.start()
+        store.write_json("registry-ownership.json", registry_handle.to_dict())
+        cluster_handle = cluster.create()
+        store.write_json("kind-cluster-ownership.json", cluster_handle.to_dict())
+        configuration = cluster.configure_local_registry(registry)
+        value = {
+            "runId": store.run_id,
+            "cluster": cluster_handle.to_dict(),
+            "registry": registry_handle.to_dict(),
+            "registryConfiguration": {
+                "hostEndpoint": configuration.host_endpoint,
+                "containerEndpoint": configuration.container_endpoint,
+                "nodes": list(configuration.nodes),
+                "localTestOnly": True,
+            },
+        }
+        store.write_json("cluster-lifecycle.json", value)
+        store.write_checksums()
+        store.verify_checksums()
+        cluster.detach()
+    except BaseException:
+        try:
+            if cluster_handle is not None:
+                cluster.destroy()
+            else:
+                cluster.close()
+        finally:
+            if registry_handle is not None:
+                registry.cleanup()
+        raise
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        print(f"run: {store.run_id}")
+        print(f"cluster: {cluster_handle.name}")
+        print(f"registry: {configuration.host_endpoint} (local test only)")
+    return 0
+
+
+def _run_cluster_kind_status(args: argparse.Namespace) -> int:
+    project = _resolved_project(args)
+    _store, cluster_handle, registry_handle = _lifecycle_values(
+        project,
+        args.run,
+        args.output,
+    )
+    cluster = KindCluster.reopen(cluster_handle)
+    try:
+        cluster_status = cluster.status()
+        registry_status = EphemeralRegistry.reopen(registry_handle).status()
+    finally:
+        cluster.detach()
+    value = {
+        "runId": args.run,
+        "cluster": {
+            "name": cluster_status.name,
+            "exists": cluster_status.exists,
+            "owned": cluster_status.owned,
+            "ready": cluster_status.ready,
+            "nodes": list(cluster_status.nodes),
+            "error": cluster_status.error,
+        },
+        "registry": {
+            "name": registry_status.name,
+            "exists": registry_status.exists,
+            "owned": registry_status.owned,
+            "running": registry_status.running,
+            "state": registry_status.state,
+            "hostPort": registry_status.host_port,
+        },
+    }
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        print(
+            f"cluster: {cluster_status.name} "
+            f"owned={str(cluster_status.owned).lower()} "
+            f"ready={str(cluster_status.ready).lower()}"
+        )
+        print(
+            f"registry: {registry_status.name} "
+            f"owned={str(registry_status.owned).lower()} "
+            f"running={str(registry_status.running).lower()}"
+        )
+    return 0 if cluster_status.ready and registry_status.running else 1
+
+
+def _run_cluster_kind_destroy(args: argparse.Namespace) -> int:
+    project = _resolved_project(args)
+    _store, cluster_handle, registry_handle = _lifecycle_values(
+        project,
+        args.run,
+        args.output,
+    )
+    errors: list[str] = []
+    cluster = None
+    registry = None
+    try:
+        cluster = KindCluster.reopen(cluster_handle)
+    except DevOpsStackError as exc:
+        errors.append(str(exc))
+    try:
+        registry = EphemeralRegistry.reopen(registry_handle)
+    except DevOpsStackError as exc:
+        errors.append(str(exc))
+    cluster_removed = False
+    registry_removed = False
+    if cluster is not None:
+        try:
+            cluster_removed = cluster.destroy()
+        except DevOpsStackError as exc:
+            errors.append(str(exc))
+    if registry is not None:
+        try:
+            registry_removed = registry.cleanup()
+        except DevOpsStackError as exc:
+            errors.append(str(exc))
+    value = {
+        "runId": args.run,
+        "clusterRemoved": cluster_removed,
+        "registryRemoved": registry_removed,
+        "errors": errors,
+    }
+    if args.json_output:
+        print(_safe_json(value), end="")
+    else:
+        print(f"cluster-removed: {str(cluster_removed).lower()}")
+        print(f"registry-removed: {str(registry_removed).lower()}")
+        for error in errors:
+            print(f"error: {error}", file=sys.stderr)
+    return 0 if not errors else 1
+
+
 def _run_diff(args: argparse.Namespace) -> int:
     composition = _composition(args)
     differences = diff_artifacts(
@@ -656,6 +1046,33 @@ def _run_explain(args: argparse.Namespace) -> int:
 
 
 def _run_report(args: argparse.Namespace) -> int:
+    if args.run is not None:
+        if args.force:
+            raise ValueError("--force is not valid when reading an execution --run")
+        project = _resolved_project(args)
+        verification = verify_execution_bundle(
+            project,
+            args.run,
+            work_directory=args.output,
+        )
+        store = EvidenceStore.open(
+            project,
+            args.run,
+            work_directory=args.output,
+        )
+        report_json = store.path("report.json")
+        report_markdown = store.path("report.md")
+        if args.json_output:
+            print(report_json.read_text(encoding="utf-8"), end="")
+        else:
+            print(f"report: {report_markdown.relative_to(project)}")
+            print(f"machine-report: {report_json.relative_to(project)}")
+            print(
+                "fresh-verification: passed "
+                f"({verification.checksum_file_count} checksummed files)"
+            )
+        return 0
+
     composition = _composition(args)
     manifest, integrity = generated_integrity_report(
         composition,
