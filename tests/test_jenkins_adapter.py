@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from jsonschema import Draft7Validator
 
+from devops_stack_composer import __version__
 from devops_stack_composer.adapters.jenkins import (
     JenkinsPipelineAdapter,
     _authenticated_push_script,
@@ -236,6 +237,10 @@ class JenkinsAdapterTests(unittest.TestCase):
             jenkinsfile,
         )
         self.assertIn("out/execution/artifact.json", jenkinsfile)
+        self.assertIn(f"Tool: devops-stack-composer-{__version__}", jenkinsfile)
+        self.assertIn(
+            f"version: ['devops-stack-composer': '{__version__}']", jenkinsfile
+        )
         self.assertIn(
             "Image tag moved while the registry digest was being resolved",
             jenkinsfile,
