@@ -170,6 +170,7 @@ class RegistryTests(unittest.TestCase):
                 "Run_2026.08.30",
                 command_runner=runner,
                 http_opener=opener or SequenceOpener(200),
+                port_allocator=lambda: 49153,
                 **kwargs,
             )
 
@@ -188,7 +189,10 @@ class RegistryTests(unittest.TestCase):
             "docker.io/library/registry:3.1.1@"
             "sha256:1be55279f18a2fe1a74edf2664cac61c1bea305b7b4642dab412e7affdcb3e33",
         )
-        self.assertEqual(command[command.index("--publish") + 1], "127.0.0.1::5000")
+        self.assertEqual(
+            command[command.index("--publish") + 1],
+            "127.0.0.1:49153:5000",
+        )
         self.assertNotIn("--restart", command)
         self.assertNotIn("--rm", command)
         self.assertNotIn("0.0.0.0", " ".join(command))
@@ -345,6 +349,20 @@ class RegistryTests(unittest.TestCase):
         ):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 EphemeralRegistry("run", command_runner=runner, **{field: 0})
+        self.assertEqual(runner.calls, [])
+
+    def test_invalid_allocated_port_fails_before_docker(self) -> None:
+        runner = FakeDockerRunner()
+        for value in (True, 0, 65536, "49153"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                RegistryError,
+                "port allocator returned an invalid port",
+            ):
+                EphemeralRegistry(
+                    "run",
+                    command_runner=runner,
+                    port_allocator=lambda value=value: value,
+                ).start()
         self.assertEqual(runner.calls, [])
 
     def test_start_failure_redacts_sensitive_docker_output(self) -> None:

@@ -6,6 +6,7 @@ import json
 import math
 import re
 import secrets
+import socket
 import subprocess
 import time
 from dataclasses import dataclass
@@ -47,6 +48,7 @@ _SECRET_FLAG = re.compile(
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 HttpOpener = Callable[..., Any]
+PortAllocator = Callable[[], int]
 
 
 class RegistryError(DevOpsStackError):
@@ -193,6 +195,20 @@ def _registry_name_matches_run(name: object, run_id: str) -> bool:
     )
 
 
+def _available_loopback_port() -> int:
+    """Ask the kernel for an ephemeral port, then bind Docker to that exact port."""
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind((REGISTRY_HOST, 0))
+            port = listener.getsockname()[1]
+    except OSError as exc:
+        raise RegistryError("could not allocate a loopback registry port") from exc
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise RegistryError("kernel returned an invalid loopback registry port")
+    return port
+
+
 class EphemeralRegistry:
     """Create and remove one isolated registry owned by an execution run."""
 
@@ -202,6 +218,7 @@ class EphemeralRegistry:
         *,
         command_runner: CommandRunner | None = None,
         http_opener: HttpOpener | None = None,
+        port_allocator: PortAllocator | None = None,
         readiness_timeout_seconds: float = 20.0,
         poll_interval_seconds: float = 0.2,
         command_timeout_seconds: float = 30.0,
@@ -223,6 +240,7 @@ class EphemeralRegistry:
         self.name = _registry_name(run_id)
         self._command_runner = command_runner or subprocess.run
         self._http_opener = http_opener or urlopen
+        self._port_allocator = port_allocator or _available_loopback_port
         self._readiness_timeout = float(readiness_timeout_seconds)
         self._poll_interval = float(poll_interval_seconds)
         self._command_timeout = float(command_timeout_seconds)
@@ -297,13 +315,21 @@ class EphemeralRegistry:
         if self._created:
             raise RegistryError("registry lifecycle has already been started")
 
+        selected_port = self._port_allocator()
+        if (
+            isinstance(selected_port, bool)
+            or not isinstance(selected_port, int)
+            or not 1 <= selected_port <= 65535
+        ):
+            raise RegistryError("registry port allocator returned an invalid port")
+
         command = ["docker", "run", "--detach", "--name", self.name]
         for key, value in self._labels.items():
             command.extend(("--label", f"{key}={value}"))
         command.extend(
             (
                 "--publish",
-                f"{REGISTRY_HOST}::{REGISTRY_CONTAINER_PORT}",
+                f"{REGISTRY_HOST}:{selected_port}:{REGISTRY_CONTAINER_PORT}",
                 REGISTRY_IMAGE,
             )
         )
@@ -320,6 +346,10 @@ class EphemeralRegistry:
             container_id = self._container_id_from(inspected)
             self._container_id = container_id
             host_port = self._host_port_from(inspected)
+            if host_port != selected_port:
+                raise RegistryError(
+                    "Docker did not preserve the selected loopback registry port"
+                )
             handle = RegistryHandle(
                 run_id=self.run_id,
                 name=self.name,
@@ -585,7 +615,7 @@ class EphemeralRegistry:
             and isinstance(bindings[0], dict)
         )
         if not valid_bindings:
-            raise RegistryError("registry did not receive exactly one dynamic host-port binding")
+            raise RegistryError("registry did not receive exactly one host-port binding")
         binding = bindings[0]
         if binding.get("HostIp") != REGISTRY_HOST:
             raise RegistryError("registry host port is not restricted to loopback")
