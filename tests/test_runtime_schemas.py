@@ -24,7 +24,7 @@ SCHEMA_DIRECTORY = Path(__file__).resolve().parents[1] / "schemas"
 SCHEMA_NAMES = (
     "execution-plan.schema.json",
     "execution-evidence.schema.json",
-    "report.schema.json",
+    "execution-report.schema.json",
 )
 
 DIGEST = "sha256:" + "a" * 64
@@ -190,7 +190,7 @@ class RuntimeSchemaTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.plan_validator = schema_validator("execution-plan.schema.json")
         cls.evidence_validator = schema_validator("execution-evidence.schema.json")
-        cls.report_validator = schema_validator("report.schema.json")
+        cls.report_validator = schema_validator("execution-report.schema.json")
 
     def assert_invalid(
         self,
@@ -225,7 +225,7 @@ class RuntimeSchemaTests(unittest.TestCase):
 
         self.assertEqual(value["statusCounts"]["NOT_APPLICABLE"], 1)
         self.assertEqual(
-            load_schema("report.schema.json")["title"],
+            load_schema("execution-report.schema.json")["title"],
             "DevOps Stack durable execution report",
         )
 
