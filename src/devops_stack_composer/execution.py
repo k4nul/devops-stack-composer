@@ -64,6 +64,12 @@ from devops_stack_composer.policies import (
     profile_policy,
 )
 from devops_stack_composer.registry import EphemeralRegistry, RegistryHandle
+from devops_stack_composer.release_validation import (
+    ReleaseGateError,
+    ReleaseGateRequest,
+    ReleaseGateResult,
+    validate_published_release,
+)
 from devops_stack_composer.resource_recovery import ResourceRecoveryStore
 from devops_stack_composer.report import redact_sensitive
 from devops_stack_composer.process_compat import (
@@ -88,6 +94,9 @@ KindFactory = Callable[[str], KindCluster]
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ToolResolver = Callable[[str], str | None]
 ProcessRunnerFactory = Callable[[Path], SafeProcessRunner]
+ReleaseValidator = Callable[
+    [ReleaseGateRequest, SafeProcessRunner], ReleaseGateResult
+]
 
 _EXECUTION_TOOLS = frozenset(
     {
@@ -129,6 +138,9 @@ class ExecutionOptions:
     keep_resources: bool = False
     keep_environment_on_failure: bool = False
     run_id: str | None = None
+    release_assets_directory: str | None = None
+    release_version: str = __version__
+    release_repository: str = "k4nul/devops-stack-composer"
 
     def __post_init__(self) -> None:
         if self.environment not in {"dev", "staging", "production"}:
@@ -153,6 +165,16 @@ class ExecutionOptions:
             )
         if self.run_id is not None and not isinstance(self.run_id, str):
             raise ValueError("run_id must be a string")
+        if self.release_assets_directory is not None:
+            object.__setattr__(
+                self,
+                "release_assets_directory",
+                normalize_relative_path(self.release_assets_directory),
+            )
+        if not isinstance(self.release_version, str):
+            raise ValueError("release_version must be a string")
+        if not isinstance(self.release_repository, str):
+            raise ValueError("release_repository must be a string")
 
 
 @dataclass(frozen=True)
@@ -549,6 +571,7 @@ class ExecutionOrchestrator:
         tool_resolver: ToolResolver | None = None,
         source_revision_resolver: SourceRevisionResolver | None = None,
         process_runner_factory: ProcessRunnerFactory | None = None,
+        release_validator: ReleaseValidator | None = None,
         clock: Clock | None = None,
     ) -> None:
         self._build_executor = build_executor
@@ -560,6 +583,7 @@ class ExecutionOrchestrator:
         self._tool_resolver = tool_resolver or shutil.which
         self._source_revision_resolver = source_revision_resolver
         self._process_runner_factory = process_runner_factory
+        self._release_validator = release_validator or validate_published_release
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def _process_runner(self, project: Path) -> SafeProcessRunner:
@@ -704,6 +728,29 @@ class ExecutionOrchestrator:
                 "RELEASE_RESOURCE_RETENTION_FORBIDDEN",
                 "release validation cannot retain run-owned resources",
             )
+        if (
+            profile == ValidationProfile.RELEASE
+            and options.release_assets_directory is None
+        ):
+            raise ExecutionError(
+                "RELEASE_ASSETS_REQUIRED",
+                "release validation requires --release-assets with a locally verified asset set",
+            )
+        if profile == ValidationProfile.RELEASE:
+            assert options.release_assets_directory is not None
+            try:
+                ReleaseGateRequest(
+                    project=composition.project,
+                    local_assets_directory=options.release_assets_directory,
+                    version=options.release_version,
+                    source_commit="0" * 40,
+                    repository=options.release_repository,
+                )
+            except ValueError as exc:
+                raise ExecutionError(
+                    "RELEASE_OPTIONS_INVALID",
+                    "release version, repository, or asset path is invalid",
+                ) from exc
 
     def _missing_required_tools(
         self,
@@ -732,12 +779,7 @@ class ExecutionOrchestrator:
                 )
             )
         if profile == ValidationProfile.RELEASE:
-            required.extend(
-                (
-                    ("cosign", "release-assets"),
-                    ("gh", "release-download-verification"),
-                )
-            )
+            required.append(("gh", "release-download-verification"))
         return tuple(
             (tool, stage_id)
             for tool, stage_id in required
@@ -1041,7 +1083,10 @@ class ExecutionOrchestrator:
         model = composition.loaded_config.model
         profile = options.profile
         assert isinstance(profile, ValidationProfile)
-        canonical_bundle = profile == ValidationProfile.KIND_E2E
+        canonical_bundle = profile in {
+            ValidationProfile.KIND_E2E,
+            ValidationProfile.RELEASE,
+        }
         process_runner = self._process_runner(composition.project)
         subprocess_adapter = SafeSubprocessAdapter(process_runner)
         build_executor = self._build_executor or BuildOnceExecutor(
@@ -1837,6 +1882,89 @@ class ExecutionOrchestrator:
                         )
 
         assert plan is not None
+        if profile == ValidationProfile.RELEASE and failure_reason is None:
+            current_stage = "package"
+            release_started = self._now()
+            try:
+                assert options.release_assets_directory is not None
+                release_result = self._release_validator(
+                    ReleaseGateRequest(
+                        project=composition.project,
+                        local_assets_directory=options.release_assets_directory,
+                        version=options.release_version,
+                        source_commit=source_revision,
+                        repository=options.release_repository,
+                    ),
+                    process_runner,
+                )
+                store.write_json("release-validation.json", release_result.to_dict())
+            except BaseException as error:
+                failure_error = error
+                failure_reason = _safe_failure(error)
+                completed_release_stages = (
+                    error.completed_stages
+                    if isinstance(error, ReleaseGateError)
+                    else ()
+                )
+                current_stage = (
+                    error.stage_id
+                    if isinstance(error, ReleaseGateError)
+                    else "package"
+                )
+                error_record = {
+                    "schemaVersion": "1.0.0",
+                    "code": getattr(error, "code", "RELEASE_VALIDATION_FAILED"),
+                    "failedStage": current_stage,
+                    "completedStages": [
+                        stage.to_dict() for stage in completed_release_stages
+                    ],
+                    "message": failure_reason,
+                }
+                store.write_json("release-validation-error.json", error_record)
+                for completed in completed_release_stages:
+                    stage_results[completed.stage_id] = self._stage(
+                        plan,
+                        completed.stage_id,
+                        StageStatus.PASSED,
+                        started=release_started,
+                        command=completed.command,
+                        tool=completed.tool,
+                        output=completed.output,
+                        evidence_paths=("release-validation-error.json",),
+                    )
+                stage_results[current_stage] = self._stage(
+                    plan,
+                    current_stage,
+                    StageStatus.FAILED,
+                    started=release_started,
+                    tool=(
+                        "gh"
+                        if current_stage == "release-download-verification"
+                        else "git"
+                        if current_stage in {"working-tree", "tag-commit"}
+                        else "devops-stack-composer"
+                    ),
+                    evidence_paths=("release-validation-error.json",),
+                    failure_reason=failure_reason,
+                    remediation=(
+                        "Repair or republish the exact release assets, then rerun the "
+                        "release profile from a clean tagged checkout"
+                    ),
+                )
+                if progress is not None:
+                    progress.fail(current_stage, error)
+            else:
+                for completed in release_result.stages:
+                    stage_results[completed.stage_id] = self._stage(
+                        plan,
+                        completed.stage_id,
+                        StageStatus.PASSED,
+                        started=release_started,
+                        command=completed.command,
+                        tool=completed.tool,
+                        output=completed.output,
+                        evidence_paths=("release-validation.json",),
+                    )
         if canonical_bundle and failure_reason is not None:
             cleanup_result = stage_results.get("cleanup")
             if cleanup_result is not None and cleanup_result.evidence_paths:

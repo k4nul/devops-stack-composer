@@ -337,6 +337,17 @@ class CliTests(unittest.TestCase):
                 "--json",
             ]
         )
+        release_execute = build_parser().parse_args(
+            [
+                "execute",
+                "--profile",
+                "release",
+                "--release-assets",
+                ".devops-stack/release-v0.2.0",
+                "--release-repository",
+                "k4nul/devops-stack-composer",
+            ]
+        )
         inspect = build_parser().parse_args(
             ["artifact", "inspect", "--run", "20260830T120000Z-abcdef012345"]
         )
@@ -391,6 +402,11 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(execute.profile, "kind-e2e")
         self.assertTrue(execute.keep_resources)
+        self.assertEqual(
+            release_execute.release_assets,
+            ".devops-stack/release-v0.2.0",
+        )
+        self.assertEqual(release_execute.release_version, "0.2.0")
         self.assertEqual(inspect.artifact_command, "inspect")
         self.assertEqual(verify.artifact, "out/execution/artifact.json")
         self.assertEqual(cluster.kind_command, "destroy")

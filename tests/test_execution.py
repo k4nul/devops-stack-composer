@@ -34,6 +34,10 @@ from devops_stack_composer.kubernetes_execution import (
 )
 from devops_stack_composer.kubernetes_runtime import ResolvedKubernetesManifest
 from devops_stack_composer.locks import TemplateLock
+from devops_stack_composer.release_validation import (
+    ReleaseGateError,
+    ReleaseGateStage,
+)
 from devops_stack_composer.sources import SourceResolution
 from devops_stack_composer.validation import CheckResult, ValidationReport, ValidationStatus
 
@@ -403,6 +407,43 @@ def schema_success(command, **kwargs):
     return subprocess.CompletedProcess(command, 0, stdout="schema passed\n", stderr="")
 
 
+class FakeReleaseGateResult:
+    def __init__(self) -> None:
+        self.stages = tuple(
+            ReleaseGateStage(stage_id, "fixture", ("fixture", stage_id), "passed")
+            for stage_id in (
+                "package",
+                "release-assets",
+                "release-download-verification",
+                "working-tree",
+                "tag-commit",
+            )
+        )
+
+    def to_dict(self):
+        return {
+            "schemaVersion": "1.0.0",
+            "sourceCommit": REVISION,
+            "downloadedFromGitHub": True,
+            "workingTreeClean": True,
+            "stages": [stage.to_dict() for stage in self.stages],
+        }
+
+
+class FakeReleaseValidator:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.request = None
+        self.error = None
+
+    def __call__(self, request, runner):
+        self.calls += 1
+        self.request = request
+        if self.error is not None:
+            raise self.error
+        return FakeReleaseGateResult()
+
+
 class ExecutionTests(unittest.TestCase):
     def orchestrator(
         self,
@@ -414,6 +455,7 @@ class ExecutionTests(unittest.TestCase):
         kubernetes_executor=None,
         schema_command_runner=None,
         tool_resolver=None,
+        release_validator=None,
     ):
         return ExecutionOrchestrator(
             build_executor=build_executor,
@@ -432,6 +474,11 @@ class ExecutionTests(unittest.TestCase):
             ),
             tool_resolver=tool_resolver or (lambda name: f"/tools/{name}"),
             source_revision_resolver=lambda project: REVISION,
+            **(
+                {"release_validator": release_validator}
+                if release_validator is not None
+                else {}
+            ),
             clock=lambda: NOW,
         )
 
@@ -739,6 +786,121 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(
                 ExecutionJournal.open(result.store).current_state,
                 ExecutionState.CLEANED,
+            )
+            verify_evidence_bundle(result.store)
+
+    def test_release_profile_runs_post_publication_gates_and_closes_bundle(self) -> None:
+        registry_factory = FakeRegistryFactory()
+        kind_factory = FakeKindFactory()
+        release = FakeReleaseValidator()
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "devops_stack_composer.execution.render_resolved_environment",
+            side_effect=resolved_manifest,
+        ):
+            project = Path(directory)
+            run_id = "20260830T120000Z-555555555555"
+            result = self.orchestrator(
+                build_executor=FakeBuildExecutor(),
+                supply_chain_generator=FakeSupplyChainGenerator(),
+                registry_factory=registry_factory,
+                kind_factory=kind_factory,
+                kubernetes_executor=SuccessfulKubernetesExecutor(
+                    project / ".devops-stack" / "runs" / run_id
+                ),
+                schema_command_runner=schema_success,
+                release_validator=release,
+            ).execute(
+                kind_composition(project),
+                ExecutionOptions(
+                    profile="release",
+                    run_id=run_id,
+                    release_assets_directory=".devops-stack/release-v0.2.0",
+                ),
+            )
+
+            self.assertTrue(result.passed)
+            self.assertEqual(release.calls, 1)
+            self.assertEqual(release.request.source_commit, REVISION)
+            self.assertEqual(
+                [self.stage(result, stage_id).status for stage_id in (
+                    "package",
+                    "release-assets",
+                    "release-download-verification",
+                    "working-tree",
+                    "tag-commit",
+                )],
+                [StageStatus.PASSED] * 5,
+            )
+            self.assertTrue(result.store.path("release-validation.json").is_file())
+            self.assertTrue(result.bundle_verification.execution_succeeded)
+            verify_evidence_bundle(result.store)
+
+    def test_release_profile_requires_local_assets_before_side_effects(self) -> None:
+        build = FakeBuildExecutor()
+        registry_factory = FakeRegistryFactory()
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            with self.assertRaisesRegex(ExecutionError, "RELEASE_ASSETS_REQUIRED"):
+                self.orchestrator(
+                    build_executor=build,
+                    registry_factory=registry_factory,
+                ).execute(
+                    kind_composition(project),
+                    ExecutionOptions(profile="release"),
+                )
+
+            self.assertEqual(build.execute_count, 0)
+            self.assertEqual(registry_factory.calls, 0)
+            self.assertFalse((project / ".devops-stack").exists())
+
+    def test_release_gate_failure_preserves_strict_partial_evidence(self) -> None:
+        registry_factory = FakeRegistryFactory()
+        kind_factory = FakeKindFactory()
+        release = FakeReleaseValidator()
+        completed = FakeReleaseGateResult().stages[:3]
+        release.error = ReleaseGateError(
+            "RELEASE_WORKTREE_DIRTY",
+            "working-tree",
+            "release validation requires a clean Git working tree",
+            completed_stages=completed,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "devops_stack_composer.execution.render_resolved_environment",
+            side_effect=resolved_manifest,
+        ):
+            project = Path(directory)
+            run_id = "20260830T120000Z-666666666666"
+            result = self.orchestrator(
+                build_executor=FakeBuildExecutor(),
+                supply_chain_generator=FakeSupplyChainGenerator(),
+                registry_factory=registry_factory,
+                kind_factory=kind_factory,
+                kubernetes_executor=SuccessfulKubernetesExecutor(
+                    project / ".devops-stack" / "runs" / run_id
+                ),
+                schema_command_runner=schema_success,
+                release_validator=release,
+            ).execute(
+                kind_composition(project),
+                ExecutionOptions(
+                    profile="release",
+                    run_id=run_id,
+                    release_assets_directory=".devops-stack/release-v0.2.0",
+                ),
+            )
+
+            self.assertFalse(result.passed)
+            self.assertEqual(
+                result.run.stage_results[-1].stage_id,
+                "working-tree",
+            )
+            self.assertEqual(
+                result.run.stage_results[-1].status,
+                StageStatus.FAILED,
+            )
+            self.assertFalse(result.bundle_verification.execution_succeeded)
+            self.assertTrue(
+                result.store.path("release-validation-error.json").is_file()
             )
             verify_evidence_bundle(result.store)
 

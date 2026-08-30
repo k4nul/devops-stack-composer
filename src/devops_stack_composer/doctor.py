@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Mapping, Sequence
 
 from devops_stack_composer.locks import TemplateLock
@@ -133,7 +132,6 @@ def run_doctor(
                 "kind",
                 "kubectl",
                 "kubeconform",
-                "cosign",
                 "gh",
             }
         ),
@@ -159,7 +157,7 @@ def run_doctor(
         ("trivy", ("trivy", "version"), False, "standalone image vulnerability scanning will be skipped"),
         ("cosign", ("cosign", "version"), False, "standalone provenance verification will be skipped"),
         ("kind", ("kind", "version"), False, "kind cluster execution will be skipped"),
-        ("gh", ("gh", "--version"), False, "GitHub artifact attestation verification will be skipped"),
+        ("gh", ("gh", "--version"), False, "published release download verification will be skipped"),
     )
     checks.extend(
         _tool_check(

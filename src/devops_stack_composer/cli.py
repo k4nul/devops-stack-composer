@@ -202,6 +202,23 @@ def build_parser() -> argparse.ArgumentParser:
     execute.add_argument("--image-tag", help="informational tag for the one pushed build")
     execute.add_argument("--run", help="explicit safe execution run ID")
     execute.add_argument(
+        "--release-assets",
+        help=(
+            "locally assembled closed asset directory required by the post-publication "
+            "release profile"
+        ),
+    )
+    execute.add_argument(
+        "--release-version",
+        default=__version__,
+        help="published version checked by the release profile",
+    )
+    execute.add_argument(
+        "--release-repository",
+        default="k4nul/devops-stack-composer",
+        help="GitHub OWNER/REPO downloaded by the release profile",
+    )
+    execute.add_argument(
         "--dry-run",
         action="store_true",
         help="validate and print the logical plan without writes or runtime side effects",
@@ -837,6 +854,9 @@ def _run_execute(args: argparse.Namespace) -> int:
             keep_resources=args.keep_resources,
             keep_environment_on_failure=args.keep_environment_on_failure,
             run_id=args.run,
+            release_assets_directory=args.release_assets,
+            release_version=args.release_version,
+            release_repository=args.release_repository,
         ),
     )
     value = result.to_dict()
