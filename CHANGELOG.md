@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 - 2026-08-31
+
+- Isolate GitHub CLI configuration and state in a cleaned runtime directory so the
+  strict post-publication worktree gate cannot be dirtied by CLI device metadata.
+
 ## 0.2.0 - 2026-08-31
 
 - Add cumulative static, supply-chain, kind E2E, and release validation profiles.
