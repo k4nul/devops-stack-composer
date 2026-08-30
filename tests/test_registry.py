@@ -87,6 +87,7 @@ class FakeDockerRunner:
         self.log_stdout = ""
         self.log_stderr = "registry listening\n"
         self.raise_on_run: BaseException | None = None
+        self.remove_persists = False
 
     def __call__(self, command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         command = list(command)
@@ -150,7 +151,8 @@ class FakeDockerRunner:
             )
 
         if command[:2] == ["docker", "rm"]:
-            self.exists = False
+            if not self.remove_persists:
+                self.exists = False
             return subprocess.CompletedProcess(command, 0, f"{command[-1]}\n", "")
 
         raise AssertionError(f"unexpected command: {command}")
@@ -449,6 +451,18 @@ class RegistryTests(unittest.TestCase):
         removes = [command for command in runner.calls if command[:2] == ["docker", "rm"]]
         self.assertEqual(removes, [["docker", "rm", "--force", "--volumes", CONTAINER_ID]])
         self.assertIsNone(registry.handle)
+
+    def test_cleanup_requires_post_delete_absence(self) -> None:
+        runner = FakeDockerRunner()
+        runner.remove_persists = True
+        registry = self.make_registry(runner)
+        registry.start()
+
+        with self.assertRaisesRegex(RegistryError, "still exists"):
+            registry.cleanup()
+
+        self.assertTrue(runner.exists)
+        self.assertIsNotNone(registry.handle)
 
     def test_cleanup_before_start_never_inspects_or_removes(self) -> None:
         runner = FakeDockerRunner()

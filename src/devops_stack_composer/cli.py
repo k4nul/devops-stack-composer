@@ -698,18 +698,35 @@ def _lifecycle_values(project: Path, run_id: str, work_directory: str):
         run_id,
         work_directory=work_directory,
     )
-    cluster_value = load_strict_json_file(
-        project,
-        f"{store.relative_root}/kind-cluster-ownership.json",
+    store.verify_checksums()
+    cluster_path = store.path("kind-cluster-ownership.json")
+    registry_path = store.path("registry-ownership.json")
+    cluster_handle = (
+        KindClusterHandle.from_dict(
+            load_strict_json_file(
+                project,
+                f"{store.relative_root}/kind-cluster-ownership.json",
+            )
+        )
+        if cluster_path.is_file()
+        else None
     )
-    registry_value = load_strict_json_file(
-        project,
-        f"{store.relative_root}/registry-ownership.json",
+    registry_handle = (
+        RegistryHandle.from_dict(
+            load_strict_json_file(
+                project,
+                f"{store.relative_root}/registry-ownership.json",
+            )
+        )
+        if registry_path.is_file()
+        else None
     )
+    if cluster_handle is None and registry_handle is None:
+        raise ValueError("run has no persisted cluster or registry ownership record")
     return (
         store,
-        KindClusterHandle.from_dict(cluster_value),
-        RegistryHandle.from_dict(registry_value),
+        cluster_handle,
+        registry_handle,
     )
 
 
@@ -771,45 +788,68 @@ def _run_cluster_kind_status(args: argparse.Namespace) -> int:
         args.run,
         args.output,
     )
-    cluster = KindCluster.reopen(cluster_handle)
+    cluster = KindCluster.reopen(cluster_handle) if cluster_handle is not None else None
     try:
-        cluster_status = cluster.status()
-        registry_status = EphemeralRegistry.reopen(registry_handle).status()
+        cluster_status = cluster.status() if cluster is not None else None
+        registry_status = (
+            EphemeralRegistry.reopen(registry_handle).status()
+            if registry_handle is not None
+            else None
+        )
     finally:
-        cluster.detach()
+        if cluster is not None:
+            cluster.detach()
     value = {
         "runId": args.run,
-        "cluster": {
-            "name": cluster_status.name,
-            "exists": cluster_status.exists,
-            "owned": cluster_status.owned,
-            "ready": cluster_status.ready,
-            "nodes": list(cluster_status.nodes),
-            "error": cluster_status.error,
-        },
-        "registry": {
-            "name": registry_status.name,
-            "exists": registry_status.exists,
-            "owned": registry_status.owned,
-            "running": registry_status.running,
-            "state": registry_status.state,
-            "hostPort": registry_status.host_port,
-        },
+        "cluster": (
+            {
+                "name": cluster_status.name,
+                "exists": cluster_status.exists,
+                "owned": cluster_status.owned,
+                "ready": cluster_status.ready,
+                "nodes": list(cluster_status.nodes),
+                "error": cluster_status.error,
+            }
+            if cluster_status is not None
+            else None
+        ),
+        "registry": (
+            {
+                "name": registry_status.name,
+                "exists": registry_status.exists,
+                "owned": registry_status.owned,
+                "running": registry_status.running,
+                "ready": registry_status.ready,
+                "state": registry_status.state,
+                "hostPort": registry_status.host_port,
+            }
+            if registry_status is not None
+            else None
+        ),
     }
     if args.json_output:
         print(_safe_json(value), end="")
     else:
-        print(
-            f"cluster: {cluster_status.name} "
-            f"owned={str(cluster_status.owned).lower()} "
-            f"ready={str(cluster_status.ready).lower()}"
-        )
-        print(
-            f"registry: {registry_status.name} "
-            f"owned={str(registry_status.owned).lower()} "
-            f"running={str(registry_status.running).lower()}"
-        )
-    return 0 if cluster_status.ready and registry_status.running else 1
+        if cluster_status is None:
+            print("cluster: not-created")
+        else:
+            print(
+                f"cluster: {cluster_status.name} "
+                f"owned={str(cluster_status.owned).lower()} "
+                f"ready={str(cluster_status.ready).lower()}"
+            )
+        if registry_status is None:
+            print("registry: not-created")
+        else:
+            print(
+                f"registry: {registry_status.name} "
+                f"owned={str(registry_status.owned).lower()} "
+                f"running={str(registry_status.running).lower()} "
+                f"ready={str(registry_status.ready).lower()}"
+            )
+    cluster_passed = cluster_status is None or cluster_status.ready
+    registry_passed = registry_status is None or registry_status.ready
+    return 0 if cluster_passed and registry_passed else 1
 
 
 def _run_cluster_kind_destroy(args: argparse.Namespace) -> int:
@@ -822,14 +862,16 @@ def _run_cluster_kind_destroy(args: argparse.Namespace) -> int:
     errors: list[str] = []
     cluster = None
     registry = None
-    try:
-        cluster = KindCluster.reopen(cluster_handle)
-    except DevOpsStackError as exc:
-        errors.append(str(exc))
-    try:
-        registry = EphemeralRegistry.reopen(registry_handle)
-    except DevOpsStackError as exc:
-        errors.append(str(exc))
+    if cluster_handle is not None:
+        try:
+            cluster = KindCluster.reopen(cluster_handle)
+        except DevOpsStackError as exc:
+            errors.append(str(exc))
+    if registry_handle is not None:
+        try:
+            registry = EphemeralRegistry.reopen(registry_handle)
+        except DevOpsStackError as exc:
+            errors.append(str(exc))
     cluster_removed = False
     registry_removed = False
     if cluster is not None:

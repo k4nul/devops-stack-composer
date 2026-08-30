@@ -152,6 +152,7 @@ class RegistryStatus:
     exists: bool
     owned: bool
     running: bool = False
+    ready: bool = False
     state: str = ""
     exit_code: int | None = None
     error: str = ""
@@ -375,11 +376,14 @@ class EphemeralRegistry:
         except RegistryError:
             host_port = None
         logs = self._read_logs(container_id) if include_logs else ""
+        running = bool(state.get("Running"))
+        handle = self._handle
         return RegistryStatus(
             name=self.name,
             exists=True,
             owned=True,
-            running=bool(state.get("Running")),
+            running=running,
+            ready=running and handle is not None and self._probe_ready(handle),
             state=state_name,
             exit_code=exit_code,
             error=error,
@@ -412,8 +416,31 @@ class EphemeralRegistry:
             timeout=self._command_timeout,
         )
         self._require_success(result, "remove owned local registry")
+        remaining = self._inspect(allow_missing=True)
+        if remaining is not None:
+            try:
+                self._assert_owned(remaining)
+            except RegistryOwnershipError as exc:
+                raise RegistryOwnershipError(
+                    "registry identity changed while confirming removal"
+                ) from exc
+            raise RegistryError(
+                "Docker reported removal but the owned registry still exists"
+            )
         self._handle = None
         return True
+
+    def _probe_ready(self, handle: RegistryHandle) -> bool:
+        request = Request(handle.v2_url, headers={"Accept": "application/json"}, method="GET")
+        try:
+            with self._http_opener(request, timeout=1.0) as response:
+                status = getattr(response, "status", None)
+                if status is None:
+                    status = response.getcode()
+                response.read(4096)
+            return status == 200
+        except (OSError, URLError, TimeoutError, ValueError):
+            return False
 
     def _wait_until_ready(self, handle: RegistryHandle) -> None:
         deadline = time.monotonic() + self._readiness_timeout

@@ -8,12 +8,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from devops_stack_composer.adapters.base import AdapterResult, GeneratedArtifact
-from devops_stack_composer.cli import build_parser, main
+from devops_stack_composer.cli import _lifecycle_values, build_parser, main
 from devops_stack_composer.composition import Composition
 from devops_stack_composer.composition import _preflight_local_build_output
 from devops_stack_composer.config import load_config
 from devops_stack_composer.errors import GeneratedFileConflictError
+from devops_stack_composer.evidence_store import EvidenceStore, EvidenceStoreError
 from devops_stack_composer.locks import TemplateLock
+from devops_stack_composer.registry import EphemeralRegistry, RegistryHandle
 from devops_stack_composer.sources import SourceResolution
 from devops_stack_composer.validation import CheckResult, ValidationReport, ValidationStatus
 
@@ -359,6 +361,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(verify.artifact, "out/execution/artifact.json")
         self.assertEqual(cluster.kind_command, "destroy")
         self.assertEqual(report.run, "20260830T120000Z-abcdef012345")
+
+    def test_lifecycle_state_accepts_registry_only_after_checksum_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_id = "20260831T012345Z-0123456789ab"
+            store = EvidenceStore.create(root, run_id=run_id)
+            registry = EphemeralRegistry(run_id)
+            handle = RegistryHandle(run_id, registry.name, "a" * 64, 49153)
+            store.write_json("registry-ownership.json", handle.to_dict())
+            store.write_checksums()
+
+            reopened, cluster_handle, registry_handle = _lifecycle_values(
+                root,
+                run_id,
+                ".devops-stack/runs",
+            )
+
+            self.assertEqual(reopened.run_id, run_id)
+            self.assertIsNone(cluster_handle)
+            self.assertEqual(registry_handle, handle)
+
+            store.path("registry-ownership.json").write_text("{}\n", encoding="utf-8")
+            with self.assertRaises(EvidenceStoreError):
+                _lifecycle_values(root, run_id, ".devops-stack/runs")
 
 
 if __name__ == "__main__":
