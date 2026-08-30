@@ -141,7 +141,13 @@ class EvidenceStore:
                 raise EvidenceStoreError(
                     f"evidence bundle contains a symbolic link: {path.relative_to(root)}"
                 )
-            if path.is_file() and path.name != "SHA256SUMS":
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                raise EvidenceStoreError(
+                    f"evidence bundle contains a non-regular file: {path.relative_to(root)}"
+                )
+            if path != root / "SHA256SUMS":
                 values.append(path)
         return tuple(values)
 
@@ -195,4 +201,3 @@ class EvidenceStore:
                 "evidence checksum mismatch: " + ", ".join(sorted(mismatched))
             )
         return expected
-
