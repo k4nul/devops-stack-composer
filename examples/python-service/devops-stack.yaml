@@ -1,0 +1,133 @@
+apiVersion: devops-stack.io/v1alpha1
+kind: DevOpsStack
+metadata:
+  name: python-service
+  annotations:
+    devops-stack.io/example: standard-library-zipapp
+application:
+  name: python-service
+  serviceName: python-service
+  type: python
+  root: .
+  buildCommand: mkdir -p build && python -m zipapp app -o build/service.pyz
+  testCommand: python -m unittest discover -s tests -v
+  runCommand: python build/service.pyz
+  buildArtifact: build/service.pyz
+image:
+  registry: ghcr.io
+  repository: k4nul/devops-stack-composer-example
+  tag:
+    strategy: branch-sha
+  architectures:
+    - linux/amd64
+build:
+  context: .
+  dockerfile:
+    strategy: generated
+  multiStage: true
+  reproducible: true
+  cache:
+    enabled: false
+    from: []
+    to: []
+ci:
+  jenkins:
+    credentialId: ghcr-registry
+  branches:
+    dev:
+      - develop
+      - feature/*
+    staging:
+      - staging
+      - release/*
+    production:
+      - main
+  approval:
+    production: true
+environments:
+  dev:
+    namespace: python-service-dev
+    environment:
+      APP_ENV: dev
+      LOG_LEVEL: debug
+  staging:
+    namespace: python-service-staging
+    replicas: 2
+    environment:
+      APP_ENV: staging
+    secretRefs:
+      - name: python-service-secrets
+        keys:
+          - API_TOKEN
+  production:
+    namespace: python-service-production
+    replicas: 3
+    environment:
+      APP_ENV: production
+    secretRefs:
+      - name: python-service-secrets
+        keys:
+          - API_TOKEN
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: '1'
+        memory: 512Mi
+deployment:
+  namespace: python-service
+  replicas: 1
+  containerPort: 8000
+  service:
+    type: ClusterIP
+    port: 80
+  health:
+    path: /health
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  readiness:
+    path: /ready
+    initialDelaySeconds: 2
+    periodSeconds: 5
+  environment:
+    PORT: 8000
+    LOG_LEVEL: info
+  secretRefs: []
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  rollout:
+    strategy: RollingUpdate
+    maxUnavailable: 0
+    maxSurge: 1
+  rollback:
+    enabled: true
+    revisionHistoryLimit: 10
+supplyChain:
+  sbom:
+    enabled: true
+    format: spdx-json
+  provenance:
+    enabled: true
+    mode: max
+  scan:
+    enabled: true
+    failOn: high
+security:
+  runAsNonRoot: true
+  runAsUser: 10001
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  seccompProfile: RuntimeDefault
+  serviceAccount: python-service
+policies:
+  production:
+    minimumReplicas: 2
+    requireApproval: true
+    requireResourceLimits: true
+    requireReadOnlyRootFilesystem: true
