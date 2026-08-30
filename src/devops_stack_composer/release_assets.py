@@ -80,7 +80,10 @@ _SENSITIVE_PATH_NAMES = frozenset(
 )
 _SENSITIVE_ASSIGNMENT = re.compile(
     r"(?im)(?:password|token|secret|authorization|api[_-]?key|private[_-]?key)"
-    r"\s*[:=]\s*(?!\"?(?:<redacted>|\[redacted\]|REDACTED)\"?)([^\s,}\]]+)"
+    r"\s*[:=]\s*"
+    r"(?![\"']?(?:<redacted>|\[redacted\]|REDACTED|true|false|null|none)[\"']?"
+    r"(?:\s*(?:[,}\]]|$)))"
+    r"([^\s,}\]]+)"
 )
 
 

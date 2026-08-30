@@ -61,7 +61,7 @@ class ReleaseAssetTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.project = Path(self.temporary.name)
-        BundleFixture(self.project)
+        self.bundle = BundleFixture(self.project)
         (self.project / "dist").mkdir()
         self.wheel = (
             self.project / "dist" / f"devops_stack_composer-{VERSION}-py3-none-any.whl"
@@ -204,6 +204,31 @@ class ReleaseAssetTests(unittest.TestCase):
             self.materials()
 
         self.assertFalse((self.project / "dist" / "materials").exists())
+
+    def test_boolean_security_setting_is_not_treated_as_secret_data(self) -> None:
+        self.bundle.store.write_text(
+            "kubernetes/security.yaml",
+            "automountServiceAccountToken: false\n",
+        )
+        self.bundle.reseal()
+        self.materials()
+
+        result = assemble_release_assets(self.request("release/safe-boolean"))
+
+        self.assertTrue(result.passed)
+
+    def test_plaintext_secret_assignment_is_rejected_from_evidence(self) -> None:
+        self.bundle.store.write_text(
+            "diagnostics/unsafe.txt",
+            "api_token: exposed-value\n",
+        )
+        self.bundle.reseal()
+        self.materials()
+
+        with self.assertRaisesRegex(ReleaseAssetError, "RELEASE_EVIDENCE_SENSITIVE"):
+            assemble_release_assets(self.request("release/unsafe-secret"))
+
+        self.assertFalse((self.project / "release" / "unsafe-secret").exists())
 
 
 if __name__ == "__main__":
