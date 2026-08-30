@@ -127,6 +127,10 @@ jobs:
               for name in names
           ), names
           assert not any("/docs/management/" in name for name in names), names
+          assert not any(
+              "/examples/python-service/build/" in name or name.endswith(".pyz")
+              for name in names
+          ), names
           sensitive_suffixes = (".pem", ".key", ".p12", ".log")
           assert not any(
               name.endswith(sensitive_suffixes)

@@ -147,6 +147,10 @@ jobs:
           with tarfile.open(sdist[0], "r:gz") as archive:
               names = archive.getnames()
           assert any(name.endswith("/PKG-INFO") for name in names), names
+          assert not any(
+              "/examples/python-service/build/" in name or name.endswith(".pyz")
+              for name in names
+          ), names
           PY
 
       - name: Assemble and offline-verify the release set

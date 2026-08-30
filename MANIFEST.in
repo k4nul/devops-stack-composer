@@ -10,7 +10,9 @@ include examples/python-service/devops-stack.yaml
 include examples/python-service/requirements.txt
 recursive-include examples/python-service/app *.py
 recursive-include examples/python-service/tests *.py
+prune examples/python-service/build
 prune tests
 prune .github
 global-exclude __pycache__
 global-exclude *.py[cod]
+global-exclude *.pyz
