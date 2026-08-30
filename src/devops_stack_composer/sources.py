@@ -25,18 +25,26 @@ REQUIRED_MARKERS = {
         "LICENSE",
         "scripts/validate-build-plan.sh",
         "scripts/build-image.sh",
+        "scripts/push-image.sh",
         "buildx/docker-bake.hcl",
     ),
     "jenkins": (
         "LICENSE",
         "scripts/show-jenkins-job-plan.ps1",
+        "scripts/show-service-pipeline-plan.ps1",
         "scripts/export-jenkins-job-dsl.ps1",
         "jenkins/job-seed.Jenkinsfile",
     ),
     "kubernetes": (
         "LICENSE",
+        "scripts/show-profile-catalog.ps1",
+        "scripts/show-environment-preset-plan.ps1",
+        "scripts/show-render-matrix.ps1",
         "scripts/show-platform-plan.ps1",
         "scripts/render-platform-assets.ps1",
+        "scripts/validate-rendered-bundle.ps1",
+        "scripts/validate-kubernetes-security-baseline.ps1",
+        "scripts/check-placeholders.ps1",
         "k8s/render-manifests.ps1",
     ),
 }
@@ -111,7 +119,15 @@ class SourceResolver:
         return self._inspect_candidate(key, cached, "lock-remote", pin)
 
     def _cache_path(self, pin: TemplatePin) -> Path:
-        return self.cache_root / pin.name / pin.commit
+        root = self.cache_root.expanduser().resolve(strict=False)
+        target = root / pin.name / pin.commit
+        try:
+            target.resolve(strict=False).relative_to(root)
+        except (OSError, ValueError) as exc:
+            raise SourceResolutionError(
+                f"unsafe cache path for {pin.key} template"
+            ) from exc
+        return target
 
     def _inspect_candidate(
         self,
@@ -142,6 +158,14 @@ class SourceResolver:
     def _fetch_locked(self, pin: TemplatePin) -> Path:
         target = self._cache_path(pin)
         target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.parent.resolve(strict=True).relative_to(
+                self.cache_root.expanduser().resolve(strict=False)
+            )
+        except (OSError, ValueError) as exc:
+            raise SourceResolutionError(
+                f"unsafe cache parent for {pin.key} template"
+            ) from exc
         temporary = Path(tempfile.mkdtemp(prefix=f".{pin.name}.", dir=target.parent))
         try:
             self._run(["git", "init", "--quiet", str(temporary)])

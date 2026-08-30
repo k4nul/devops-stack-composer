@@ -41,3 +41,15 @@ class LockValidationError(DevOpsStackError):
 
 class SourceResolutionError(DevOpsStackError):
     """Raised when a pinned template source cannot be resolved safely."""
+
+
+class UnsafePathError(DevOpsStackError):
+    """Raised when a path crosses the selected project boundary."""
+
+
+class GeneratedFileConflictError(DevOpsStackError):
+    """Raised before overwriting an untracked or user-modified generated file."""
+
+
+class ManifestValidationError(DevOpsStackError):
+    """Raised when generated-file tracking metadata is invalid."""

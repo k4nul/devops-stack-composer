@@ -20,6 +20,8 @@ from devops_stack_composer.adapters.base import (
     AdapterResult,
     GeneratedArtifact,
 )
+from devops_stack_composer.archives import extract_locked_source
+from devops_stack_composer.errors import SourceResolutionError
 from devops_stack_composer.model import EnvironmentModel, NormalizedDevOpsModel
 from devops_stack_composer.sources import SourceResolution
 from devops_stack_composer.validation import ValidationStatus
@@ -28,6 +30,7 @@ from devops_stack_composer.validation import ValidationStatus
 ADAPTER_VERSION = "1.0.0"
 UPSTREAM_PROFILE = "minimal-application"
 UPSTREAM_APPLICATION = "nginx-web"
+MAX_UPSTREAM_QUERY_BYTES = 256 * 1024
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -807,6 +810,23 @@ def validate_yaml_artifacts(
             continue
         if kind == "Secret":
             errors.append(f"{artifact.path}: generated Secret resources are forbidden")
+            continue
+        expected_api_versions = {
+            "ConfigMap": "v1",
+            "Deployment": "apps/v1",
+            "Kustomization": "kustomize.config.k8s.io/v1beta1",
+            "Namespace": "v1",
+            "Service": "v1",
+            "ServiceAccount": "v1",
+        }
+        if kind not in expected_api_versions:
+            errors.append(f"{artifact.path}: unsupported generated kind {kind!r}")
+            continue
+        if api_version != expected_api_versions[kind]:
+            errors.append(
+                f"{artifact.path}: {kind} requires apiVersion "
+                f"{expected_api_versions[kind]}"
+            )
         if kind == "Kustomization":
             resources = document.get("resources")
             if not isinstance(resources, list) or not resources:
@@ -947,7 +967,16 @@ class KubernetesAdapter:
             }
             upstream_diagnostics = []
         artifacts = self._render_artifacts(model, upstream)
-        diagnostics = [*upstream_diagnostics, validate_yaml_artifacts(artifacts)]
+        diagnostics = [
+            *upstream_diagnostics,
+            AdapterDiagnostic(
+                status=_validation_status(ValidationStatus.PASSED),
+                check="kubernetes.platform-context-contract",
+                message="Sanitized upstream evidence is bound to platform-context.json.",
+                details={"summary": upstream},
+            ),
+            validate_yaml_artifacts(artifacts),
+        ]
         diagnostics.extend(self._external_diagnostics(artifacts))
         return AdapterResult(
             adapter="kubernetes",
@@ -992,18 +1021,91 @@ class KubernetesAdapter:
         }
 
     @staticmethod
-    def _copy_template_source(source: Path, destination: Path) -> None:
-        if not source.is_dir() or source.is_symlink():
-            raise ValueError("template source must be a real directory")
-        shutil.copytree(
-            source,
-            destination,
-            symlinks=True,
-            ignore=shutil.ignore_patterns(".git", "out", "__pycache__", "*.pyc"),
-        )
-        _, symlinks = _tree_inventory(destination)
-        if symlinks:
-            raise ValueError("template source contains symbolic links")
+    def _query_payload_errors(key: str, payload: Any) -> tuple[str, ...]:
+        if not isinstance(payload, dict):
+            return ("top-level value must be an object",)
+        if key == "profileCatalog":
+            profiles = payload.get("Profiles")
+            if not isinstance(profiles, list) or not profiles:
+                return ("Profiles must be a non-empty array",)
+            if any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("Name"), str)
+                or not item["Name"]
+                for item in profiles
+            ):
+                return ("Profiles entries must be objects with non-empty Name values",)
+            selected = [
+                item
+                for item in profiles
+                if isinstance(item, dict) and item.get("Name") == UPSTREAM_PROFILE
+            ]
+            if not selected:
+                return (f"Profiles must include {UPSTREAM_PROFILE!r}",)
+            return ()
+        if key == "environmentPresetPlan":
+            presets = payload.get("Presets")
+            if not isinstance(presets, list) or not presets:
+                return ("Presets must be a non-empty array",)
+            if any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("Name"), str)
+                or not item["Name"]
+                for item in presets
+            ):
+                return ("Presets entries must be objects with non-empty Name values",)
+            return ()
+        if key == "renderMatrix":
+            entries = payload.get("Entries")
+            if not isinstance(entries, list) or not entries:
+                return ("Entries must be a non-empty array",)
+            if any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("Name"), str)
+                or not item["Name"]
+                or item.get("Scope") not in {"environment", "profile"}
+                for item in entries
+            ):
+                return (
+                    "Entries must contain objects with Name and environment/profile Scope",
+                )
+            entry_count = payload.get("EntryCount")
+            environment_count = payload.get("EnvironmentEntryCount")
+            profile_count = payload.get("ProfileEntryCount")
+            expected_environment_count = sum(
+                item["Scope"] == "environment" for item in entries
+            )
+            expected_profile_count = sum(item["Scope"] == "profile" for item in entries)
+            if (
+                entry_count != len(entries)
+                or environment_count != expected_environment_count
+                or profile_count != expected_profile_count
+            ):
+                return ("render-matrix counts must match Entries",)
+            return ()
+        if key == "platformPlan":
+            errors: list[str] = []
+            if payload.get("Profile") != UPSTREAM_PROFILE:
+                errors.append(f"Profile must equal {UPSTREAM_PROFILE!r}")
+            applications = payload.get("Applications")
+            if not isinstance(applications, list) or UPSTREAM_APPLICATION not in applications:
+                errors.append(
+                    f"Applications must be an array containing {UPSTREAM_APPLICATION!r}"
+                )
+            components = payload.get("Components")
+            if not isinstance(components, list) or not components:
+                errors.append("Components must be a non-empty array")
+            elif any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("Directory"), str)
+                or not item["Directory"]
+                for item in components
+            ):
+                errors.append(
+                    "Components entries must be objects with non-empty Directory values"
+                )
+            return tuple(errors)
+        return (f"unsupported upstream query key {key!r}",)
 
     @staticmethod
     def _pwsh_command(script: str, *arguments: str) -> tuple[str, ...]:
@@ -1016,6 +1118,40 @@ class KubernetesAdapter:
             f"scripts/{script}",
             *arguments,
         )
+
+    @staticmethod
+    def _minimal_environment(stage: Path) -> dict[str, str]:
+        home = stage / ".home"
+        temporary = stage / ".tmp"
+        home.mkdir(exist_ok=True)
+        temporary.mkdir(exist_ok=True)
+        environment = {
+            key: os.environ[key]
+            for key in (
+                "DOTNET_ROOT",
+                "JAVA_HOME",
+                "PATH",
+                "PATHEXT",
+                "SSL_CERT_DIR",
+                "SSL_CERT_FILE",
+                "SYSTEMROOT",
+                "WINDIR",
+            )
+            if key in os.environ and os.environ[key]
+        }
+        environment.setdefault("PATH", "/usr/bin:/bin")
+        environment.update(
+            {
+                "DOTNET_CLI_HOME": str(home),
+                "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+                "HOME": str(home),
+                "LANG": "C",
+                "LC_ALL": "C",
+                "POWERSHELL_TELEMETRY_OPTOUT": "1",
+                "TMPDIR": str(temporary),
+            }
+        )
+        return environment
 
     def _read_upstream(
         self,
@@ -1063,15 +1199,15 @@ class KubernetesAdapter:
             template_root = temporary_root / "template"
             rendered_root = temporary_root / "rendered"
             try:
-                self._copy_template_source(self.source.path, template_root)
-            except (OSError, ValueError) as exc:
+                extract_locked_source(self.source, template_root)
+            except (OSError, SourceResolutionError, ValueError) as exc:
                 diagnostics.append(
                     AdapterDiagnostic(
                         status=_validation_status(ValidationStatus.FAILED),
-                        check="kubernetes.upstream.isolated-copy",
+                        check="kubernetes.upstream.locked-archive",
                         message=(
-                            "Kubernetes template could not be copied into a symlink-safe "
-                            f"ephemeral directory: {type(exc).__name__}"
+                            "Kubernetes template could not be archived from its locked "
+                            f"Git commit: {type(exc).__name__}"
                         ),
                     )
                 )
@@ -1080,10 +1216,14 @@ class KubernetesAdapter:
             diagnostics.append(
                 AdapterDiagnostic(
                     status=_validation_status(ValidationStatus.PASSED),
-                    check="kubernetes.upstream.isolated-copy",
-                    message="Kubernetes template was copied without source out/ or symlinks",
+                    check="kubernetes.upstream.locked-archive",
+                    message=(
+                        "Upstream validation uses archived bytes from the locked Git commit"
+                    ),
+                    details={"commit": self.source.commit or "unknown"},
                 )
             )
+            environment = self._minimal_environment(template_root)
 
             for key, script_name, arguments in _UPSTREAM_QUERIES:
                 command = self._pwsh_command(
@@ -1101,6 +1241,7 @@ class KubernetesAdapter:
                         capture_output=True,
                         text=True,
                         timeout=60,
+                        env=environment,
                     )
                 except FileNotFoundError:
                     diagnostics.append(
@@ -1148,8 +1289,40 @@ class KubernetesAdapter:
                         "status": ValidationStatus.FAILED.value
                     }
                     continue
+                stdout = completed.stdout
+                if not isinstance(stdout, str):
+                    diagnostics.append(
+                        AdapterDiagnostic(
+                            status=_validation_status(ValidationStatus.FAILED),
+                            check=check_name,
+                            message="read-only upstream query did not return text output",
+                            command=command,
+                        )
+                    )
+                    summary["queries"][key] = {
+                        "status": ValidationStatus.FAILED.value
+                    }
+                    continue
+                output_size = len(stdout.encode("utf-8"))
+                if output_size > MAX_UPSTREAM_QUERY_BYTES:
+                    diagnostics.append(
+                        AdapterDiagnostic(
+                            status=_validation_status(ValidationStatus.FAILED),
+                            check=check_name,
+                            message=(
+                                "read-only upstream query exceeded the "
+                                f"{MAX_UPSTREAM_QUERY_BYTES}-byte output limit"
+                            ),
+                            command=command,
+                            details={"outputBytes": output_size},
+                        )
+                    )
+                    summary["queries"][key] = {
+                        "status": ValidationStatus.FAILED.value
+                    }
+                    continue
                 try:
-                    parsed = json.loads(completed.stdout)
+                    parsed = json.loads(stdout)
                 except (TypeError, json.JSONDecodeError):
                     diagnostics.append(
                         AdapterDiagnostic(
@@ -1157,6 +1330,22 @@ class KubernetesAdapter:
                             check=check_name,
                             message="read-only upstream query did not return valid JSON",
                             command=command,
+                        )
+                    )
+                    summary["queries"][key] = {
+                        "status": ValidationStatus.FAILED.value
+                    }
+                    continue
+
+                payload_errors = self._query_payload_errors(key, parsed)
+                if payload_errors:
+                    diagnostics.append(
+                        AdapterDiagnostic(
+                            status=_validation_status(ValidationStatus.FAILED),
+                            check=check_name,
+                            message="read-only upstream query returned an unexpected JSON shape",
+                            command=command,
+                            details={"errors": list(payload_errors)},
                         )
                     )
                     summary["queries"][key] = {
@@ -1172,7 +1361,10 @@ class KubernetesAdapter:
                     AdapterDiagnostic(
                         status=_validation_status(ValidationStatus.PASSED),
                         check=check_name,
-                        message=f"read-only upstream query {script_name} returned JSON",
+                        message=(
+                            f"read-only upstream query {script_name} returned JSON "
+                            "matching the expected interface"
+                        ),
                         command=command,
                     )
                 )
@@ -1183,6 +1375,7 @@ class KubernetesAdapter:
                 rendered_root,
                 summary,
                 diagnostics,
+                environment,
             )
             self._validate_upstream_render(
                 template_root,
@@ -1190,6 +1383,7 @@ class KubernetesAdapter:
                 render_succeeded,
                 summary,
                 diagnostics,
+                environment,
             )
 
         return summary, diagnostics
@@ -1201,8 +1395,10 @@ class KubernetesAdapter:
         rendered_root: Path,
         summary: dict[str, Any],
         diagnostics: list[AdapterDiagnostic],
+        environment: Mapping[str, str],
     ) -> bool:
-        values_file = template_root / "config" / "platform-values.env.example"
+        example_values_file = template_root / "config" / "platform-values.env.example"
+        values_file = template_root / ".devops-stack-validation-values.env"
         script = template_root / "scripts" / "render-platform-assets.ps1"
         display_command = self._pwsh_command(
             "render-platform-assets.ps1",
@@ -1215,19 +1411,49 @@ class KubernetesAdapter:
             "-Version",
             "0.0.0-composer-validation",
             "-ValuesFile",
-            "<isolated-template>/config/platform-values.env.example",
+            "<isolated-template>/.devops-stack-validation-values.env",
             "-Profile",
             UPSTREAM_PROFILE,
             "-Applications",
             UPSTREAM_APPLICATION,
             "-FailOnUnresolvedToken",
         )
-        if not script.is_file() or not values_file.is_file():
+        if not script.is_file() or not example_values_file.is_file():
             diagnostics.append(
                 AdapterDiagnostic(
                     status=_validation_status(ValidationStatus.FAILED),
                     check="kubernetes.upstream.renderPlatformAssets",
                     message="official renderer or checked-in example values are missing",
+                    command=display_command,
+                )
+            )
+            summary["render"] = {"status": ValidationStatus.FAILED.value}
+            return False
+        try:
+            validation_values = example_values_file.read_text(encoding="utf-8")
+            validation_values = validation_values.replace(
+                "nfs.example.internal",
+                "nfs.validation.invalid",
+            )
+            validation_values = validation_values.replace(
+                "example.com",
+                "validation.invalid",
+            )
+            validation_values = validation_values.replace(
+                "change-me-",
+                "validation-only-",
+            )
+            values_file.write_text(validation_values, encoding="utf-8")
+            values_file.chmod(0o600)
+        except OSError as exc:
+            diagnostics.append(
+                AdapterDiagnostic(
+                    status=_validation_status(ValidationStatus.FAILED),
+                    check="kubernetes.upstream.renderPlatformAssets",
+                    message=(
+                        "could not prepare public, validation-only platform values: "
+                        f"{type(exc).__name__}"
+                    ),
                     command=display_command,
                 )
             )
@@ -1259,6 +1485,7 @@ class KubernetesAdapter:
                 capture_output=True,
                 text=True,
                 timeout=120,
+                env=environment,
             )
         except FileNotFoundError:
             diagnostics.append(
@@ -1347,6 +1574,7 @@ class KubernetesAdapter:
         render_succeeded: bool,
         summary: dict[str, Any],
         diagnostics: list[AdapterDiagnostic],
+        environment: Mapping[str, str],
     ) -> None:
         validators = (
             (
@@ -1364,8 +1592,8 @@ class KubernetesAdapter:
             (
                 "placeholders",
                 "check-placeholders.ps1",
-                ("-Path", str(rendered_root)),
-                ("-Path", "<ephemeral-render>"),
+                ("-Path", str(rendered_root / "k8s"), "-FailOnMatch"),
+                ("-Path", "<ephemeral-render>/k8s", "-FailOnMatch"),
             ),
         )
         for key, script_name, arguments, display_arguments in validators:
@@ -1404,6 +1632,7 @@ class KubernetesAdapter:
                     capture_output=True,
                     text=True,
                     timeout=120,
+                    env=environment,
                 )
             except FileNotFoundError:
                 status = ValidationStatus.BLOCKED_MISSING_REQUIRED_TOOL.value
@@ -1464,9 +1693,14 @@ class KubernetesAdapter:
                     output,
                     re.IGNORECASE,
                 )
-                validator_summary["matchCount"] = (
+                match_count = (
                     int(placeholder_match.group(1)) if placeholder_match else 0
                 )
+                validator_summary["matchCount"] = match_count
+                if match_count:
+                    status = ValidationStatus.FAILED.value
+                    message = "upstream placeholder validator found unresolved placeholders"
+                    validator_summary["status"] = status
             summary["validators"][key] = validator_summary
             diagnostics.append(
                 AdapterDiagnostic(

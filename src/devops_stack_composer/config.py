@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,8 @@ from typing import Any
 import yaml
 from jsonschema import Draft7Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
 
 from devops_stack_composer.errors import (
     ConfigParseError,
@@ -19,10 +22,50 @@ from devops_stack_composer.errors import (
     ValidationIssue,
 )
 from devops_stack_composer.model import NormalizedDevOpsModel, normalize_config
+from devops_stack_composer.resources import schema_path
 
 
-SCHEMA_PATH = Path(__file__).resolve().parents[2] / "schemas" / "devops-stack.schema.json"
+SCHEMA_PATH = schema_path("devops-stack.schema.json")
 SENSITIVE_NAME = re.compile(r"(?:secret|token|password|credential|private.?key)", re.IGNORECASE)
+
+
+class StrictSafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: StrictSafeLoader,
+    node: MappingNode,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    loader.flatten_mapping(node)
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable mapping key",
+                key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found a duplicate mapping key",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+StrictSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
 
 
 @dataclass(frozen=True)
@@ -38,8 +81,35 @@ def load_schema(path: Path = SCHEMA_PATH) -> dict[str, Any]:
 
 
 def canonical_hash(value: dict[str, Any]) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _non_finite_issues(value: Any, path: str = "$") -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    if isinstance(value, float) and not math.isfinite(value):
+        issues.append(
+            ValidationIssue(
+                path=path,
+                expected="a finite number",
+                received="non-finite number",
+                example="0",
+                message="NaN and infinity are not supported",
+            )
+        )
+        return issues
+    if isinstance(value, dict):
+        for key, child in value.items():
+            issues.extend(_non_finite_issues(child, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            issues.extend(_non_finite_issues(child, f"{path}[{index}]"))
+    return issues
 
 
 def _json_path(error: ValidationError) -> str:
@@ -116,11 +186,19 @@ def _issue(error: ValidationError) -> ValidationIssue:
 
 def parse_config(text: str, *, source: str = "<memory>") -> dict[str, Any]:
     try:
-        value = yaml.safe_load(text)
+        value = yaml.load(text, Loader=StrictSafeLoader)
     except yaml.YAMLError as exc:
         mark = getattr(exc, "problem_mark", None)
         location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
-        raise ConfigParseError(f"cannot parse YAML from {source}{location}: {exc}") from exc
+        problem = getattr(exc, "problem", "")
+        reason = (
+            "duplicate mapping key"
+            if isinstance(problem, str) and "duplicate mapping key" in problem
+            else "invalid YAML syntax"
+        )
+        raise ConfigParseError(
+            f"cannot parse YAML from {source}{location}: {reason}"
+        ) from exc
     if not isinstance(value, dict):
         received = type(value).__name__
         raise ConfigParseError(
@@ -132,8 +210,25 @@ def parse_config(text: str, *, source: str = "<memory>") -> dict[str, Any]:
 def validate_config(config: dict[str, Any], *, schema: dict[str, Any] | None = None) -> None:
     validator = Draft7Validator(schema or load_schema(), format_checker=FormatChecker())
     errors = sorted(validator.iter_errors(config), key=lambda error: list(error.absolute_path))
-    if errors:
-        raise ConfigValidationError([_issue(error) for error in errors])
+    issues = [_issue(error) for error in errors]
+    issues.extend(_non_finite_issues(config))
+    if issues:
+        raise ConfigValidationError(issues)
+    registry = config.get("image", {}).get("registry")
+    if isinstance(registry, str) and ":" in registry:
+        port_text = registry.rsplit(":", 1)[1]
+        if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+            raise ConfigValidationError(
+                [
+                    ValidationIssue(
+                        path="$.image.registry",
+                        expected="registry port from 1 through 65535",
+                        received=json.dumps(registry),
+                        example='"registry.example:5000"',
+                        message="registry port is outside the valid TCP range",
+                    )
+                ]
+            )
 
 
 def load_config(path: Path) -> LoadedConfig:

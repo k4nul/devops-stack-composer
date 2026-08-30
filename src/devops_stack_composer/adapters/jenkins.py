@@ -27,19 +27,14 @@ from devops_stack_composer.validation import ValidationStatus
 
 ADAPTER_VERSION = "1.0.0"
 GENERATED_ROOT = "generated"
+MAX_UPSTREAM_JSON_BYTES = 256 * 1024
+MAX_UPSTREAM_ENTRIES = 1000
+MAX_UPSTREAM_EXPORT_BYTES = 1024 * 1024
 PASSED = ValidationStatus.PASSED.value
 FAILED = ValidationStatus.FAILED.value
 SKIPPED_MISSING_OPTIONAL_TOOL = ValidationStatus.SKIPPED_MISSING_OPTIONAL_TOOL.value
 BLOCKED_MISSING_REQUIRED_TOOL = ValidationStatus.BLOCKED_MISSING_REQUIRED_TOOL.value
 
-_VOLATILE_UPSTREAM_KEYS = {"generatedat", "reporoot"}
-_SENSITIVE_UPSTREAM_KEY_PARTS = (
-    "credential",
-    "password",
-    "privatekey",
-    "secret",
-    "token",
-)
 _TOKEN_LIKE_VALUE = re.compile(
     r"(?:ghp_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})"
 )
@@ -593,29 +588,124 @@ def _sanitize_upstream_string(value: str, source_roots: tuple[Path, ...]) -> str
     return sanitized.replace("__TEMPLATE_SOURCE__", "<template-source>")
 
 
-def _sanitize_upstream_value(
-    value: Any,
-    *source_roots: Path,
-) -> Any:
-    if isinstance(value, dict):
-        sanitized: dict[str, Any] = {}
-        for key in sorted(value, key=str):
-            normalized_key = re.sub(r"[_-]", "", str(key)).lower()
-            if normalized_key in _VOLATILE_UPSTREAM_KEYS:
+def _bounded_names(values: list[dict[str, Any]]) -> list[str]:
+    return sorted(
+        str(value.get("Name", ""))[:128]
+        for value in values[:50]
+        if isinstance(value.get("Name"), str) and value.get("Name")
+    )
+
+
+def _summarize_upstream_plan(
+    check: str,
+    payload: Any,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if not isinstance(payload, dict):
+        return None, ["plan root must be a JSON object"]
+    issues: list[str] = []
+    if check == "jenkins_upstream_job_plan":
+        selections = payload.get("Selections")
+        service_jobs = payload.get("ServiceJobs")
+        for key in ("JobRoot", "ServiceJobRoot"):
+            if not isinstance(payload.get(key), str) or not payload[key]:
+                issues.append(f"{key} must be a non-empty string")
+        if not isinstance(selections, list):
+            issues.append("Selections must be an array")
+            selections = []
+        elif len(selections) > MAX_UPSTREAM_ENTRIES:
+            issues.append(
+                f"Selections must contain at most {MAX_UPSTREAM_ENTRIES} entries"
+            )
+            selections = selections[:MAX_UPSTREAM_ENTRIES]
+        if not isinstance(service_jobs, list):
+            issues.append("ServiceJobs must be an array")
+            service_jobs = []
+        elif len(service_jobs) > MAX_UPSTREAM_ENTRIES:
+            issues.append(
+                f"ServiceJobs must contain at most {MAX_UPSTREAM_ENTRIES} entries"
+            )
+            service_jobs = service_jobs[:MAX_UPSTREAM_ENTRIES]
+        if payload.get("SelectionCount") != len(selections):
+            issues.append("SelectionCount must equal the Selections length")
+        if payload.get("ServiceJobCount") != len(service_jobs):
+            issues.append("ServiceJobCount must equal the ServiceJobs length")
+        for index, selection in enumerate(selections):
+            if not isinstance(selection, dict):
+                issues.append(f"Selections[{index}] must be an object")
                 continue
-            if any(part in normalized_key for part in _SENSITIVE_UPSTREAM_KEY_PARTS):
-                sanitized[str(key)] = "<redacted>"
-            else:
-                sanitized[str(key)] = _sanitize_upstream_value(
-                    value[key],
-                    *source_roots,
+            if not isinstance(selection.get("Name"), str) or not selection["Name"]:
+                issues.append(f"Selections[{index}].Name must be non-empty")
+            if not isinstance(selection.get("PipelineJobs"), list):
+                issues.append(f"Selections[{index}].PipelineJobs must be an array")
+            elif len(selection["PipelineJobs"]) > MAX_UPSTREAM_ENTRIES:
+                issues.append(
+                    f"Selections[{index}].PipelineJobs exceeds the entry limit"
                 )
-        return sanitized
-    if isinstance(value, (list, tuple)):
-        return [_sanitize_upstream_value(item, *source_roots) for item in value]
-    if isinstance(value, str):
-        return _sanitize_upstream_string(value, tuple(source_roots))
-    return value
+        for index, service_job in enumerate(service_jobs):
+            if not isinstance(service_job, dict):
+                issues.append(f"ServiceJobs[{index}] must be an object")
+            elif not isinstance(service_job.get("Name"), str) or not service_job["Name"]:
+                issues.append(f"ServiceJobs[{index}].Name must be non-empty")
+        if issues:
+            return None, issues[:20]
+        return (
+            {
+                "schemaVersion": "jenkins-job-plan-summary-v1",
+                "jobRoot": payload["JobRoot"][:128],
+                "serviceJobRoot": payload["ServiceJobRoot"][:128],
+                "selectionCount": len(selections),
+                "selectionNames": _bounded_names(selections),
+                "serviceJobCount": len(service_jobs),
+                "serviceJobNames": _bounded_names(
+                    [item for item in service_jobs if isinstance(item, dict)]
+                ),
+            },
+            [],
+        )
+
+    services = payload.get("Services")
+    common_environment = payload.get("CommonEnvironmentVariables")
+    if not isinstance(services, list) or not services:
+        issues.append("Services must be a non-empty array")
+        services = []
+    elif len(services) > MAX_UPSTREAM_ENTRIES:
+        issues.append(f"Services must contain at most {MAX_UPSTREAM_ENTRIES} entries")
+        services = services[:MAX_UPSTREAM_ENTRIES]
+    if not isinstance(common_environment, list):
+        issues.append("CommonEnvironmentVariables must be an array")
+        common_environment = []
+    elif len(common_environment) > MAX_UPSTREAM_ENTRIES:
+        issues.append(
+            "CommonEnvironmentVariables exceeds the upstream entry limit"
+        )
+        common_environment = common_environment[:MAX_UPSTREAM_ENTRIES]
+    categories: dict[str, int] = {}
+    for index, service in enumerate(services):
+        if not isinstance(service, dict):
+            issues.append(f"Services[{index}] must be an object")
+            continue
+        for key in ("Name", "ImageName", "Category"):
+            if not isinstance(service.get(key), str) or not service[key]:
+                issues.append(f"Services[{index}].{key} must be non-empty")
+        if not isinstance(service.get("RequiredFiles"), list):
+            issues.append(f"Services[{index}].RequiredFiles must be an array")
+        if not isinstance(service.get("HasJenkinsfile"), bool):
+            issues.append(f"Services[{index}].HasJenkinsfile must be boolean")
+        category = service.get("Category")
+        if isinstance(category, str) and category:
+            categories[category[:128]] = categories.get(category[:128], 0) + 1
+    if issues:
+        return None, issues[:20]
+    return (
+        {
+            "schemaVersion": "jenkins-service-plan-summary-v1",
+            "serviceCount": len(services),
+            "serviceNames": _bounded_names(services),
+            "categories": dict(sorted(categories.items())),
+            "commonEnvironmentVariableCount": len(common_environment),
+        },
+        [],
+    )
 
 
 def _local_supply_chain_capability(model: NormalizedDevOpsModel) -> AdapterDiagnostic:
@@ -1078,8 +1168,34 @@ class JenkinsPipelineAdapter:
                     )
                     continue
 
+                stdout = completed.stdout
+                if not isinstance(stdout, str):
+                    diagnostics.append(
+                        AdapterDiagnostic(
+                            status=FAILED,
+                            check=check,
+                            message="Jenkins upstream validation did not return text output.",
+                            command=display_command,
+                        )
+                    )
+                    continue
+                output_bytes = len(stdout.encode("utf-8"))
+                if output_bytes > MAX_UPSTREAM_JSON_BYTES:
+                    diagnostics.append(
+                        AdapterDiagnostic(
+                            status=FAILED,
+                            check=check,
+                            message=(
+                                "Jenkins upstream validation exceeded the "
+                                f"{MAX_UPSTREAM_JSON_BYTES}-byte JSON output limit."
+                            ),
+                            command=display_command,
+                            details={"outputBytes": output_bytes},
+                        )
+                    )
+                    continue
                 try:
-                    payload = json.loads(completed.stdout)
+                    payload = json.loads(stdout)
                 except json.JSONDecodeError as exc:
                     diagnostics.append(
                         AdapterDiagnostic(
@@ -1097,19 +1213,26 @@ class JenkinsPipelineAdapter:
                     )
                     continue
 
+                summary, issues = _summarize_upstream_plan(check, payload)
+                if issues:
+                    diagnostics.append(
+                        AdapterDiagnostic(
+                            status=FAILED,
+                            check=check,
+                            message="Jenkins upstream plan did not match its expected interface.",
+                            command=display_command,
+                            details={"issues": issues},
+                        )
+                    )
+                    continue
+
                 diagnostics.append(
                     AdapterDiagnostic(
                         status=PASSED,
                         check=check,
                         message="Jenkins upstream plan rendered successfully.",
                         command=display_command,
-                        details={
-                            "plan": _sanitize_upstream_value(
-                                payload,
-                                stage,
-                                self.source.path,
-                            ),
-                        },
+                        details={"summary": summary},
                     )
                 )
 
@@ -1182,18 +1305,52 @@ class JenkinsPipelineAdapter:
                     )
                 else:
                     payload = output_path.read_bytes()
-                    diagnostics.append(
-                        AdapterDiagnostic(
-                            status=PASSED,
-                            check="jenkins_upstream_job_dsl_export",
-                            message="Jenkins upstream Job DSL exporter passed in the isolated stage.",
-                            command=exporter_display,
-                            details={
-                                "bytes": len(payload),
-                                "sha256": hashlib.sha256(payload).hexdigest(),
-                            },
+                    export_issues: list[str] = []
+                    if not payload:
+                        export_issues.append("exported Job DSL must not be empty")
+                    if len(payload) > MAX_UPSTREAM_EXPORT_BYTES:
+                        export_issues.append(
+                            "exported Job DSL exceeds the bounded output limit"
                         )
-                    )
+                    try:
+                        job_dsl = payload.decode("utf-8-sig")
+                    except UnicodeDecodeError:
+                        job_dsl = ""
+                        export_issues.append("exported Job DSL must be UTF-8 text")
+                    for marker in (
+                        "// Generated by scripts/export-jenkins-job-dsl.ps1.",
+                        "pipelineJob('",
+                    ):
+                        if marker not in job_dsl:
+                            export_issues.append(
+                                f"exported Job DSL is missing marker {marker!r}"
+                            )
+                    if export_issues:
+                        diagnostics.append(
+                            AdapterDiagnostic(
+                                status=FAILED,
+                                check="jenkins_upstream_job_dsl_export",
+                                message=(
+                                    "Jenkins upstream Job DSL exporter output did not "
+                                    "match its expected interface."
+                                ),
+                                command=exporter_display,
+                                details={"issues": export_issues[:10]},
+                            )
+                        )
+                    else:
+                        diagnostics.append(
+                            AdapterDiagnostic(
+                                status=PASSED,
+                                check="jenkins_upstream_job_dsl_export",
+                                message="Jenkins upstream Job DSL exporter passed in the isolated stage.",
+                                command=exporter_display,
+                                details={
+                                    "bytes": len(payload),
+                                    "sha256": hashlib.sha256(payload).hexdigest(),
+                                },
+                            )
+                        )
         return tuple(diagnostics)
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from devops_stack_composer.errors import SourceResolutionError
@@ -116,6 +117,53 @@ class SourceResolverTests(unittest.TestCase):
             with self.assertRaisesRegex(SourceResolutionError, "missing required files"):
                 resolver.resolve("docker", fetch=False)
 
+    def test_docker_push_entrypoint_is_a_required_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "docker"
+            make_template(source, "docker")
+            (source / "scripts" / "push-image.sh").unlink()
+            resolver = SourceResolver(
+                self.lock,
+                explicit_paths={"docker": source},
+                environment={},
+                default_base=base / "defaults",
+                cache_root=base / "cache",
+            )
+
+            with self.assertRaisesRegex(
+                SourceResolutionError,
+                "scripts/push-image.sh",
+            ):
+                resolver.resolve("docker", fetch=False)
+
+    def test_all_directly_invoked_upstream_scripts_are_required_markers(self) -> None:
+        expected = {
+            "docker": {
+                "scripts/validate-build-plan.sh",
+                "scripts/build-image.sh",
+                "scripts/push-image.sh",
+            },
+            "jenkins": {
+                "scripts/show-jenkins-job-plan.ps1",
+                "scripts/show-service-pipeline-plan.ps1",
+                "scripts/export-jenkins-job-dsl.ps1",
+            },
+            "kubernetes": {
+                "scripts/show-profile-catalog.ps1",
+                "scripts/show-environment-preset-plan.ps1",
+                "scripts/show-render-matrix.ps1",
+                "scripts/show-platform-plan.ps1",
+                "scripts/render-platform-assets.ps1",
+                "scripts/validate-rendered-bundle.ps1",
+                "scripts/validate-kubernetes-security-baseline.ps1",
+                "scripts/check-placeholders.ps1",
+            },
+        }
+
+        for key, scripts in expected.items():
+            self.assertLessEqual(scripts, set(REQUIRED_MARKERS[key]))
+
     def test_fetch_disabled_reports_every_search_location(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -139,6 +187,19 @@ class SourceResolverTests(unittest.TestCase):
 
             self.assertEqual(resolver.cache_root, Path(directory))
             self.assertNotIn("UNRELATED_TOKEN", repr(resolver.cache_root))
+
+    def test_cache_path_defensively_rejects_traversal_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            resolver = SourceResolver(
+                self.lock,
+                environment={},
+                default_base=Path(directory) / "defaults",
+                cache_root=Path(directory) / "cache",
+            )
+            unsafe_pin = replace(self.lock.pin("docker"), name="../../escaped")
+
+            with self.assertRaisesRegex(SourceResolutionError, "unsafe cache path"):
+                resolver._cache_path(unsafe_pin)
 
 
 if __name__ == "__main__":

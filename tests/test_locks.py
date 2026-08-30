@@ -55,6 +55,29 @@ class TemplateLockTests(unittest.TestCase):
         with self.assertRaisesRegex(LockValidationError, "unknown template"):
             TemplateLock.load(LOCK_PATH).pin("terraform")
 
+    def test_repository_url_credentials_are_rejected(self) -> None:
+        data = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+        data["templates"]["docker"]["repository"] = (
+            "https://operator:secret@example.invalid/template.git"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "templates.lock.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+
+            with self.assertRaisesRegex(LockValidationError, "must not contain"):
+                TemplateLock.load(path)
+
+    def test_template_name_must_be_one_safe_path_component(self) -> None:
+        for name in ("../../escaped-cache", "/tmp/escaped-cache"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                data = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+                data["templates"]["docker"]["name"] = name
+                path = Path(directory) / "templates.lock.json"
+                path.write_text(json.dumps(data), encoding="utf-8")
+
+                with self.assertRaisesRegex(LockValidationError, "name"):
+                    TemplateLock.load(path)
+
 
 if __name__ == "__main__":
     unittest.main()

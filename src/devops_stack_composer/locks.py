@@ -11,13 +11,15 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from jsonschema import Draft7Validator, FormatChecker
 
 from devops_stack_composer.errors import LockValidationError
+from devops_stack_composer.resources import schema_path
 
 
-LOCK_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "schemas" / "templates-lock.schema.json"
+LOCK_SCHEMA_PATH = schema_path("templates-lock.schema.json")
 TEMPLATE_KEYS = ("docker", "jenkins", "kubernetes")
 
 
@@ -67,6 +69,19 @@ class TemplateLock:
                 path_text = "$" + "".join(f".{part}" for part in error.absolute_path)
                 rendered.append(f"{path_text}: {error.message}")
             raise LockValidationError("template lock validation failed:\n  - " + "\n  - ".join(rendered))
+        for key in TEMPLATE_KEYS:
+            repository = data["templates"][key]["repository"]
+            parsed = urlsplit(repository)
+            if parsed.password is not None:
+                raise LockValidationError(
+                    f"template lock repository for {key} must not contain credentials"
+                )
+            if parsed.username is not None and not (
+                parsed.scheme == "ssh" and parsed.username == "git"
+            ):
+                raise LockValidationError(
+                    f"template lock repository for {key} must not contain user information"
+                )
         return cls(path.resolve(), data)
 
     def pin(self, key: str) -> TemplatePin:

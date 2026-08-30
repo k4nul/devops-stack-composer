@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -34,15 +35,41 @@ def source_resolution(
     *,
     matches_lock: bool = True,
     path: Path = SOURCE_FIXTURE,
+    commit: str = "bbd6c4ba184c0e68dcaf65d4eb26ea622847c8c3",
 ) -> SourceResolution:
     return SourceResolution(
         key="docker",
         path=path.resolve(),
         origin="fixture",
-        commit="bbd6c4ba184c0e68dcaf65d4eb26ea622847c8c3",
+        commit=commit,
         remote="https://example.invalid/docker-build-template.git",
         matches_lock=matches_lock,
     )
+
+
+def make_git_source(path: Path) -> SourceResolution:
+    shutil.copytree(SOURCE_FIXTURE, path)
+    subprocess.run(["git", "init", "--quiet", str(path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.email", "fixture@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.name", "Fixture"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "--quiet", "-m", "fixture"],
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return source_resolution(path=path, commit=commit)
 
 
 def raw_config() -> dict[str, object]:
@@ -53,7 +80,7 @@ def source_snapshot(path: Path) -> dict[str, tuple[bytes, int]]:
     return {
         item.relative_to(path).as_posix(): (item.read_bytes(), item.stat().st_mode & 0o777)
         for item in sorted(path.rglob("*"))
-        if item.is_file()
+        if item.is_file() and ".git" not in item.relative_to(path).parts
     }
 
 
@@ -82,8 +109,11 @@ def materialize_artifacts(result: AdapterResult, output_root: Path) -> None:
 
 class DockerBuildAdapterTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.source_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.source_directory.cleanup)
+        self.source = make_git_source(Path(self.source_directory.name) / "source")
         self.model = normalize_config(raw_config())
-        self.adapter = DockerBuildAdapter(source_resolution())
+        self.adapter = DockerBuildAdapter(self.source)
 
     def test_render_is_deterministic_and_uses_only_official_image_env_keys(self) -> None:
         first = self.adapter.render(self.model)
@@ -249,7 +279,7 @@ class DockerBuildAdapterTests(unittest.TestCase):
         self.assertFalse(metadata["build"]["multiStage"])
 
     def test_generate_invokes_self_contained_source_without_touching_it(self) -> None:
-        before = source_snapshot(SOURCE_FIXTURE)
+        before = source_snapshot(self.source.path)
         with tempfile.TemporaryDirectory() as directory:
             project_root = Path(directory)
             write_python_application(project_root)
@@ -259,7 +289,7 @@ class DockerBuildAdapterTests(unittest.TestCase):
             ):
                 result = self.adapter.generate(self.model, project_root=project_root)
 
-        after = source_snapshot(SOURCE_FIXTURE)
+        after = source_snapshot(self.source.path)
         validation = next(
             diagnostic
             for diagnostic in result.diagnostics
@@ -269,6 +299,86 @@ class DockerBuildAdapterTests(unittest.TestCase):
         self.assertEqual(validation.command, ("sh", "scripts/validate-build-plan.sh"))
         self.assertIn("fixture docker template validation passed", validation.details["stdout"])
         self.assertEqual(before, after)
+
+    def test_upstream_diagnostics_redact_captured_credentials(self) -> None:
+        secret_output = """Authorization: Bearer TOP-SECRET
+Proxy-Authorization: Basic PROXY-SECRET
+https://alice:swordfish@example.invalid/private
+TOKEN=INLINE-SECRET
+curl --user bob:hunter2 https://example.invalid
+curl -ucompact:password https://example.invalid
+"""
+
+        def runner(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 0, secret_output, secret_output)
+
+        adapter = DockerBuildAdapter(self.source, command_runner=runner)
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            write_python_application(project_root)
+            result = adapter.generate(self.model, project_root=project_root)
+
+        diagnostic = next(
+            item
+            for item in result.diagnostics
+            if item.check == "docker-template-validation"
+        )
+        serialized = json.dumps(diagnostic.details, sort_keys=True)
+        for secret in (
+            "TOP-SECRET",
+            "PROXY-SECRET",
+            "alice:swordfish",
+            "INLINE-SECRET",
+            "bob:hunter2",
+            "compact:password",
+        ):
+            self.assertNotIn(secret, serialized)
+        self.assertIn("<redacted>", serialized)
+
+    def test_application_staging_excludes_generated_and_local_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            write_python_application(project_root)
+            for relative in (
+                "generated/unowned-secrets.txt",
+                "generated-preview/preview.txt",
+                ".devops-stack/reports/private.txt",
+            ):
+                target = project_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("must not enter build context\n", encoding="utf-8")
+
+            result = self.adapter.generate(self.model, project_root=project_root)
+
+        validation = next(
+            diagnostic
+            for diagnostic in result.diagnostics
+            if diagnostic.check == "docker-template-validation"
+        )
+        self.assertEqual(validation.status, PASSED)
+
+    def test_dirty_template_worktree_bytes_are_not_executed(self) -> None:
+        dirty_script = self.source.path / "scripts" / "validate-build-plan.sh"
+        dirty_script.write_text("#!/usr/bin/env sh\nexit 99\n", encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            write_python_application(project_root)
+
+            result = self.adapter.generate(self.model, project_root=project_root)
+
+        validation = next(
+            diagnostic
+            for diagnostic in result.diagnostics
+            if diagnostic.check == "docker-template-validation"
+        )
+        archive = next(
+            diagnostic
+            for diagnostic in result.diagnostics
+            if diagnostic.check == "docker-template-archive"
+        )
+        self.assertEqual(validation.status, PASSED)
+        self.assertIn("fixture docker template validation passed", validation.details["stdout"])
+        self.assertEqual(archive.status, PASSED)
 
     def test_optional_local_build_runs_only_for_an_explicit_single_platform_request(self) -> None:
         raw = raw_config()
@@ -341,7 +451,7 @@ class DockerBuildAdapterTests(unittest.TestCase):
         raw = raw_config()
         raw["image"]["architectures"] = ["linux/amd64"]
         disable_cache(raw)
-        adapter = DockerBuildAdapter(source_resolution(), command_runner=runner)
+        adapter = DockerBuildAdapter(self.source, command_runner=runner)
         with tempfile.TemporaryDirectory() as directory:
             project_root = Path(directory)
             write_python_application(project_root)
@@ -362,7 +472,7 @@ class DockerBuildAdapterTests(unittest.TestCase):
         def missing_shell(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(command, 127, "", "sh: not found\n")
 
-        blocked_adapter = DockerBuildAdapter(source_resolution(), command_runner=missing_shell)
+        blocked_adapter = DockerBuildAdapter(self.source, command_runner=missing_shell)
         with tempfile.TemporaryDirectory() as directory:
             project_root = Path(directory)
             write_python_application(project_root)
@@ -383,7 +493,7 @@ class DockerBuildAdapterTests(unittest.TestCase):
                 "docker: 'buildx' is not a docker command.\n",
             )
 
-        adapter = DockerBuildAdapter(source_resolution(), command_runner=runner)
+        adapter = DockerBuildAdapter(self.source, command_runner=runner)
         with tempfile.TemporaryDirectory() as directory:
             project_root = Path(directory)
             write_python_application(project_root)
@@ -407,7 +517,7 @@ class DockerBuildAdapterTests(unittest.TestCase):
         raw = raw_config()
         raw["image"]["architectures"] = ["linux/amd64"]
         disable_cache(raw)
-        adapter = DockerBuildAdapter(source_resolution(), command_runner=runner)
+        adapter = DockerBuildAdapter(self.source, command_runner=runner)
         with tempfile.TemporaryDirectory() as directory:
             project_root = Path(directory)
             write_python_application(project_root)
@@ -472,16 +582,27 @@ class DockerBuildAdapterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
-            source = base / "source"
-            shutil.copytree(SOURCE_FIXTURE, source)
+            source_resolution_value = make_git_source(base / "source")
+            source = source_resolution_value.path
             outside = base / "outside.txt"
             outside.write_text("do not copy\n", encoding="utf-8")
             (source / "unsafe-link").symlink_to(outside)
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(source), "commit", "--quiet", "-m", "symlink"],
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(source), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             project_root = base / "project"
             project_root.mkdir()
             write_python_application(project_root)
             adapter = DockerBuildAdapter(
-                source_resolution(path=source),
+                replace(source_resolution_value, commit=commit),
                 command_runner=runner,
             )
 
@@ -495,8 +616,31 @@ class DockerBuildAdapterTests(unittest.TestCase):
             if diagnostic.check == "docker-template-staging"
         )
         self.assertEqual(staging.status, FAILED)
-        self.assertIn("must not contain symlinks", staging.message)
+        self.assertIn("non-regular entry", staging.message)
         self.assertFalse(called)
+
+    def test_application_context_rejects_all_symlinks_consistently(self) -> None:
+        for absolute in (False, True):
+            with self.subTest(absolute=absolute), tempfile.TemporaryDirectory() as directory:
+                project_root = Path(directory)
+                write_python_application(project_root)
+                target = project_root / "app" / "target.txt"
+                target.write_text("content\n", encoding="utf-8")
+                link = project_root / "app" / "link.txt"
+                link.symlink_to(target if absolute else Path("target.txt"))
+
+                result = self.adapter.generate(
+                    self.model,
+                    project_root=project_root,
+                )
+
+                diagnostic = next(
+                    item
+                    for item in result.diagnostics
+                    if item.check == "docker-application-context"
+                )
+                self.assertEqual(diagnostic.status, FAILED)
+                self.assertIn("must not contain symlinks", diagnostic.message)
 
     def test_generated_build_script_modes_use_only_official_template_entrypoints(self) -> None:
         raw = raw_config()
@@ -513,8 +657,13 @@ class DockerBuildAdapterTests(unittest.TestCase):
             environment = {
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                 "HOME": os.environ.get("HOME", "/tmp"),
-                "DEVOPS_STACK_DOCKER_TEMPLATE": str(SOURCE_FIXTURE),
+                "DEVOPS_STACK_DOCKER_TEMPLATE": str(self.source.path),
+                "DEVOPS_STACK_PROJECT_ROOT": str(project_root.parent / "outside"),
             }
+            (self.source.path / "scripts" / "validate-build-plan.sh").write_text(
+                "#!/usr/bin/env sh\nexit 99\n",
+                encoding="utf-8",
+            )
 
             validation = subprocess.run(
                 [str(script)],
@@ -570,6 +719,10 @@ class DockerBuildAdapterTests(unittest.TestCase):
         self.assertEqual(push.returncode, 0, push.stderr)
         self.assertIn("fixture docker official push passed", push.stdout)
         self.assertNotIn("docker buildx build --push", result.artifact("docker/build.sh").content)
+        self.assertNotIn(
+            "DEVOPS_STACK_PROJECT_ROOT",
+            result.artifact("docker/build.sh").content,
+        )
         self.assertNotEqual(multi_load.returncode, 0)
         self.assertIn("exactly one platform", multi_load.stderr)
         self.assertNotEqual(placeholder_push.returncode, 0)
@@ -585,7 +738,10 @@ class DockerBuildAdapterTests(unittest.TestCase):
             called = True
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        adapter = DockerBuildAdapter(source_resolution(matches_lock=False), command_runner=runner)
+        adapter = DockerBuildAdapter(
+            replace(self.source, matches_lock=False),
+            command_runner=runner,
+        )
         with tempfile.TemporaryDirectory() as directory:
             project_root = Path(directory)
             write_python_application(project_root)

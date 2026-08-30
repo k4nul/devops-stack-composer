@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,12 +33,20 @@ class FakeRunner:
         *,
         generation: int = 0,
         schema_tools_missing: bool = False,
+        placeholder_matches: int = 0,
+        query_payload_overrides: dict[str, object] | None = None,
+        query_output_overrides: dict[str, str] | None = None,
     ) -> None:
         self.source_root = source_root
         self.generation = generation
         self.schema_tools_missing = schema_tools_missing
+        self.placeholder_matches = placeholder_matches
+        self.query_payload_overrides = query_payload_overrides or {}
+        self.query_output_overrides = query_output_overrides or {}
         self.calls: list[tuple[tuple[str, ...], dict]] = []
         self.copied_source_contained_out = False
+        self.executed_script_contents: list[str] = []
+        self.render_values_content = ""
 
     def __call__(self, command: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
         self.calls.append((tuple(command), kwargs))
@@ -50,10 +60,17 @@ class FakeRunner:
 
         script = Path(command[command.index("-File") + 1]).name
         isolated_root = Path(kwargs["cwd"])
+        script_path = isolated_root / "scripts" / script
+        if script_path.is_file():
+            self.executed_script_contents.append(
+                script_path.read_text(encoding="utf-8")
+            )
         self.copied_source_contained_out = (
             self.copied_source_contained_out or (isolated_root / "out").exists()
         )
         if script == "render-platform-assets.ps1":
+            values_file = Path(command[command.index("-ValuesFile") + 1])
+            self.render_values_content = values_file.read_text(encoding="utf-8")
             output = Path(command[command.index("-OutputPath") + 1])
             manifest = output / "k8s" / "100_namespace" / "namespace.yaml"
             manifest.parent.mkdir(parents=True, exist_ok=True)
@@ -79,12 +96,20 @@ class FakeRunner:
             "validate-kubernetes-security-baseline.ps1": (
                 "Kubernetes security baseline findings: high=0, medium=1, low=1\n"
             ),
-            "check-placeholders.ps1": "Found 4 placeholder matches.\n",
+            "check-placeholders.ps1": (
+                f"Found {self.placeholder_matches} placeholder matches.\n"
+            ),
         }
         if script in validator_output:
             return subprocess.CompletedProcess(
                 command,
-                0,
+                (
+                    1
+                    if script == "check-placeholders.ps1"
+                    and self.placeholder_matches
+                    and "-FailOnMatch" in command
+                    else 0
+                ),
                 stdout=validator_output[script],
                 stderr="",
             )
@@ -116,9 +141,13 @@ class FakeRunner:
             },
             "show-render-matrix.ps1": {
                 **common,
+                "EntryCount": 1,
+                "EnvironmentEntryCount": 0,
+                "ProfileEntryCount": 1,
                 "Entries": [
                     {
                         "Name": "minimal-application",
+                        "Scope": "profile",
                         "ValuesFileResolved": "/tmp/private/platform-values.env",
                     }
                 ],
@@ -129,10 +158,15 @@ class FakeRunner:
                 "Components": [{"Directory": "100_namespace"}],
             },
         }
+        if script in self.query_output_overrides:
+            stdout = self.query_output_overrides[script]
+        else:
+            payload = self.query_payload_overrides.get(script, payloads[script])
+            stdout = json.dumps(payload)
         return subprocess.CompletedProcess(
             command,
             0,
-            stdout=json.dumps(payloads[script]),
+            stdout=stdout,
             stderr="",
         )
 
@@ -164,11 +198,39 @@ class KubernetesAdapterTests(unittest.TestCase):
         source_out = self.source_root / "out"
         source_out.mkdir()
         (source_out / "must-not-copy.txt").write_text("sentinel\n", encoding="utf-8")
+        (self.source_root / ".gitignore").write_text("out/\n", encoding="utf-8")
+        subprocess.run(["git", "init", "--quiet", str(self.source_root)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.source_root),
+                "config",
+                "user.email",
+                "fixture@example.invalid",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.source_root), "config", "user.name", "Fixture"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(self.source_root), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.source_root), "commit", "--quiet", "-m", "fixture"],
+            check=True,
+        )
+        commit = subprocess.run(
+            ["git", "-C", str(self.source_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
         self.source = SourceResolution(
             key="kubernetes",
             path=self.source_root,
             origin="test",
-            commit="2" * 40,
+            commit=commit,
             remote="https://example.invalid/k8s-platform-template.git",
             matches_lock=True,
         )
@@ -523,7 +585,7 @@ class KubernetesAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             context_document["validators"]["placeholders"]["matchCount"],
-            4,
+            0,
         )
 
     def test_architecture_contract_is_visible_to_the_scheduler(self) -> None:
@@ -590,6 +652,12 @@ class KubernetesAdapterTests(unittest.TestCase):
         for command, _ in query_calls:
             self.assertEqual(command[-2:], ("-Format", "json"))
             self.assertNotIn("OutputPath", command)
+        placeholder_command = next(
+            command
+            for command, _ in pwsh_calls
+            if any(value.endswith("check-placeholders.ps1") for value in command)
+        )
+        self.assertIn("-FailOnMatch", placeholder_command)
         platform_command = next(
             command
             for command, _ in query_calls
@@ -607,9 +675,31 @@ class KubernetesAdapterTests(unittest.TestCase):
         values_path = Path(render_command[render_command.index("-ValuesFile") + 1])
         self.assertFalse(output_path.is_relative_to(isolated_root))
         self.assertTrue(values_path.is_relative_to(isolated_root))
-        self.assertEqual(values_path.name, "platform-values.env.example")
+        self.assertEqual(values_path.name, ".devops-stack-validation-values.env")
         self.assertIn("-FailOnUnresolvedToken", render_command)
+        self.assertNotIn("example.com", self.runner.render_values_content)
+        self.assertNotIn("change-me-", self.runner.render_values_content)
+        self.assertIn("validation.invalid", self.runner.render_values_content)
         self.assertFalse(self.runner.copied_source_contained_out)
+
+    def test_upstream_scripts_receive_only_a_minimal_environment(self) -> None:
+        runner = FakeRunner(self.source_root)
+        with patch.dict(
+            os.environ,
+            {"KUBERNETES_ADAPTER_SECRET_SHOULD_NOT_LEAK": "sensitive"},
+        ), patch(
+            "devops_stack_composer.adapters.kubernetes.shutil.which",
+            return_value=None,
+        ):
+            KubernetesAdapter(self.source, runner=runner).render(self.model)
+
+        pwsh_calls = [kwargs for command, kwargs in runner.calls if command[0] == "pwsh"]
+        self.assertTrue(pwsh_calls)
+        for kwargs in pwsh_calls:
+            environment = kwargs["env"]
+            self.assertNotIn("KUBERNETES_ADAPTER_SECRET_SHOULD_NOT_LEAK", environment)
+            self.assertEqual(environment["POWERSHELL_TELEMETRY_OPTOUT"], "1")
+            self.assertIn("PATH", environment)
 
     def test_missing_external_tools_are_skipped_not_passed(self) -> None:
         diagnostics = {diagnostic.check: diagnostic for diagnostic in self.result.diagnostics}
@@ -637,6 +727,101 @@ class KubernetesAdapterTests(unittest.TestCase):
             diagnostics["kubernetes.upstream.renderedBundle"].status,
             ValidationStatus.SKIPPED_MISSING_OPTIONAL_TOOL.value,
         )
+
+    def test_upstream_placeholder_matches_are_failed(self) -> None:
+        runner = FakeRunner(self.source_root, placeholder_matches=4)
+        with patch(
+            "devops_stack_composer.adapters.kubernetes.shutil.which",
+            return_value=None,
+        ):
+            result = KubernetesAdapter(self.source, runner=runner).render(self.model)
+        diagnostics = {diagnostic.check: diagnostic for diagnostic in result.diagnostics}
+        context = json.loads(result.artifact("k8s/platform-context.json").content)
+
+        self.assertEqual(
+            diagnostics["kubernetes.upstream.placeholders"].status,
+            ValidationStatus.FAILED.value,
+        )
+        self.assertEqual(
+            context["validators"]["placeholders"],
+            {"matchCount": 4, "status": ValidationStatus.FAILED.value},
+        )
+
+    def test_upstream_queries_reject_malformed_json_interfaces(self) -> None:
+        cases = (
+            ("show-profile-catalog.ps1", {}, "profileCatalog"),
+            (
+                "show-environment-preset-plan.ps1",
+                {"Presets": [None]},
+                "environmentPresetPlan",
+            ),
+            (
+                "show-render-matrix.ps1",
+                {
+                    "EntryCount": 1,
+                    "EnvironmentEntryCount": 0,
+                    "ProfileEntryCount": 1,
+                    "Entries": [],
+                },
+                "renderMatrix",
+            ),
+            (
+                "show-platform-plan.ps1",
+                {
+                    "Profile": "unexpected",
+                    "Applications": [],
+                    "Components": {},
+                },
+                "platformPlan",
+            ),
+        )
+        for script, payload, key in cases:
+            with self.subTest(script=script):
+                runner = FakeRunner(
+                    self.source_root,
+                    query_payload_overrides={script: payload},
+                )
+                with patch(
+                    "devops_stack_composer.adapters.kubernetes.shutil.which",
+                    return_value=None,
+                ):
+                    result = KubernetesAdapter(self.source, runner=runner).render(
+                        self.model
+                    )
+
+                diagnostic = next(
+                    item
+                    for item in result.diagnostics
+                    if item.check == f"kubernetes.upstream.{key}"
+                )
+                self.assertEqual(diagnostic.status, ValidationStatus.FAILED.value)
+                self.assertIn("unexpected JSON shape", diagnostic.message)
+                context = json.loads(
+                    result.artifact("k8s/platform-context.json").content
+                )
+                self.assertEqual(context["queries"][key], {"status": "FAILED"})
+
+    def test_upstream_query_output_is_size_bounded_before_json_parsing(self) -> None:
+        runner = FakeRunner(
+            self.source_root,
+            query_output_overrides={
+                "show-profile-catalog.ps1": " " * (256 * 1024 + 1)
+            },
+        )
+        with patch(
+            "devops_stack_composer.adapters.kubernetes.shutil.which",
+            return_value=None,
+        ):
+            result = KubernetesAdapter(self.source, runner=runner).render(self.model)
+
+        diagnostic = next(
+            item
+            for item in result.diagnostics
+            if item.check == "kubernetes.upstream.profileCatalog"
+        )
+        self.assertEqual(diagnostic.status, ValidationStatus.FAILED.value)
+        self.assertIn("output limit", diagnostic.message)
+        self.assertEqual(diagnostic.details["outputBytes"], 256 * 1024 + 1)
 
     def test_unlocked_source_fails_without_executing_upstream_scripts(self) -> None:
         unlocked = SourceResolution(
@@ -689,18 +874,54 @@ class KubernetesAdapterTests(unittest.TestCase):
 
     def test_symlinked_template_content_fails_before_script_execution(self) -> None:
         (self.source_root / "escape").symlink_to(Path("/tmp"), target_is_directory=True)
+        subprocess.run(["git", "-C", str(self.source_root), "add", "escape"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.source_root), "commit", "--quiet", "-m", "symlink"],
+            check=True,
+        )
+        commit = subprocess.run(
+            ["git", "-C", str(self.source_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        runner = FakeRunner(self.source_root)
+        with patch(
+            "devops_stack_composer.adapters.kubernetes.shutil.which",
+            return_value=None,
+        ):
+            result = KubernetesAdapter(
+                replace(self.source, commit=commit),
+                runner=runner,
+            ).render(self.model)
+        diagnostics = {diagnostic.check: diagnostic for diagnostic in result.diagnostics}
+
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(
+            diagnostics["kubernetes.upstream.locked-archive"].status,
+            ValidationStatus.FAILED.value,
+        )
+
+    def test_dirty_template_worktree_bytes_are_not_executed(self) -> None:
+        dirty_marker = "DIRTY_BYTES_MUST_NOT_EXECUTE"
+        script = self.source_root / "scripts" / "show-profile-catalog.ps1"
+        script.write_text(dirty_marker + "\n", encoding="utf-8")
         runner = FakeRunner(self.source_root)
         with patch(
             "devops_stack_composer.adapters.kubernetes.shutil.which",
             return_value=None,
         ):
             result = KubernetesAdapter(self.source, runner=runner).render(self.model)
-        diagnostics = {diagnostic.check: diagnostic for diagnostic in result.diagnostics}
 
-        self.assertEqual(runner.calls, [])
-        self.assertEqual(
-            diagnostics["kubernetes.upstream.isolated-copy"].status,
-            ValidationStatus.FAILED.value,
+        archive = next(
+            diagnostic
+            for diagnostic in result.diagnostics
+            if diagnostic.check == "kubernetes.upstream.locked-archive"
+        )
+        self.assertEqual(archive.status, ValidationStatus.PASSED.value)
+        self.assertTrue(runner.executed_script_contents)
+        self.assertFalse(
+            any(dirty_marker in content for content in runner.executed_script_contents)
         )
 
     def test_installed_external_tools_report_real_passes(self) -> None:

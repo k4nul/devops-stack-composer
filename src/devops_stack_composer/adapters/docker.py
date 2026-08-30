@@ -19,6 +19,8 @@ from devops_stack_composer.adapters.base import (
     AdapterResult,
     GeneratedArtifact,
 )
+from devops_stack_composer.archives import extract_locked_source
+from devops_stack_composer.errors import SourceResolutionError
 from devops_stack_composer.model import IMAGE_TAG_PLACEHOLDER, NormalizedDevOpsModel
 from devops_stack_composer.sources import SourceResolution
 
@@ -50,6 +52,7 @@ UPSTREAM_IMAGE_ENV_KEYS = (
 
 UPSTREAM_REQUIRED_DOCKERIGNORE_PATTERNS = (
     ".git",
+    ".devops-stack",
     "config/*.env",
     "config/image.env",
     ".env",
@@ -58,6 +61,8 @@ UPSTREAM_REQUIRED_DOCKERIGNORE_PATTERNS = (
     "AGENTS.md",
     "docs/management",
     "out",
+    "generated",
+    "generated-preview",
     "node_modules",
     "dist",
     "build",
@@ -74,8 +79,19 @@ UPSTREAM_REQUIRED_DOCKERIGNORE_PATTERNS = (
     "id_ed25519",
 )
 
-_SOURCE_COPY_IGNORES = (".git", "__pycache__", "*.pyc")
-_CONTEXT_COPY_IGNORES = (".git", ".devops-stack", "__pycache__", "*.pyc")
+_CONTEXT_COPY_IGNORES = tuple(
+    dict.fromkeys(
+        (
+            *UPSTREAM_REQUIRED_DOCKERIGNORE_PATTERNS,
+            ".gitignore",
+            ".dockerignore",
+            "Dockerfile*",
+            "__pycache__",
+            "*.pyc",
+            "*.env",
+        )
+    )
+)
 _DOCKER_ENV_ALLOWLIST = (
     "PATH",
     "HOME",
@@ -103,6 +119,34 @@ _IMAGE_PAIRS = {
 }
 
 _SAFE_IMAGE_TAG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+_OUTPUT_URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@")
+_OUTPUT_AUTHORIZATION = re.compile(
+    r"(?i)(\b(?:proxy-)?authorization\s*:\s*)[^\r\n]*"
+)
+_OUTPUT_INLINE_SECRET = re.compile(
+    r"(?ix)(\b(?:password|passphrase|token|secret|private.?key|access.?key|api.?key|authorization)\b[\"']?\s*[:=]\s*)"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
+)
+_OUTPUT_SECRET_FLAG = re.compile(
+    r"(?ix)(--(?:password|passphrase|token|secret|private-key|access-key|api-key)(?:\s+|=))"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
+)
+_OUTPUT_CURL_USER = re.compile(
+    r"(?i)(?<!\S)(?P<prefix>--user(?:\s+|=)|-u(?:\s+|=)|"
+    r"-u(?=[^\s;]*:))"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s;]+)"
+)
+
+
+def _sanitize_command_output(value: str | None) -> str:
+    if not isinstance(value, str):
+        return ""
+    sanitized = _OUTPUT_URL_USERINFO.sub(r"\1<redacted>@", value)
+    sanitized = _OUTPUT_AUTHORIZATION.sub(r"\1<redacted>", sanitized)
+    sanitized = _OUTPUT_INLINE_SECRET.sub(r"\1<redacted>", sanitized)
+    sanitized = _OUTPUT_SECRET_FLAG.sub(r"\1<redacted>", sanitized)
+    sanitized = _OUTPUT_CURL_USER.sub(r"\g<prefix><redacted>", sanitized)
+    return sanitized.strip()[-4000:]
 
 
 class DockerBuildAdapter:
@@ -463,6 +507,7 @@ class DockerBuildAdapter:
         context_value = shlex.quote(relative_context.as_posix())
         cache = model.build.get("cache", {})
         cache_requested = bool(cache.get("enabled") or cache.get("from") or cache.get("to"))
+        expected_template_commit = shlex.quote(self.source.commit or "")
         return f"""#!/usr/bin/env sh
 set -eu
 
@@ -480,9 +525,10 @@ case "$MODE" in
 esac
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-PROJECT_ROOT=${{DEVOPS_STACK_PROJECT_ROOT:-$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd -P)}}
+PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd -P)
 TEMPLATE_ROOT=${{DEVOPS_STACK_DOCKER_TEMPLATE:-}}
 CONTEXT_RELATIVE={context_value}
+EXPECTED_TEMPLATE_COMMIT={expected_template_commit}
 
 if [ -z "$TEMPLATE_ROOT" ] || [ ! -f "$TEMPLATE_ROOT/scripts/build-image.sh" ]; then
   printf '%s\n' "Set DEVOPS_STACK_DOCKER_TEMPLATE to a resolved docker-build-template checkout" >&2
@@ -507,6 +553,19 @@ esac
 
 if find "$TEMPLATE_ROOT" -type l -print -quit | grep . >/dev/null; then
   printf '%s\n' "Docker template source must not contain symlinks" >&2
+  exit 2
+fi
+if ! command -v git >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+  printf '%s\n' "git and tar are required to stage the locked Docker template" >&2
+  exit 2
+fi
+ACTUAL_TEMPLATE_COMMIT=$(git -C "$TEMPLATE_ROOT" rev-parse HEAD 2>/dev/null || true)
+if [ -z "$EXPECTED_TEMPLATE_COMMIT" ] || [ "$ACTUAL_TEMPLATE_COMMIT" != "$EXPECTED_TEMPLATE_COMMIT" ]; then
+  printf '%s\n' "Docker template checkout does not match the generated lock commit" >&2
+  exit 2
+fi
+if git -C "$TEMPLATE_ROOT" ls-tree -r "$EXPECTED_TEMPLATE_COMMIT" | grep '^120000 ' >/dev/null; then
+  printf '%s\n' "Locked Docker template commit must not contain symlinks" >&2
   exit 2
 fi
 if find "$CONTEXT_PATH" -type l -print -quit | grep . >/dev/null; then
@@ -542,6 +601,7 @@ fi
 STAGE_PARENT=$(mktemp -d "${{TMPDIR:-/tmp}}/devops-stack-docker.XXXXXX")
 STAGE_PARENT=$(CDPATH= cd -- "$STAGE_PARENT" && pwd -P)
 TEMPLATE_STAGE="$STAGE_PARENT/template"
+TEMPLATE_ARCHIVE="$STAGE_PARENT/template.tar"
 APPLICATION_STAGE="$TEMPLATE_STAGE/application"
 cleanup() {{
   rm -rf "$STAGE_PARENT"
@@ -564,9 +624,18 @@ for destination in "$TEMPLATE_STAGE" "$APPLICATION_STAGE" \
 done
 
 mkdir -p "$TEMPLATE_STAGE"
-cp -R "$TEMPLATE_ROOT/." "$TEMPLATE_STAGE"
+git -C "$TEMPLATE_ROOT" archive --format=tar \
+  --output="$TEMPLATE_ARCHIVE" "$EXPECTED_TEMPLATE_COMMIT"
+tar -xf "$TEMPLATE_ARCHIVE" -C "$TEMPLATE_STAGE"
 mkdir -p "$APPLICATION_STAGE"
-cp -R "$CONTEXT_PATH/." "$APPLICATION_STAGE"
+tar -C "$CONTEXT_PATH" \
+  --exclude='./generated' \
+  --exclude='./generated/*' \
+  --exclude='./generated-preview' \
+  --exclude='./generated-preview/*' \
+  --exclude='./.devops-stack' \
+  --exclude='./.devops-stack/*' \
+  -cf - . | tar -xf - -C "$APPLICATION_STAGE"
 mkdir -p "$TEMPLATE_STAGE/generated/docker" "$TEMPLATE_STAGE/out"
 cp "$SCRIPT_DIR/Dockerfile" "$TEMPLATE_STAGE/generated/docker/Dockerfile"
 cp "$SCRIPT_DIR/Dockerfile.dockerignore" \
@@ -594,6 +663,13 @@ set -- env -i \
 [ -z "${{BUILDX_BUILDER:-}}" ] || set -- "$@" "BUILDX_BUILDER=$BUILDX_BUILDER"
 [ -z "${{BUILDX_CONFIG:-}}" ] || set -- "$@" "BUILDX_CONFIG=$BUILDX_CONFIG"
 [ -z "${{XDG_RUNTIME_DIR:-}}" ] || set -- "$@" "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+
+# A Docker --load result cannot carry registry attestations. Keep the configured
+# SBOM/provenance values for validation and push, but disable attestations only for
+# this local image load; Jenkins runs its local Syft/Trivy checks afterwards.
+if [ "$MODE" = "--load" ]; then
+  set -- "$@" "SBOM=false" "PROVENANCE=false"
+fi
 
 case "$MODE" in
   --validate)
@@ -672,9 +748,11 @@ esac
                 "runAsNonRoot": bool(model.security.get("runAsNonRoot")),
                 "user": model.runtime_user,
             },
-            "scriptModes": {
-                "default": "--validate",
-                "load": "single-platform, explicit IMAGE_TAG",
+                "scriptModes": {
+                    "default": "--validate",
+                    "load": (
+                        "single-platform, explicit IMAGE_TAG, registry attestations disabled"
+                    ),
                 "push": "official scripts/push-image.sh, explicit IMAGE_TAG",
                 "validate": "official scripts/validate-build-plan.sh",
             },
@@ -721,27 +799,39 @@ esac
             )
             return replace(result, diagnostics=(*result.diagnostics, diagnostic))
 
-        validate_script = self.source.path / "scripts" / "validate-build-plan.sh"
-        if not validate_script.is_file():
-            diagnostic = AdapterDiagnostic(
-                status=BLOCKED_MISSING_REQUIRED_TOOL,
-                check="docker-template-validation",
-                message=f"Required upstream validator is missing: {validate_script}",
-            )
-            return replace(result, diagnostics=(*result.diagnostics, diagnostic))
-
         diagnostics: list[AdapterDiagnostic] = []
         try:
             with tempfile.TemporaryDirectory(prefix="devops-stack-docker-") as directory:
                 stage_parent = Path(directory).resolve(strict=True)
-                self._reject_symlinks(self.source.path, label="Docker template source")
                 stage = self._safe_stage_destination(stage_parent, "template")
-                shutil.copytree(
-                    self.source.path,
-                    stage,
-                    symlinks=True,
-                    ignore=shutil.ignore_patterns(*_SOURCE_COPY_IGNORES),
+                extract_locked_source(self.source, stage)
+                diagnostics.append(
+                    AdapterDiagnostic(
+                        status=PASSED,
+                        check="docker-template-archive",
+                        message=(
+                            "Upstream validation uses archived bytes from the locked "
+                            "Git commit."
+                        ),
+                        details={"commit": self.source.commit},
+                    )
                 )
+                validate_script = stage / "scripts" / "validate-build-plan.sh"
+                if not validate_script.is_file():
+                    diagnostics.append(
+                        AdapterDiagnostic(
+                            status=BLOCKED_MISSING_REQUIRED_TOOL,
+                            check="docker-template-validation",
+                            message=(
+                                "Required upstream validator is missing from the locked "
+                                "Docker template commit."
+                            ),
+                        )
+                    )
+                    return replace(
+                        result,
+                        diagnostics=(*result.diagnostics, *diagnostics),
+                    )
                 staged_context = self._safe_stage_destination(stage, "application")
                 shutil.copytree(
                     context,
@@ -816,10 +906,15 @@ esac
                             )
                         else:
                             build_command = ("sh", "scripts/build-image.sh")
+                            build_environment = {
+                                **environment,
+                                "SBOM": "false",
+                                "PROVENANCE": "false",
+                            }
                             build = self._invoke(
                                 build_command,
                                 cwd=stage,
-                                environment=environment,
+                                environment=build_environment,
                                 timeout=300,
                             )
                             diagnostics.append(
@@ -829,11 +924,18 @@ esac
                                     command=build_command,
                                     optional_tool=True,
                                     success_message=(
-                                        "Optional single-platform local Docker build passed."
+                                        "Optional single-platform local Docker build passed; "
+                                        "registry attestations remain reserved for push."
                                     ),
                                 )
                             )
-        except (OSError, ValueError, shutil.Error, subprocess.TimeoutExpired) as exc:
+        except (
+            OSError,
+            SourceResolutionError,
+            ValueError,
+            shutil.Error,
+            subprocess.TimeoutExpired,
+        ) as exc:
             diagnostics.append(
                 AdapterDiagnostic(
                     status=FAILED,
@@ -891,25 +993,11 @@ esac
             expect_directory=True,
         )
         for entry in context.rglob("*"):
-            if not entry.is_symlink():
-                continue
-            try:
-                resolved = entry.resolve(strict=True)
-                resolved.relative_to(context)
-            except (OSError, ValueError) as exc:
-                raise ValueError(
-                    f"Docker build context symlink must stay inside the context: {entry}"
-                ) from exc
-        return context
-
-    @staticmethod
-    def _reject_symlinks(root: Path, *, label: str) -> None:
-        source = Path(root)
-        if source.is_symlink():
-            raise ValueError(f"{label} must not be a symlink: {source}")
-        for entry in source.rglob("*"):
             if entry.is_symlink():
-                raise ValueError(f"{label} must not contain symlinks: {entry}")
+                raise ValueError(
+                    f"Docker build context must not contain symlinks: {entry}"
+                )
+        return context
 
     @staticmethod
     def _safe_stage_destination(stage_root: Path, relative: str) -> Path:
@@ -1040,12 +1128,12 @@ esac
         optional_tool: bool,
         success_message: str,
     ) -> AdapterDiagnostic:
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
+        stdout = result.stdout if isinstance(result.stdout, str) else ""
+        stderr = result.stderr if isinstance(result.stderr, str) else ""
         details = {
             "returnCode": result.returncode,
-            "stdout": stdout[-4000:],
-            "stderr": stderr[-4000:],
+            "stdout": _sanitize_command_output(stdout),
+            "stderr": _sanitize_command_output(stderr),
         }
         if result.returncode == 0:
             return AdapterDiagnostic(
