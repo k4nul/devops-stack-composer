@@ -50,6 +50,30 @@ class EvidenceValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ArtifactContractError, "ARTIFACT_DIGEST_MISMATCH"):
             validate_artifact_contract(artifact(platform_digest="sha256:" + "e" * 64))
 
+    def test_supply_chain_index_can_bind_top_level_evidence_without_child_identity(self) -> None:
+        child_digest = "sha256:" + "e" * 64
+
+        result = validate_artifact_contract(
+            artifact(
+                platform_digest=child_digest,
+                media_type="application/vnd.oci.image.index.v1+json",
+            ),
+            require_platform_identity=False,
+        )
+
+        self.assertEqual(result.authoritative_digest, DIGEST)
+        self.assertNotIn("platform-manifest", result.subjects)
+
+    def test_non_index_cannot_claim_a_distinct_child_digest(self) -> None:
+        with self.assertRaisesRegex(
+            ArtifactContractError,
+            "ARTIFACT_PLATFORM_DIGEST_MISMATCH",
+        ):
+            validate_artifact_contract(
+                artifact(platform_digest="sha256:" + "e" * 64),
+                require_platform_identity=False,
+            )
+
     def test_artifact_contract_rejects_multiple_builds(self) -> None:
         with self.assertRaisesRegex(ArtifactContractError, "BUILD_INVOKED_MORE_THAN_ONCE"):
             validate_artifact_contract(artifact(build_invocation_count=2))

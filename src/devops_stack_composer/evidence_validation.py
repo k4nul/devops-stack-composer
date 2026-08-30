@@ -22,6 +22,14 @@ from devops_stack_composer.oci import (
 )
 
 
+_INDEX_MEDIA_TYPES = frozenset(
+    {
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+    }
+)
+
+
 class ArtifactContractError(DevOpsStackError):
     """A stable artifact-identity violation with an actionable evidence location."""
 
@@ -306,18 +314,43 @@ def validate_artifact_contract(
     artifact: ResolvedArtifact,
     supply_chain: SupplyChainEvidence | None = None,
     deployment: DeploymentEvidence | None = None,
+    *,
+    require_platform_identity: bool = True,
 ) -> ArtifactVerification:
+    """Validate immutable evidence subjects against the top-level manifest.
+
+    A multi-platform OCI index legitimately has a different digest from each
+    child platform manifest. Supply-chain-only verification can therefore set
+    ``require_platform_identity`` to false while still binding every top-level
+    evidence subject to the index digest. Local kind execution keeps the
+    stricter default because the v0.2 runtime contract supports only an
+    artifact whose manifest, selected platform, and running image digest are
+    identical.
+    """
+    if not isinstance(require_platform_identity, bool):
+        raise ValueError("require_platform_identity must be boolean")
     if artifact.build_invocation_count != 1:
         raise ArtifactContractError(
             "BUILD_INVOKED_MORE_THAN_ONCE",
             f"artifact records {artifact.build_invocation_count} build invocations",
             evidence_path="artifact.json",
         )
+    if (
+        not require_platform_identity
+        and artifact.manifest_digest != artifact.platform_digest
+        and artifact.media_type not in _INDEX_MEDIA_TYPES
+    ):
+        raise ArtifactContractError(
+            "ARTIFACT_PLATFORM_DIGEST_MISMATCH",
+            "only an OCI index may name a distinct child platform digest",
+            evidence_path="artifact.json",
+        )
     subjects: dict[str, str] = {
         "build-metadata": artifact.manifest_digest,
-        "platform-manifest": artifact.platform_digest,
         "artifact-record": artifact.immutable_image_reference,
     }
+    if require_platform_identity:
+        subjects["platform-manifest"] = artifact.platform_digest
     if supply_chain is not None:
         subjects.update(
             {
