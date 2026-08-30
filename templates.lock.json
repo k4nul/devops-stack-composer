@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "1.0.0",
+  "templates": {
+    "docker": {
+      "name": "docker-build-template",
+      "repository": "https://github.com/k4nul/docker-build-template.git",
+      "commit": "bbd6c4ba184c0e68dcaf65d4eb26ea622847c8c3",
+      "adapterVersion": "1.0.0",
+      "schemaVersion": "docker-env-v1",
+      "checkedAt": "2026-08-30",
+      "license": {
+        "spdx": "MIT",
+        "file": "LICENSE"
+      }
+    },
+    "jenkins": {
+      "name": "jenkins-pipeline-template",
+      "repository": "https://github.com/k4nul/jenkins-pipeline-template.git",
+      "commit": "e71cd88365484d9aba464db084437276d98ff0e0",
+      "adapterVersion": "1.0.0",
+      "schemaVersion": "jenkins-plan-json-v1",
+      "checkedAt": "2026-08-30",
+      "license": {
+        "spdx": "MIT",
+        "file": "LICENSE"
+      }
+    },
+    "kubernetes": {
+      "name": "k8s-platform-template",
+      "repository": "https://github.com/k4nul/k8s-platform-template",
+      "commit": "2c2c306354615157208c76fc97846ed391392e51",
+      "adapterVersion": "1.0.0",
+      "schemaVersion": "k8s-plan-json-v1",
+      "checkedAt": "2026-08-30",
+      "license": {
+        "spdx": "MIT",
+        "file": "LICENSE"
+      }
+    }
+  }
+}

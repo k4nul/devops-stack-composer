@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/k4nul/devops-stack-composer/schemas/templates-lock.schema.json",
+  "title": "DevOps Stack template lock",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "templates"],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.0.0"
+    },
+    "templates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["docker", "jenkins", "kubernetes"],
+      "properties": {
+        "docker": {"$ref": "#/definitions/template"},
+        "jenkins": {"$ref": "#/definitions/template"},
+        "kubernetes": {"$ref": "#/definitions/template"}
+      }
+    }
+  },
+  "definitions": {
+    "template": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "repository",
+        "commit",
+        "adapterVersion",
+        "schemaVersion",
+        "checkedAt",
+        "license"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repository": {
+          "type": "string",
+          "pattern": "^(?:https://|ssh://|git@|file://).+"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "adapterVersion": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "schemaVersion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "checkedAt": {
+          "type": "string",
+          "format": "date"
+        },
+        "license": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["spdx", "file"],
+          "properties": {
+            "spdx": {"type": "string", "const": "MIT"},
+            "file": {"type": "string", "const": "LICENSE"}
+          }
+        }
+      }
+    }
+  }
+}

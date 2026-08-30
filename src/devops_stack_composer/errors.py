@@ -33,3 +33,11 @@ class ConfigValidationError(DevOpsStackError):
 
 class ConfigParseError(DevOpsStackError):
     """Raised when YAML cannot be parsed into a mapping."""
+
+
+class LockValidationError(DevOpsStackError):
+    """Raised when the committed template lock is invalid."""
+
+
+class SourceResolutionError(DevOpsStackError):
+    """Raised when a pinned template source cannot be resolved safely."""
