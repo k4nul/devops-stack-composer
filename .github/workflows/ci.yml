@@ -105,7 +105,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install build==1.6.0 twine==7.0.0
           python -m build
-          python -m twine check dist/*
+          python -m twine check dist/*.whl dist/*.tar.gz
 
       - name: Inspect and install both artifacts
         run: |

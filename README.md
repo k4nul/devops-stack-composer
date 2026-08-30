@@ -169,7 +169,7 @@ mypy --follow-imports=skip --ignore-missing-imports \
   src/devops_stack_composer/release_assets.py \
   src/devops_stack_composer/release_validation.py
 python3 -m build
-python3 -m twine check dist/*
+python3 -m twine check dist/*.whl dist/*.tar.gz
 git diff --check
 ```
 
