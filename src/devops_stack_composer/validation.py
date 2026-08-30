@@ -681,10 +681,508 @@ def _docker_artifact_mismatches(
     return mismatches
 
 
+def _jenkins_v2_artifact_mismatches(
+    model: NormalizedDevOpsModel,
+    result: AdapterResult,
+) -> list[dict[str, Any]]:
+    """Validate the v0.2 build-once, immutable-digest Jenkins projection."""
+
+    artifacts = _artifact_map(result)
+    required = [
+        "jenkins/Jenkinsfile",
+        "jenkins/job-dsl.groovy",
+        "jenkins/artifact-contract.json",
+        "jenkins/README.md",
+        *(f"jenkins/environments/{environment.name}.json" for environment in model.environments),
+    ]
+    mismatches: list[dict[str, Any]] = [
+        {"path": path, "expected": "generated artifact", "received": None}
+        for path in required
+        if path not in artifacts
+    ]
+    if mismatches:
+        return mismatches
+
+    from devops_stack_composer.adapters.jenkins import JenkinsPipelineAdapter
+    from devops_stack_composer.sources import SourceResolution
+
+    expected_result = JenkinsPipelineAdapter(
+        SourceResolution(
+            key="jenkins",
+            path=Path("."),
+            origin="artifact-contract",
+            commit=result.template_commit,
+            remote=None,
+            matches_lock=True,
+        )
+    ).render(model, validate_upstream=False)
+    mismatches.extend(
+        _closed_artifact_mismatches(
+            result,
+            {
+                artifact.path: (artifact.content, artifact.mode, artifact.origins)
+                for artifact in expected_result.artifacts
+            },
+        )
+    )
+
+    try:
+        contract = json.loads(artifacts["jenkins/artifact-contract.json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        mismatches.append(
+            {
+                "path": "jenkins.artifactContract",
+                "expected": "valid JSON object",
+                "received": type(exc).__name__,
+            }
+        )
+        contract = {}
+    if not isinstance(contract, dict):
+        mismatches.append(
+            {
+                "path": "jenkins.artifactContract",
+                "expected": "JSON object",
+                "received": type(contract).__name__,
+            }
+        )
+        contract = {}
+    expected_contract_values = (
+        ("schemaVersion", "jenkins-artifact-contract-v1"),
+        ("verificationScope", "generated-static-plan-only"),
+        ("jenkinsExecutionVerified", False),
+    )
+    for key, expected in expected_contract_values:
+        _mismatch(
+            mismatches,
+            f"jenkins.artifactContract.{key}",
+            expected,
+            contract.get(key),
+        )
+    build_contract = contract.get("build")
+    build_contract = build_contract if isinstance(build_contract, dict) else {}
+    _mismatch(
+        mismatches,
+        "jenkins.artifactContract.build.maximumImageBuildInvocations",
+        1,
+        build_contract.get("maximumImageBuildInvocations"),
+    )
+    _mismatch(
+        mismatches,
+        "jenkins.artifactContract.build.command",
+        "./generated/docker/build.sh --push",
+        build_contract.get("command"),
+    )
+    deployment_contract = contract.get("deployment")
+    deployment_contract = (
+        deployment_contract if isinstance(deployment_contract, dict) else {}
+    )
+    _mismatch(
+        mismatches,
+        "jenkins.artifactContract.deployment.mutableTagsAllowed",
+        False,
+        deployment_contract.get("mutableTagsAllowed"),
+    )
+    _mismatch(
+        mismatches,
+        "jenkins.artifactContract.deployment.rollbackRebuildAllowed",
+        False,
+        deployment_contract.get("rollbackRebuildAllowed"),
+    )
+
+    for environment in model.environments:
+        path = f"jenkins/environments/{environment.name}.json"
+        try:
+            value = json.loads(artifacts[path])
+        except (TypeError, json.JSONDecodeError) as exc:
+            mismatches.append(
+                {"path": path, "expected": "valid JSON", "received": type(exc).__name__}
+            )
+            continue
+        if not isinstance(value, dict):
+            mismatches.append(
+                {"path": path, "expected": "JSON object", "received": type(value).__name__}
+            )
+            continue
+        prefix = f"jenkins.environments.{environment.name}"
+        for key, expected in (
+            ("environment", environment.name),
+            ("image", model.image_reference),
+            ("imageContract", "resolved-digest"),
+            ("imageTagExpression", model.image_tag_expression),
+            (
+                "deploymentImageSource",
+                "out/execution/artifact.json#immutableImageReference",
+            ),
+            ("mutableTagDeploymentAllowed", False),
+            ("namespace", environment.namespace),
+            ("branchPatterns", list(model.branch_environment_map[environment.name])),
+        ):
+            _mismatch(mismatches, f"{prefix}.{key}", expected, value.get(key))
+
+    jenkinsfile = artifacts["jenkins/Jenkinsfile"]
+    environment_match = re.search(
+        r"(?ms)^\s*environment\s*\{\s*(.*?)^\s*\}\s*$",
+        jenkinsfile,
+    )
+    environment_body = environment_match.group(1) if environment_match else ""
+    for path, key, expected in (
+        ("jenkins.Jenkinsfile.registry", "IMAGE_REGISTRY", model.image_registry),
+        ("jenkins.Jenkinsfile.repository", "IMAGE_REPOSITORY", model.image_name),
+        (
+            "jenkins.Jenkinsfile.registryCredentialId",
+            "REGISTRY_CREDENTIAL_ID",
+            model.credential_id,
+        ),
+    ):
+        assignments = re.findall(
+            rf"(?m)^[ \t]*{key}[ \t]*=[ \t]*(.+?)[ \t]*$",
+            environment_body,
+        )
+        expected_assignment = _groovy_literal(expected)
+        if assignments != [expected_assignment]:
+            mismatches.append(
+                {
+                    "path": path,
+                    "expected": expected_assignment,
+                    "received": assignments,
+                }
+            )
+
+    stage_blocks = _jenkins_stage_blocks(jenkinsfile)
+    expected_jenkinsfile = expected_result.artifact("jenkins/Jenkinsfile").content
+    expected_stage_blocks = _jenkins_stage_blocks(expected_jenkinsfile)
+
+    def exact_stage(name: str) -> tuple[int, str] | None:
+        entries = stage_blocks.get(name, [])
+        if len(entries) != 1:
+            mismatches.append(
+                {
+                    "path": f"jenkins.Jenkinsfile.stages.{name}",
+                    "expected": "exactly one executable stage",
+                    "received": len(entries),
+                }
+            )
+            return None
+        return entries[0]
+
+    ordered_names = [
+        "Checkout",
+        "Resolve Image Intent",
+        "Resolve Docker Template",
+        "Application Build",
+        "Test",
+        "Container Plan Validation",
+        "Build Once",
+        "Resolve Digest",
+        "Generate SBOM",
+        "Scan Same Digest",
+        "Produce Provenance",
+        "Verify Artifact Contract",
+        "Deploy Same Digest dev",
+        "Verify Rollout dev",
+        "Deploy Same Digest staging",
+        "Verify Rollout staging",
+    ]
+    if model.production_approval:
+        ordered_names.append("Production Approval")
+    ordered_names.extend(
+        ["Deploy Same Digest production", "Verify Rollout production"]
+    )
+    entries = {name: exact_stage(name) for name in ordered_names}
+    semantic_stage_paths = {
+        "Resolve Image Intent": "jenkins.Jenkinsfile.imageTagResolution",
+        "Resolve Docker Template": "jenkins.Jenkinsfile.dockerTemplateResolution",
+        "Container Plan Validation": "jenkins.Jenkinsfile.containerPlanValidation",
+        "Generate SBOM": "jenkins.Jenkinsfile.supplyChain.sbom",
+        "Scan Same Digest": "jenkins.Jenkinsfile.supplyChain.scan",
+        "Produce Provenance": "jenkins.Jenkinsfile.supplyChain.provenance",
+        "Production Approval": "jenkins.Jenkinsfile.productionApproval",
+    }
+    for name, path in semantic_stage_paths.items():
+        expected_blocks = expected_stage_blocks.get(name, [])
+        actual_blocks = stage_blocks.get(name, [])
+        expected_contents = [block for _, block in expected_blocks]
+        actual_contents = [block for _, block in actual_blocks]
+        if actual_contents != expected_contents:
+            mismatches.append(
+                {
+                    "path": path,
+                    "expected": (
+                        expected_contents[0]
+                        if len(expected_contents) == 1
+                        else len(expected_contents)
+                    ),
+                    "received": (
+                        actual_contents[0]
+                        if len(actual_contents) == 1
+                        else len(actual_contents)
+                    ),
+                }
+            )
+    positions = [entries[name][0] for name in ordered_names if entries[name] is not None]
+    if len(positions) == len(ordered_names) and positions != sorted(positions):
+        mismatches.append(
+            {
+                "path": "jenkins.Jenkinsfile.stageOrdering",
+                "expected": ordered_names,
+                "received": sorted(ordered_names, key=lambda name: entries[name][0]),
+            }
+        )
+    if not model.production_approval and stage_blocks.get("Production Approval"):
+        mismatches.append(
+            {
+                "path": "jenkins.Jenkinsfile.productionApproval",
+                "expected": "disabled",
+                "received": "generated",
+            }
+        )
+
+    routed_branches = tuple(
+        dict.fromkeys(
+            branch
+            for environment_name in ("dev", "staging", "production")
+            for branch in model.branch_environment_map[environment_name]
+        )
+    )
+    for name in (
+        "Build Once",
+        "Resolve Digest",
+        "Generate SBOM",
+        "Scan Same Digest",
+        "Produce Provenance",
+        "Verify Artifact Contract",
+    ):
+        entry = entries.get(name)
+        if entry is None:
+            continue
+        differs, received = _jenkins_route_mismatch(entry[1], routed_branches)
+        if differs:
+            mismatches.append(
+                {
+                    "path": f"jenkins.Jenkinsfile.branchRouting.{name}",
+                    "expected": {"branches": list(routed_branches), "comparator": "GLOB"},
+                    "received": received,
+                }
+            )
+
+    build_entry = entries.get("Build Once")
+    expected_build_blocks = expected_stage_blocks.get("Build Once", [])
+    actual_build_blocks = stage_blocks.get("Build Once", [])
+    if (
+        [block for _, block in actual_build_blocks]
+        != [block for _, block in expected_build_blocks]
+    ):
+        expected_binding = (
+            "withCredentials([usernamePassword(credentialsId: "
+            "env.REGISTRY_CREDENTIAL_ID, usernameVariable: 'REGISTRY_USER', "
+            "passwordVariable: 'REGISTRY_PASSWORD')]) {"
+        )
+        actual_binding_count = (
+            0 if build_entry is None else build_entry[1].count(expected_binding)
+        )
+        if actual_binding_count != 1:
+            mismatches.append(
+                {
+                    "path": "jenkins.Jenkinsfile.registryCredentialBinding",
+                    "expected": expected_binding,
+                    "received": actual_binding_count,
+                }
+            )
+    build_count = jenkinsfile.count("./generated/docker/build.sh --push")
+    load_count = jenkinsfile.count("./generated/docker/build.sh --load")
+    raw_build_count = len(
+        re.findall(r"(?m)(?<![A-Za-z0-9_-])docker\s+build(?:\s|$)|docker\s+buildx\s+build(?:\s|$)", jenkinsfile)
+    )
+    if (
+        build_entry is None
+        or build_entry[1].count("./generated/docker/build.sh --push") != 1
+        or "out/execution/build-invocation.json" not in build_entry[1]
+        or "BUILD_INVOKED_MORE_THAN_ONCE" not in build_entry[1]
+        or build_count != 1
+        or load_count != 0
+        or raw_build_count != 0
+    ):
+        mismatches.append(
+            {
+                "path": "jenkins.Jenkinsfile.buildOnce",
+                "expected": {
+                    "officialPushWrapperCount": 1,
+                    "loadCount": 0,
+                    "rawBuildCount": 0,
+                    "persistentInvocationMarker": True,
+                },
+                "received": {
+                    "officialPushWrapperCount": build_count,
+                    "loadCount": load_count,
+                    "rawBuildCount": raw_build_count,
+                    "persistentInvocationMarker": bool(
+                        build_entry
+                        and "out/execution/build-invocation.json" in build_entry[1]
+                    ),
+                },
+            }
+        )
+
+    resolve_entry = entries.get("Resolve Digest")
+    resolve_required = (
+        'docker buildx imagetools inspect --raw "$IMAGE_TAG_REF"',
+        "tag_recheck_digest=",
+        "Image tag moved while the registry digest was being resolved",
+        'env.IMAGE_REF = "${env.IMAGE_REPOSITORY}@${env.IMAGE_DIGEST}"',
+        "out/execution/artifact.json",
+        "manifestDigest: env.IMAGE_DIGEST",
+        "buildInvocationCount: 1",
+    )
+    if resolve_entry is None or any(
+        marker not in resolve_entry[1] for marker in resolve_required
+    ):
+        mismatches.append(
+            {
+                "path": "jenkins.Jenkinsfile.digestResolution",
+                "expected": list(resolve_required),
+                "received": None if resolve_entry is None else resolve_entry[1],
+            }
+        )
+    if resolve_entry is not None:
+        downstream = jenkinsfile[resolve_entry[0] :]
+        if (
+            "./generated/docker/build.sh --push" in downstream
+            or "./generated/docker/build.sh --load" in downstream
+            or re.search(r"docker\s+buildx\s+build(?:\s|$)", downstream)
+        ):
+            mismatches.append(
+                {
+                    "path": "jenkins.Jenkinsfile.downstreamRebuild",
+                    "expected": "no image build after digest resolution",
+                    "received": "build command found",
+                }
+            )
+
+    evidence_expectations = {
+        "Generate SBOM": (
+            bool(model.supply_chain.get("sbom", {}).get("enabled", False)),
+            'syft "$IMAGE_REF"',
+        ),
+        "Scan Same Digest": (
+            bool(model.supply_chain.get("scan", {}).get("enabled", False)),
+            'trivy image --format json --output out/supply-chain/vulnerabilities.json',
+        ),
+        "Produce Provenance": (
+            bool(model.supply_chain.get("provenance", {}).get("enabled", False)),
+            "subject: [[name: env.IMAGE_REPOSITORY, digest: [sha256: env.IMAGE_DIGEST.substring(7)]]]",
+        ),
+    }
+    for name, (enabled, marker) in evidence_expectations.items():
+        entry = entries.get(name)
+        received = 0 if entry is None else entry[1].count(marker)
+        if received != int(enabled):
+            mismatches.append(
+                {
+                    "path": f"jenkins.Jenkinsfile.evidence.{name}",
+                    "expected": {"enabled": enabled, "digestSubjectCount": int(enabled)},
+                    "received": received,
+                }
+            )
+    verify_entry = entries.get("Verify Artifact Contract")
+    expected_verify = "devops-stack artifact verify --artifact out/execution/artifact.json"
+    if verify_entry is None or verify_entry[1].count(expected_verify) != 1:
+        mismatches.append(
+            {
+                "path": "jenkins.Jenkinsfile.artifactVerification",
+                "expected": expected_verify,
+                "received": None if verify_entry is None else verify_entry[1],
+            }
+        )
+
+    for environment in model.environments:
+        deploy_name = f"Deploy Same Digest {environment.name}"
+        rollout_name = f"Verify Rollout {environment.name}"
+        deploy_entry = entries.get(deploy_name)
+        rollout_entry = entries.get(rollout_name)
+        branches = model.branch_environment_map[environment.name]
+        for name, entry in ((deploy_name, deploy_entry), (rollout_name, rollout_entry)):
+            if entry is None:
+                continue
+            differs, received = _jenkins_route_mismatch(entry[1], branches)
+            if differs:
+                mismatches.append(
+                    {
+                        "path": f"jenkins.Jenkinsfile.branchRouting.{name}",
+                        "expected": {"branches": list(branches), "comparator": "GLOB"},
+                        "received": received,
+                    }
+                )
+        deploy_markers = (
+            '"$IMAGE_REPOSITORY"@sha256:*',
+            'kustomize edit set image "$IMAGE_REPOSITORY=$IMAGE_REF"',
+            f'out/execution/rendered-{environment.name}.sha256',
+            'kubectl apply -f "$render_root/rendered.yaml"',
+        )
+        if deploy_entry is None or any(
+            marker not in deploy_entry[1] for marker in deploy_markers
+        ):
+            mismatches.append(
+                {
+                    "path": f"jenkins.Jenkinsfile.deployment.{environment.name}",
+                    "expected": list(deploy_markers),
+                    "received": None if deploy_entry is None else deploy_entry[1],
+                }
+            )
+        rollout_command = (
+            f"kubectl rollout status deployment/{model.service_name} "
+            f"--namespace {environment.namespace} --timeout=5m"
+        )
+        if rollout_entry is None or rollout_entry[1].count(rollout_command) != 1:
+            mismatches.append(
+                {
+                    "path": f"jenkins.Jenkinsfile.rollout.{environment.name}",
+                    "expected": rollout_command,
+                    "received": None if rollout_entry is None else rollout_entry[1],
+                }
+            )
+        rollback_command = (
+            f"kubectl rollout undo deployment/{model.service_name} "
+            f"--namespace {environment.namespace}"
+        )
+        rollback_count = sum(
+            entry[1].count(rollback_command)
+            for entry in (deploy_entry, rollout_entry)
+            if entry is not None
+        )
+        expected_rollback_count = 2 if environment.rollback.get("enabled", False) else 0
+        if rollback_count != expected_rollback_count:
+            mismatches.append(
+                {
+                    "path": f"jenkins.Jenkinsfile.rollback.{environment.name}",
+                    "expected": expected_rollback_count,
+                    "received": rollback_count,
+                }
+            )
+
+    job_dsl = artifacts["jenkins/job-dsl.groovy"]
+    for marker in (
+        f"multibranchPipelineJob({_groovy_literal(model.application_name)})",
+        "branchSources {",
+        "workflowBranchProjectFactory {",
+        "scriptPath('generated/jenkins/Jenkinsfile')",
+    ):
+        if marker not in job_dsl:
+            mismatches.append(
+                {
+                    "path": "jenkins.jobDsl",
+                    "expected": marker,
+                    "received": None,
+                }
+            )
+    return mismatches
+
+
 def _jenkins_artifact_mismatches(
     model: NormalizedDevOpsModel,
     result: AdapterResult,
 ) -> list[dict[str, Any]]:
+    if result.adapter_version == "2.0.0":
+        return _jenkins_v2_artifact_mismatches(model, result)
     artifacts = _artifact_map(result)
     required = ["jenkins/Jenkinsfile", "jenkins/job-dsl.groovy"] + [
         f"jenkins/environments/{environment.name}.json"

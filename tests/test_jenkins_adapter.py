@@ -10,10 +10,14 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from jsonschema import Draft7Validator
+
 from devops_stack_composer.adapters.jenkins import (
     JenkinsPipelineAdapter,
     _authenticated_push_script,
     _deployment_render_script,
+    _registry_authenticated_script,
+    _resolve_digest_script,
 )
 from devops_stack_composer.config import load_config
 from devops_stack_composer.model import normalize_config
@@ -195,30 +199,55 @@ class JenkinsAdapterTests(unittest.TestCase):
 
         jenkinsfile = result.artifact("jenkins/Jenkinsfile").content
         for stage in (
-            "Build",
+            "Checkout",
+            "Application Build",
             "Test",
+            "Resolve Image Intent",
             "Resolve Docker Template",
             "Container Plan Validation",
-            "Container Build",
-            "Supply Chain Scan",
-            "Registry Push",
-            "Deploy dev",
-            "Deploy staging",
+            "Build Once",
+            "Resolve Digest",
+            "Generate SBOM",
+            "Scan Same Digest",
+            "Produce Provenance",
+            "Verify Artifact Contract",
+            "Deploy Same Digest dev",
+            "Verify Rollout dev",
+            "Deploy Same Digest staging",
+            "Verify Rollout staging",
             "Production Approval",
-            "Deploy production",
+            "Deploy Same Digest production",
+            "Verify Rollout production",
         ):
             self.assertIn(f"stage('{stage}')", jenkinsfile)
 
         self.assertIn("sh './generated/docker/build.sh --validate'", jenkinsfile)
-        self.assertIn("./generated/docker/build.sh --load", jenkinsfile)
-        self.assertIn("./generated/docker/build.sh --push", jenkinsfile)
+        self.assertEqual(jenkinsfile.count("./generated/docker/build.sh --push"), 1)
+        self.assertNotIn("./generated/docker/build.sh --load", jenkinsfile)
         self.assertIn("devops-stack templates path docker", jenkinsfile)
         self.assertIn("syft \"$IMAGE_REF\"", jenkinsfile)
-        self.assertIn("trivy image --exit-code 1 --severity HIGH,CRITICAL", jenkinsfile)
+        self.assertIn(
+            "trivy image --format json --output out/supply-chain/vulnerabilities.json "
+            "--exit-code 1 --severity HIGH,CRITICAL",
+            jenkinsfile,
+        )
+        self.assertIn(
+            'env.IMAGE_REF = "${env.IMAGE_REPOSITORY}@${env.IMAGE_DIGEST}"',
+            jenkinsfile,
+        )
+        self.assertIn("out/execution/artifact.json", jenkinsfile)
+        self.assertIn(
+            "Image tag moved while the registry digest was being resolved",
+            jenkinsfile,
+        )
         self.assertNotIn("docker push \"$IMAGE_REF\"", jenkinsfile)
         self.assertLess(
-            jenkinsfile.index("stage('Supply Chain Scan')"),
-            jenkinsfile.index("stage('Registry Push')"),
+            jenkinsfile.index("stage('Build Once')"),
+            jenkinsfile.index("stage('Resolve Digest')"),
+        )
+        self.assertLess(
+            jenkinsfile.index("stage('Resolve Digest')"),
+            jenkinsfile.index("stage('Generate SBOM')"),
         )
         for environment in self.model.environments:
             self.assertIn(f'overlays/{environment.name}', jenkinsfile)
@@ -237,7 +266,7 @@ class JenkinsAdapterTests(unittest.TestCase):
             )
             self.assertIn(f"if (env.{rollout_flag} == 'true')", jenkinsfile)
         self.assertNotIn("kubectl apply -k generated/", jenkinsfile)
-        self.assertEqual(jenkinsfile.count("post {\n                failure {"), 3)
+        self.assertEqual(jenkinsfile.count("post {\n                failure {"), 6)
 
     def test_branch_routes_and_production_input_are_derived_from_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -245,7 +274,9 @@ class JenkinsAdapterTests(unittest.TestCase):
 
         jenkinsfile = result.artifact("jenkins/Jenkinsfile").content
         for environment, branches in self.model.branch_environment_map.items():
-            stage_start = jenkinsfile.index(f"stage('Deploy {environment}')")
+            stage_start = jenkinsfile.index(
+                f"stage('Deploy Same Digest {environment}')"
+            )
             stage_end = jenkinsfile.find("\n        stage(", stage_start + 1)
             stage = jenkinsfile[
                 stage_start : stage_end if stage_end != -1 else len(jenkinsfile)
@@ -264,7 +295,7 @@ class JenkinsAdapterTests(unittest.TestCase):
             jenkinsfile,
         )
         approval = jenkinsfile.index("stage('Production Approval')")
-        production = jenkinsfile.index("stage('Deploy production')")
+        production = jenkinsfile.index("stage('Deploy Same Digest production')")
         self.assertLess(approval, production)
 
     def test_registry_credential_is_referenced_by_id_without_a_value(self) -> None:
@@ -292,6 +323,7 @@ class JenkinsAdapterTests(unittest.TestCase):
                 (
                     "jenkins/Jenkinsfile",
                     "jenkins/job-dsl.groovy",
+                    "jenkins/artifact-contract.json",
                     "jenkins/README.md",
                     "jenkins/environments/dev.json",
                     "jenkins/environments/staging.json",
@@ -314,6 +346,22 @@ class JenkinsAdapterTests(unittest.TestCase):
         self.assertEqual(production["namespace"], "sample-api-production")
         self.assertEqual(production["branchPatterns"], ["main"])
         self.assertTrue(production["productionApproval"])
+        self.assertEqual(production["imageContract"], "resolved-digest")
+        self.assertFalse(production["mutableTagDeploymentAllowed"])
+
+        artifact_contract = json.loads(
+            result.artifact("jenkins/artifact-contract.json").content
+        )
+        contract_schema = json.loads(
+            (ROOT / "schemas" / "jenkins-artifact-contract.schema.json").read_text()
+        )
+        Draft7Validator.check_schema(contract_schema)
+        Draft7Validator(contract_schema).validate(artifact_contract)
+        self.assertEqual(
+            artifact_contract["build"]["maximumImageBuildInvocations"], 1
+        )
+        self.assertFalse(artifact_contract["jenkinsExecutionVerified"])
+        self.assertFalse(artifact_contract["deployment"]["mutableTagsAllowed"])
 
         boundary = result.artifact("jenkins/README.md").content
         self.assertIn("Job DSL", boundary)
@@ -555,7 +603,7 @@ class JenkinsAdapterTests(unittest.TestCase):
         self.assertEqual(result.diagnostics[0].status, ValidationStatus.FAILED.value)
         self.assertEqual(result.diagnostics[0].check, "jenkins_template_lock")
 
-    def test_multiarch_local_supply_chain_is_an_explicit_failed_capability(self) -> None:
+    def test_multiarch_supply_chain_uses_registry_digest_without_local_rebuild(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             result = self.render_without_validation(
                 make_source(Path(directory)),
@@ -567,7 +615,7 @@ class JenkinsAdapterTests(unittest.TestCase):
             for diagnostic in result.diagnostics
             if diagnostic.check == "jenkins_local_supply_chain_capability"
         )
-        self.assertEqual(capability.status, ValidationStatus.FAILED.value)
+        self.assertEqual(capability.status, ValidationStatus.PASSED.value)
         self.assertEqual(capability.details["architectures"], ["linux/amd64", "linux/arm64"])
         cache = next(
             diagnostic
@@ -576,13 +624,11 @@ class JenkinsAdapterTests(unittest.TestCase):
         )
         self.assertEqual(cache.status, ValidationStatus.FAILED.value)
         jenkinsfile = result.artifact("jenkins/Jenkinsfile").content
-        self.assertIn(
-            "Local SBOM and image scanning require exactly one configured architecture",
-            jenkinsfile,
-        )
         self.assertNotIn("docker/build.sh --load", jenkinsfile)
+        self.assertIn('syft "$IMAGE_REF"', jenkinsfile)
+        self.assertIn('trivy image --format json', jenkinsfile)
 
-    def test_single_platform_scans_local_image_before_official_push(self) -> None:
+    def test_single_platform_scans_resolved_digest_after_only_build(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             result = self.render_without_validation(make_source(Path(directory)))
 
@@ -593,20 +639,27 @@ class JenkinsAdapterTests(unittest.TestCase):
         )
         self.assertEqual(capability.status, ValidationStatus.PASSED.value)
         jenkinsfile = result.artifact("jenkins/Jenkinsfile").content
-        local_build = jenkinsfile.index("docker/build.sh --load")
+        push = jenkinsfile.index("docker/build.sh --push")
+        resolve = jenkinsfile.index("stage('Resolve Digest')")
         sbom = jenkinsfile.index('syft \"$IMAGE_REF\"')
         scan = jenkinsfile.index('trivy image')
-        push = jenkinsfile.index("docker/build.sh --push")
-        self.assertLess(local_build, sbom)
+        verify = jenkinsfile.index("stage('Verify Artifact Contract')")
+        self.assertLess(push, resolve)
+        self.assertLess(resolve, sbom)
         self.assertLess(sbom, scan)
-        self.assertLess(scan, push)
-        supply_start = jenkinsfile.index("stage('Supply Chain Scan')")
-        supply_end = jenkinsfile.index("stage('Registry Push')")
-        supply_stage = jenkinsfile[supply_start:supply_end]
-        self.assertIn("branch pattern: 'main', comparator: 'GLOB'", supply_stage)
+        self.assertLess(scan, verify)
+        self.assertEqual(jenkinsfile.count("docker/build.sh --push"), 1)
+        self.assertNotIn("docker/build.sh --load", jenkinsfile)
+        sbom_start = jenkinsfile.index("stage('Generate SBOM')")
+        sbom_end = jenkinsfile.index("stage('Scan Same Digest')")
+        sbom_stage = jenkinsfile[sbom_start:sbom_end]
+        self.assertIn("branch pattern: 'main', comparator: 'GLOB'", sbom_stage)
 
     def test_generated_shell_fragments_are_syntactically_valid(self) -> None:
-        scripts = [_authenticated_push_script()]
+        scripts = [
+            _authenticated_push_script(),
+            _registry_authenticated_script(_resolve_digest_script()),
+        ]
         scripts.extend(
             _deployment_render_script(self.executable_model, environment)
             for environment in self.executable_model.environments

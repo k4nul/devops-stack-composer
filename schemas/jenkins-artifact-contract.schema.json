@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/k4nul/devops-stack-composer/schemas/jenkins-artifact-contract.schema.json",
+  "title": "Generated Jenkins immutable artifact contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "verificationScope", "jenkinsExecutionVerified", "build", "identity", "evidence", "deployment"],
+  "properties": {
+    "schemaVersion": {"const": "jenkins-artifact-contract-v1"},
+    "verificationScope": {"const": "generated-static-plan-only"},
+    "jenkinsExecutionVerified": {"const": false},
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maximumImageBuildInvocations", "command", "marker"],
+      "properties": {
+        "maximumImageBuildInvocations": {"const": 1},
+        "command": {"const": "./generated/docker/build.sh --push"},
+        "marker": {"const": "out/execution/build-invocation.json"}
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["intentEnvironment", "digestEnvironment", "immutableReferenceEnvironment", "artifact", "requiredReferenceForm"],
+      "properties": {
+        "intentEnvironment": {"const": "IMAGE_TAG_REF"},
+        "digestEnvironment": {"const": "IMAGE_DIGEST"},
+        "immutableReferenceEnvironment": {"const": "IMAGE_REF"},
+        "artifact": {"const": "out/execution/artifact.json"},
+        "requiredReferenceForm": {"type": "string", "pattern": "^[^@]+@sha256:<64-lowercase-hex>$"}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sbom", "vulnerabilityReport", "provenance", "provenanceVerification"],
+      "properties": {
+        "sbom": {"const": "out/supply-chain/sbom.json"},
+        "vulnerabilityReport": {"const": "out/supply-chain/vulnerabilities.json"},
+        "provenance": {"const": "out/supply-chain/provenance.json"},
+        "provenanceVerification": {"const": "unsigned-unattached-file-only"}
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["imageSource", "mutableTagsAllowed", "rollbackRebuildAllowed"],
+      "properties": {
+        "imageSource": {"const": "out/execution/artifact.json#immutableImageReference"},
+        "mutableTagsAllowed": {"const": false},
+        "rollbackRebuildAllowed": {"const": false}
+      }
+    }
+  }
+}

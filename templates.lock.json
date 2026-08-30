@@ -17,7 +17,7 @@
       "name": "jenkins-pipeline-template",
       "repository": "https://github.com/k4nul/jenkins-pipeline-template.git",
       "commit": "e71cd88365484d9aba464db084437276d98ff0e0",
-      "adapterVersion": "1.0.0",
+      "adapterVersion": "2.0.0",
       "schemaVersion": "jenkins-plan-json-v1",
       "checkedAt": "2026-08-30",
       "license": {

@@ -563,7 +563,7 @@ def result(adapter: str, contract: dict, model) -> AdapterResult:
         raise ValueError(f"unsupported validation fixture adapter: {adapter}")
     return AdapterResult(
         adapter=adapter,
-        adapter_version="1.0.0",
+        adapter_version=rendered.adapter_version,
         template_commit=source.commit or "unknown",
         artifacts=rendered.artifacts,
         contract=contract,
@@ -1288,7 +1288,7 @@ class CrossProjectValidationTests(unittest.TestCase):
                 "branch-routing",
                 "branch pattern: 'develop', comparator: 'GLOB'",
                 "branch pattern: 'unrouted', comparator: 'GLOB'",
-                "jenkins.Jenkinsfile.branchRouting.Container Build",
+                "jenkins.Jenkinsfile.branchRouting.Build Once",
             ),
             (
                 "credential-id",
@@ -1322,14 +1322,16 @@ class CrossProjectValidationTests(unittest.TestCase):
             ),
             (
                 "scan",
-                'trivy image --exit-code 1 --severity HIGH,CRITICAL "$IMAGE_REF"',
-                'trivy image --exit-code 0 --severity CRITICAL "$IMAGE_REF"',
+                "trivy image --format json --output out/supply-chain/vulnerabilities.json "
+                '--exit-code 1 --severity HIGH,CRITICAL "$IMAGE_REF"',
+                "trivy image --format json --output out/supply-chain/vulnerabilities.json "
+                '--exit-code 0 --severity CRITICAL "$IMAGE_REF"',
                 "jenkins.Jenkinsfile.supplyChain.scan",
             ),
             (
                 "provenance",
-                "Provenance mode max is delegated to docker/build.sh.",
-                "Provenance mode min is delegated to docker/build.sh.",
+                "subject: [[name: env.IMAGE_REPOSITORY, digest: [sha256: env.IMAGE_DIGEST.substring(7)]]],",
+                "subject: [[name: env.IMAGE_REPOSITORY, digest: [sha256: '0' * 64]]],",
                 "jenkins.Jenkinsfile.supplyChain.provenance",
             ),
         )
@@ -1379,7 +1381,7 @@ class CrossProjectValidationTests(unittest.TestCase):
                 "rollout-status",
                 "sh 'kubectl rollout status deployment/sample-api --namespace sample-api-dev --timeout=5m'",
                 "echo 'rollout assumed healthy'",
-                "jenkins.Jenkinsfile.deployment.dev",
+                "jenkins.Jenkinsfile.rollout.dev",
             ),
         )
         for name, original, replacement, expected_path in cases:
@@ -1786,10 +1788,7 @@ class CrossProjectValidationTests(unittest.TestCase):
             if item.check == "contract.jenkins.artifacts"
         )
         self.assertEqual(baseline_check.status, ValidationStatus.PASSED)
-        disabled_echo = (
-            "sh 'echo \\'Supply-chain checks are disabled by the normalized model.\\''"
-        )
-        production_marker = "        stage('Deploy production') {"
+        production_marker = "        stage('Deploy Same Digest production') {"
         unexpected_approval = "\n".join(
             (
                 "        stage('Production Approval') {",
@@ -1811,20 +1810,20 @@ class CrossProjectValidationTests(unittest.TestCase):
         cases = (
             (
                 "sbom",
-                disabled_echo,
+                "echo 'SBOM generation is disabled by the normalized model.'",
                 'sh \'syft "$IMAGE_REF" -o spdx-json=out/supply-chain/sbom.json\'',
                 "jenkins.Jenkinsfile.supplyChain.sbom",
             ),
             (
                 "scan",
-                disabled_echo,
-                'sh \'trivy image --exit-code 1 --severity HIGH,CRITICAL "$IMAGE_REF"\'',
+                "echo 'Vulnerability scanning is disabled by the normalized model.'",
+                'sh \'trivy image --format json --output out/supply-chain/vulnerabilities.json --exit-code 1 --severity HIGH,CRITICAL "$IMAGE_REF"\'',
                 "jenkins.Jenkinsfile.supplyChain.scan",
             ),
             (
                 "provenance",
-                disabled_echo,
-                "sh 'echo \\'Provenance mode max is delegated to docker/build.sh.\\''",
+                "echo 'Provenance generation is disabled by the normalized model.'",
+                "sh 'echo unsafe provenance'",
                 "jenkins.Jenkinsfile.supplyChain.provenance",
             ),
             (

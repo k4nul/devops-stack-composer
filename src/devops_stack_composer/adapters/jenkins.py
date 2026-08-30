@@ -25,7 +25,7 @@ from devops_stack_composer.sources import SourceResolution
 from devops_stack_composer.validation import ValidationStatus
 
 
-ADAPTER_VERSION = "1.0.0"
+ADAPTER_VERSION = "2.0.0"
 GENERATED_ROOT = "generated"
 MAX_UPSTREAM_JSON_BYTES = 256 * 1024
 MAX_UPSTREAM_ENTRIES = 1000
@@ -90,22 +90,23 @@ def _deployment_render_script(
 ) -> str:
     return f'''set -eu
 case "${{IMAGE_REF:-}}" in
-  "$IMAGE_REPOSITORY":*)
-    image_tag=${{IMAGE_REF#"$IMAGE_REPOSITORY":}}
+  "$IMAGE_REPOSITORY"@sha256:*)
+    image_digest=${{IMAGE_REF#"$IMAGE_REPOSITORY"@}}
     ;;
   *)
-    printf '%s\n' 'IMAGE_REF must use IMAGE_REPOSITORY and a concrete tag resolved by Jenkins' >&2
+    printf '%s\n' 'IMAGE_REF must use IMAGE_REPOSITORY@sha256:<digest>' >&2
     exit 2
     ;;
 esac
-case "$image_tag" in
-  ''|{'__IMAGE_TAG__'}|.*|-*|*[!A-Za-z0-9_.-]*)
-    printf '%s\n' 'IMAGE_REF contains an invalid or unresolved Docker tag' >&2
+image_digest_hex=${{image_digest#sha256:}}
+case "$image_digest_hex" in
+  ''|*[!0-9a-f]*)
+    printf '%s\n' 'IMAGE_REF contains an invalid OCI digest' >&2
     exit 2
     ;;
 esac
-if [ "${{#image_tag}}" -gt 128 ]; then
-  printf '%s\n' 'IMAGE_REF tag must be 128 characters or fewer' >&2
+if [ "${{#image_digest_hex}}" -ne 64 ]; then
+  printf '%s\n' 'IMAGE_REF digest must contain 64 lowercase hexadecimal characters' >&2
   exit 2
 fi
 render_root=$(mktemp -d "${{TMPDIR:-/tmp}}/devops-stack-kustomize.XXXXXX")
@@ -121,9 +122,16 @@ overlay="$render_root/k8s/overlays/{environment.name}"
 )
 kustomize build "$overlay" > "$render_root/rendered.yaml"
 if grep -F '__IMAGE_TAG__' "$render_root/rendered.yaml" >/dev/null; then
-  printf '%s\n' 'Rendered Kubernetes manifests still contain an unresolved image tag' >&2
+  printf '%s\n' 'Rendered Kubernetes manifests still contain an unresolved image placeholder' >&2
   exit 2
 fi
+if ! grep -F "image: $IMAGE_REF" "$render_root/rendered.yaml" >/dev/null; then
+  printf '%s\n' 'Rendered Kubernetes manifests do not contain the resolved immutable image' >&2
+  exit 2
+fi
+mkdir -p out/execution
+cp "$render_root/rendered.yaml" "out/execution/rendered-{environment.name}.yaml"
+sha256sum "out/execution/rendered-{environment.name}.yaml" > "out/execution/rendered-{environment.name}.sha256"
 set +e
 apply_output=$(kubectl apply -f "$render_root/rendered.yaml")
 apply_status=$?
@@ -142,11 +150,7 @@ def _deployment_stage_lines(
     environment: EnvironmentModel,
 ) -> list[str]:
     rollout_flag = f"DEPLOY_{environment.name.upper()}_ROLLOUT_STARTED"
-    rollout_command = (
-        f"kubectl rollout status deployment/{model.service_name} "
-        f"--namespace {environment.namespace} --timeout=5m"
-    )
-    lines = [f"        stage('Deploy {environment.name}') {{"]
+    lines = [f"        stage('Deploy Same Digest {environment.name}') {{"]
     lines.extend(
         _branch_when_lines(model.branch_environment_map[environment.name], "            ")
     )
@@ -164,7 +168,6 @@ def _deployment_stage_lines(
             "                    if (deploymentParts[1] != '0') {",
             "                        error('kubectl apply failed after rollout-state detection.')",
             "                    }",
-            f"                    sh {_groovy_string(rollout_command)}",
             "                }",
             "            }",
             "            post {",
@@ -198,12 +201,62 @@ def _deployment_stage_lines(
     return lines
 
 
-def _image_tag_stage_lines(model: NormalizedDevOpsModel) -> list[str]:
+def _rollout_stage_lines(
+    model: NormalizedDevOpsModel,
+    environment: EnvironmentModel,
+) -> list[str]:
+    rollout_flag = f"DEPLOY_{environment.name.upper()}_ROLLOUT_STARTED"
+    rollout_command = (
+        f"kubectl rollout status deployment/{model.service_name} "
+        f"--namespace {environment.namespace} --timeout=5m"
+    )
+    lines = [f"        stage('Verify Rollout {environment.name}') {{"]
+    lines.extend(
+        _branch_when_lines(model.branch_environment_map[environment.name], "            ")
+    )
+    lines.extend(
+        [
+            "            steps {",
+            f"                sh {_groovy_string(rollout_command)}",
+            "            }",
+            "            post {",
+            "                failure {",
+        ]
+    )
+    if environment.rollback.get("enabled", False):
+        lines.extend(
+            [
+                "                    script {",
+                f"                        if (env.{rollout_flag} == 'true') {{",
+                f"                            sh {_groovy_string(_rollback_command(model, environment))}",
+                "                        } else {",
+                f"                            echo {_groovy_string(f'Rollback skipped for {environment.name}: apply did not start a rollout.')}",
+                "                        }",
+                "                    }",
+            ]
+        )
+    else:
+        lines.append(
+            f"                    echo {_groovy_string(f'Rollback is disabled for {environment.name}.')}"
+        )
+    lines.extend(
+        [
+            "                }",
+            "            }",
+            "        }",
+            "",
+        ]
+    )
+    return lines
+
+
+def _image_intent_stage_lines(model: NormalizedDevOpsModel) -> list[str]:
     lines = [
-        "        stage('Resolve Image Tag') {",
+        "        stage('Resolve Image Intent') {",
         "            steps {",
         "                script {",
-        "                    env.GIT_COMMIT_SHA = sh(script: 'git rev-parse --short=12 HEAD', returnStdout: true).trim()",
+        "                    env.SOURCE_REVISION = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()",
+        "                    env.GIT_COMMIT_SHA = env.SOURCE_REVISION.take(12)",
     ]
     if model.image_tag_strategy == "fixed":
         lines.append(f"                    env.IMAGE_TAG = {_groovy_string(model.image_tag)}")
@@ -232,8 +285,8 @@ def _image_tag_stage_lines(model: NormalizedDevOpsModel) -> list[str]:
             "                    if (!(env.IMAGE_TAG ==~ /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/) || env.IMAGE_TAG == '__IMAGE_TAG__') {",
             "                        error('Resolved image tag is not Docker-safe.')",
             "                    }",
-            '                    env.IMAGE_REF = "${env.IMAGE_REPOSITORY}:${env.IMAGE_TAG}"',
-            '                    env.OCI_REVISION = "${env.GIT_COMMIT_SHA}"',
+            '                    env.IMAGE_TAG_REF = "${env.IMAGE_REPOSITORY}:${env.IMAGE_TAG}"',
+            '                    env.OCI_REVISION = "${env.SOURCE_REVISION}"',
             "                    env.OCI_CREATED = sh(script: 'git show -s --format=%cI HEAD', returnStdout: true).trim()",
             "                }",
             "            }",
@@ -254,52 +307,245 @@ def _scan_severities(fail_on: str) -> str:
     return thresholds.get(fail_on.lower(), fail_on.upper())
 
 
-def _supply_chain_lines(
+def _registry_authenticated_script(command: str) -> str:
+    return f"""set +x
+set -eu
+docker_config=$(mktemp -d "${{TMPDIR:-/tmp}}/devops-stack-docker-config.XXXXXX")
+export DOCKER_CONFIG="$docker_config"
+cleanup() {{
+  docker logout "$IMAGE_REGISTRY" >/dev/null 2>&1 || true
+  rm -rf "$docker_config"
+}}
+trap cleanup EXIT HUP INT TERM
+printf '%s' "$REGISTRY_PASSWORD" | docker login "$IMAGE_REGISTRY" --username "$REGISTRY_USER" --password-stdin >/dev/null
+{command}"""
+
+
+def _credential_step_lines(command: str, *, indent: str = "                ") -> list[str]:
+    return [
+        f"{indent}withCredentials([usernamePassword(credentialsId: env.REGISTRY_CREDENTIAL_ID, usernameVariable: 'REGISTRY_USER', passwordVariable: 'REGISTRY_PASSWORD')]) {{",
+        f"{indent}    sh {_groovy_string(_registry_authenticated_script(command))}",
+        f"{indent}}}",
+    ]
+
+
+def _resolve_digest_script() -> str:
+    return r"""mkdir -p out/execution
+manifest_path=out/execution/registry-manifest.json
+verify_path=out/execution/registry-manifest-verified.json
+tag_recheck_path=out/execution/registry-manifest-tag-recheck.json
+docker buildx imagetools inspect --raw "$IMAGE_TAG_REF" > "$manifest_path"
+image_digest="sha256:$(sha256sum "$manifest_path" | awk '{print $1}')"
+digest_hex=${image_digest#sha256:}
+case "$digest_hex" in
+  ''|*[!0-9a-f]*)
+    printf '%s\n' 'Registry returned an invalid OCI manifest digest' >&2
+    exit 2
+    ;;
+esac
+if [ "${#digest_hex}" -ne 64 ]; then
+  printf '%s\n' 'Registry returned an invalid OCI manifest digest length' >&2
+  exit 2
+fi
+docker buildx imagetools inspect --raw "$IMAGE_REPOSITORY@$image_digest" > "$verify_path"
+verified_digest="sha256:$(sha256sum "$verify_path" | awk '{print $1}')"
+if [ "$verified_digest" != "$image_digest" ]; then
+  printf '%s\n' 'Digest re-resolution did not match the pushed manifest' >&2
+  exit 2
+fi
+docker buildx imagetools inspect --raw "$IMAGE_TAG_REF" > "$tag_recheck_path"
+tag_recheck_digest="sha256:$(sha256sum "$tag_recheck_path" | awk '{print $1}')"
+if [ "$tag_recheck_digest" != "$image_digest" ]; then
+  printf '%s\n' 'Image tag moved while the registry digest was being resolved' >&2
+  exit 2
+fi
+printf '%s' "$image_digest"
+"""
+
+
+def _resolve_digest_stage_lines(routed_branches: tuple[str, ...]) -> list[str]:
+    lines = ["        stage('Resolve Digest') {"]
+    lines.extend(_branch_when_lines(routed_branches, "            "))
+    lines.extend(["            steps {", "                script {"])
+    lines.extend(
+        [
+            "                    withCredentials([usernamePassword(credentialsId: env.REGISTRY_CREDENTIAL_ID, usernameVariable: 'REGISTRY_USER', passwordVariable: 'REGISTRY_PASSWORD')]) {",
+            "                        env.IMAGE_DIGEST = sh(script: "
+            + _groovy_string(_registry_authenticated_script(_resolve_digest_script()))
+            + ", returnStdout: true).trim()",
+            "                    }",
+            "                    if (!(env.IMAGE_DIGEST ==~ /^sha256:[0-9a-f]{64}$/)) {",
+            "                        error('Resolved registry digest is not a lowercase SHA-256 value.')",
+            "                    }",
+            '                    env.IMAGE_REF = "${env.IMAGE_REPOSITORY}@${env.IMAGE_DIGEST}"',
+            "                    env.EVIDENCE_CREATED = sh(script: 'date -u +%Y-%m-%dT%H:%M:%SZ', returnStdout: true).trim()",
+            "                    env.BUILD_PLAN_HASH = sh(script: \"sha256sum generated/docker/metadata.json | awk '{print \\$1}'\", returnStdout: true).trim()",
+            "                    if (!(env.BUILD_PLAN_HASH ==~ /^[0-9a-f]{64}$/)) {",
+            "                        error('Generated Docker metadata hash is not a lowercase SHA-256 value.')",
+            "                    }",
+            "                    Map artifactContract = [",
+            "                        schemaVersion: 'jenkins-artifact-v1',",
+            "                        repository: env.IMAGE_REPOSITORY,",
+            "                        tag: env.IMAGE_TAG,",
+            "                        tagReference: env.IMAGE_TAG_REF,",
+            "                        manifestDigest: env.IMAGE_DIGEST,",
+            "                        immutableImageReference: env.IMAGE_REF,",
+            "                        sourceRevision: env.SOURCE_REVISION,",
+            "                        buildPlanHash: env.BUILD_PLAN_HASH,",
+            "                        buildInvocationCount: 1,",
+            "                        verificationStatus: 'RESOLVED_UNVERIFIED'",
+            "                    ]",
+            "                    writeFile file: 'out/execution/artifact.json', text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(artifactContract)) + '\\n'",
+            "                }",
+            "                archiveArtifacts artifacts: 'out/execution/artifact.json,out/execution/build-invocation.json,out/execution/registry-manifest*.json', fingerprint: true, onlyIfSuccessful: true",
+            "            }",
+            "        }",
+            "",
+        ]
+    )
+    return lines
+
+
+def _generate_sbom_stage_lines(
     model: NormalizedDevOpsModel,
     routed_branches: tuple[str, ...],
 ) -> list[str]:
-    commands: list[str] = []
     sbom = model.supply_chain.get("sbom", {})
-    scan = model.supply_chain.get("scan", {})
-    provenance = model.supply_chain.get("provenance", {})
-
-    if sbom.get("enabled", False):
-        output_format = str(sbom.get("format", "spdx-json"))
-        commands.append(
-            "mkdir -p out/supply-chain && "
-            f"syft \"$IMAGE_REF\" -o {output_format}=out/supply-chain/sbom.json"
-        )
-    if scan.get("enabled", False):
-        fail_on = str(scan.get("failOn", "high"))
-        severities = (
-            "LOW,MEDIUM,HIGH,CRITICAL" if fail_on == "never" else _scan_severities(fail_on)
-        )
-        exit_code = 0 if fail_on == "never" else 1
-        commands.append(
-            f'trivy image --exit-code {exit_code} --severity {severities} "$IMAGE_REF"'
-        )
-    if provenance.get("enabled", False):
-        mode = str(provenance.get("mode", "max"))
-        commands.append(
-            f"echo 'Provenance mode {mode} is delegated to docker/build.sh.'"
-        )
-    if not commands:
-        commands.append("echo 'Supply-chain checks are disabled by the normalized model.'")
-
-    lines = [
-        "        stage('Supply Chain Scan') {",
-    ]
+    enabled = bool(sbom.get("enabled", False))
+    output_format = str(sbom.get("format", "spdx-json"))
+    output_path = "out/supply-chain/sbom.json"
+    command = (
+        "mkdir -p out/supply-chain && "
+        f"syft \"$IMAGE_REF\" -o {output_format}={output_path}"
+    )
+    lines = ["        stage('Generate SBOM') {"]
     lines.extend(_branch_when_lines(routed_branches, "            "))
     lines.append("            steps {")
-    lines.extend(f"                sh {_groovy_string(command)}" for command in commands)
-    if sbom.get("enabled", False):
+    if enabled:
+        lines.extend(_credential_step_lines(command))
         lines.extend(
             [
-                "                archiveArtifacts artifacts: 'out/supply-chain/sbom.json', fingerprint: true, onlyIfSuccessful: true",
+                "                script {",
+                f"                    Map sbomDocument = new groovy.json.JsonSlurperClassic().parseText(readFile({_groovy_string(output_path)}))",
             ]
         )
+        if output_format == "spdx-json":
+            lines.extend(
+                [
+                    "                    List annotations = sbomDocument.annotations instanceof List ? sbomDocument.annotations : []",
+                    "                    annotations.add([annotationDate: env.EVIDENCE_CREATED, annotationType: 'OTHER', annotator: 'Tool: devops-stack-composer-0.2.0', comment: \"devops-stack.io/subject=${env.IMAGE_REF}\"])",
+                    "                    sbomDocument.annotations = annotations",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "                    List properties = sbomDocument.properties instanceof List ? sbomDocument.properties : []",
+                    "                    properties.add([name: 'devops-stack.io/subject', value: env.IMAGE_REF])",
+                    "                    sbomDocument.properties = properties",
+                ]
+            )
+        lines.extend(
+            [
+                f"                    writeFile file: {_groovy_string(output_path)}, text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(sbomDocument)) + '\\n'",
+                "                }",
+                f"                archiveArtifacts artifacts: {_groovy_string(output_path)}, fingerprint: true, onlyIfSuccessful: true",
+            ]
+        )
+    else:
+        lines.append("                echo 'SBOM generation is disabled by the normalized model.'")
+    lines.extend(["            }", "        }", ""])
+    return lines
+
+
+def _scan_stage_lines(
+    model: NormalizedDevOpsModel,
+    routed_branches: tuple[str, ...],
+) -> list[str]:
+    scan = model.supply_chain.get("scan", {})
+    enabled = bool(scan.get("enabled", False))
+    fail_on = str(scan.get("failOn", "high"))
+    severities = (
+        "LOW,MEDIUM,HIGH,CRITICAL" if fail_on == "never" else _scan_severities(fail_on)
+    )
+    exit_code = 0 if fail_on == "never" else 1
+    output_path = "out/supply-chain/vulnerabilities.json"
+    command = (
+        "mkdir -p out/supply-chain && "
+        f"trivy image --format json --output {output_path} --exit-code {exit_code} "
+        f"--severity {severities} \"$IMAGE_REF\""
+    )
+    lines = ["        stage('Scan Same Digest') {"]
+    lines.extend(_branch_when_lines(routed_branches, "            "))
+    lines.append("            steps {")
+    if enabled:
+        lines.extend(_credential_step_lines(command))
+        lines.append(
+            f"                archiveArtifacts artifacts: {_groovy_string(output_path)}, fingerprint: true, onlyIfSuccessful: true"
+        )
+    else:
+        lines.append("                echo 'Vulnerability scanning is disabled by the normalized model.'")
+    lines.extend(["            }", "        }", ""])
+    return lines
+
+
+def _provenance_stage_lines(
+    model: NormalizedDevOpsModel,
+    routed_branches: tuple[str, ...],
+) -> list[str]:
+    provenance = model.supply_chain.get("provenance", {})
+    enabled = bool(provenance.get("enabled", False))
+    lines = ["        stage('Produce Provenance') {"]
+    lines.extend(_branch_when_lines(routed_branches, "            "))
+    lines.append("            steps {")
+    if enabled:
+        lines.extend(
+            [
+                "                script {",
+                "                    Map statement = [",
+                "                        _type: 'https://in-toto.io/Statement/v1',",
+                "                        subject: [[name: env.IMAGE_REPOSITORY, digest: [sha256: env.IMAGE_DIGEST.substring(7)]]],",
+                "                        predicateType: 'https://slsa.dev/provenance/v1',",
+                "                        predicate: [",
+                "                            buildDefinition: [",
+                "                                buildType: 'https://github.com/k4nul/devops-stack-composer/build-types/build-once/v0.2',",
+                "                                externalParameters: [artifactReference: env.IMAGE_REF, sourceRevision: env.SOURCE_REVISION, buildPlanHash: env.BUILD_PLAN_HASH],",
+                "                                internalParameters: [:],",
+                "                                resolvedDependencies: [[name: 'source', digest: [gitCommit: env.SOURCE_REVISION]], [name: 'build-plan', digest: [sha256: env.BUILD_PLAN_HASH]]]",
+                "                            ],",
+                "                            runDetails: [builder: [id: 'https://www.jenkins.io/', version: ['devops-stack-composer': '0.2.0']], metadata: [:], byproducts: []],",
+                "                            devopsStack_fileEvidence: [mode: 'file-only', generatedAt: env.EVIDENCE_CREATED, signatureGenerated: false, signatureVerified: false, attachedToRegistry: false, cryptographicallyVerified: false, checksumIsSignature: false]",
+                "                        ]",
+                "                    ]",
+                "                    writeFile file: 'out/supply-chain/provenance.json', text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(statement)) + '\\n'",
+                "                }",
+                "                archiveArtifacts artifacts: 'out/supply-chain/provenance.json', fingerprint: true, onlyIfSuccessful: true",
+            ]
+        )
+    else:
+        lines.append("                echo 'Provenance generation is disabled by the normalized model.'")
+    lines.extend(["            }", "        }", ""])
+    return lines
+
+
+def _verify_artifact_stage_lines(
+    model: NormalizedDevOpsModel,
+    routed_branches: tuple[str, ...],
+) -> list[str]:
+    arguments = ["--artifact out/execution/artifact.json"]
+    if model.supply_chain.get("sbom", {}).get("enabled", False):
+        arguments.append("--sbom out/supply-chain/sbom.json")
+    if model.supply_chain.get("scan", {}).get("enabled", False):
+        arguments.append("--scan out/supply-chain/vulnerabilities.json")
+    if model.supply_chain.get("provenance", {}).get("enabled", False):
+        arguments.append("--provenance out/supply-chain/provenance.json")
+    command = "devops-stack artifact verify " + " ".join(arguments)
+    lines = ["        stage('Verify Artifact Contract') {"]
+    lines.extend(_branch_when_lines(routed_branches, "            "))
     lines.extend(
         [
+            "            steps {",
+            f"                sh {_groovy_string(command)}",
             "            }",
             "        }",
             "",
@@ -329,17 +575,15 @@ def _docker_template_stage_lines() -> list[str]:
 
 
 def _authenticated_push_script() -> str:
-    return f"""set +x
-set -eu
-docker_config=$(mktemp -d "${{TMPDIR:-/tmp}}/devops-stack-docker-config.XXXXXX")
-export DOCKER_CONFIG="$docker_config"
-cleanup() {{
-  docker logout "$IMAGE_REGISTRY" >/dev/null 2>&1 || true
-  rm -rf "$docker_config"
-}}
-trap cleanup EXIT HUP INT TERM
-printf '%s' "$REGISTRY_PASSWORD" | docker login "$IMAGE_REGISTRY" --username "$REGISTRY_USER" --password-stdin
+    return _registry_authenticated_script(
+        f"""mkdir -p out/execution
+if [ -e out/execution/build-invocation.json ]; then
+  printf '%s\n' 'BUILD_INVOKED_MORE_THAN_ONCE: build marker already exists' >&2
+  exit 2
+fi
+printf '%s\n' '{{"buildInvocationCount":1}}' > out/execution/build-invocation.json
 ./{GENERATED_ROOT}/docker/build.sh --push"""
+    )
 
 
 def _render_jenkinsfile(model: NormalizedDevOpsModel) -> str:
@@ -350,18 +594,16 @@ def _render_jenkinsfile(model: NormalizedDevOpsModel) -> str:
             for branch in model.branch_environment_map[environment]
         )
     )
-    local_supply_chain_requested = bool(
-        model.supply_chain.get("sbom", {}).get("enabled", False)
-        or model.supply_chain.get("scan", {}).get("enabled", False)
-    )
     lines = [
         "// Generated by devops-stack-composer. Do not store credential values here.",
+        "// Static Jenkins contract only: controller-backed execution is not verified in v0.2.0.",
         "pipeline {",
         "    agent any",
         "",
         "    options {",
         "        timestamps()",
         "        disableConcurrentBuilds()",
+        "        skipDefaultCheckout(true)",
         "    }",
     ]
     if model.image_tag_strategy == "semver":
@@ -385,11 +627,23 @@ def _render_jenkinsfile(model: NormalizedDevOpsModel) -> str:
             "    stages {",
         ]
     )
-    lines.extend(_image_tag_stage_lines(model))
+    lines.extend(
+        [
+            "        stage('Checkout') {",
+            "            steps {",
+            "                deleteDir()",
+            "                checkout scm",
+            "                sh 'mkdir -p out/execution out/supply-chain'",
+            "            }",
+            "        }",
+            "",
+        ]
+    )
+    lines.extend(_image_intent_stage_lines(model))
     lines.extend(_docker_template_stage_lines())
     lines.extend(
         [
-            "        stage('Build') {",
+            "        stage('Application Build') {",
             "            steps {",
             f"                sh {_groovy_string(model.build_command)}",
             "            }",
@@ -409,22 +663,7 @@ def _render_jenkinsfile(model: NormalizedDevOpsModel) -> str:
             "",
         ]
     )
-    lines.append("        stage('Container Build') {")
-    lines.extend(_branch_when_lines(all_branches, "            "))
-    lines.append("            steps {")
-    if local_supply_chain_requested and len(model.architectures) == 1:
-        lines.append(f"                sh './{GENERATED_ROOT}/docker/build.sh --load'")
-    elif local_supply_chain_requested:
-        lines.append(
-            "                error('Local SBOM and image scanning require exactly one configured architecture before registry publication.')"
-        )
-    else:
-        lines.append(
-            "                echo 'Local image build is not required because local SBOM and image scanning are disabled.'"
-        )
-    lines.extend(["            }", "        }", ""])
-    lines.extend(_supply_chain_lines(model, all_branches))
-    lines.extend(["        stage('Registry Push') {"])
+    lines.append("        stage('Build Once') {")
     lines.extend(_branch_when_lines(all_branches, "            "))
     lines.extend(
         [
@@ -437,8 +676,15 @@ def _render_jenkinsfile(model: NormalizedDevOpsModel) -> str:
             "",
         ]
     )
+    lines.extend(_resolve_digest_stage_lines(all_branches))
+    lines.extend(_generate_sbom_stage_lines(model, all_branches))
+    lines.extend(_scan_stage_lines(model, all_branches))
+    lines.extend(_provenance_stage_lines(model, all_branches))
+    lines.extend(_verify_artifact_stage_lines(model, all_branches))
     lines.extend(_deployment_stage_lines(model, model.environment("dev")))
+    lines.extend(_rollout_stage_lines(model, model.environment("dev")))
     lines.extend(_deployment_stage_lines(model, model.environment("staging")))
+    lines.extend(_rollout_stage_lines(model, model.environment("staging")))
 
     if model.production_approval:
         lines.append("        stage('Production Approval') {")
@@ -458,6 +704,7 @@ def _render_jenkinsfile(model: NormalizedDevOpsModel) -> str:
         )
 
     lines.extend(_deployment_stage_lines(model, model.environment("production")))
+    lines.extend(_rollout_stage_lines(model, model.environment("production")))
     lines.extend(
         [
             "    }",
@@ -536,6 +783,11 @@ def _render_boundary(model: NormalizedDevOpsModel, template_commit: str) -> str:
             "  and optional SCM credential ID are supplied as seed bindings.",
             "- **Pipeline DSL** (`Jenkinsfile`) owns build, test, image, supply-chain, push,",
             "  branch routing, production approval, deployment, and rollback behavior.",
+            "- The image is built and pushed exactly once, resolved to an OCI digest, and",
+            "  passed through `out/execution/artifact.json`; all later stages use",
+            "  `IMAGE_REPOSITORY@sha256:<digest>` and never rebuild or reinterpret the tag.",
+            "- SBOM and vulnerability evidence target the resolved registry digest. The",
+            "  generated provenance is explicitly unsigned, unattached, file-only evidence.",
             "- **External JCasC/controller configuration** owns plugin installation, the seed",
             "  job, agents and tools, security realms, authorization, and credential values.",
             "  Credential values must never be committed or passed through this adapter.",
@@ -544,6 +796,8 @@ def _render_boundary(model: NormalizedDevOpsModel, template_commit: str) -> str:
             "  or `devops-stack templates path docker` on a clean agent.",
             "- Kubernetes image overrides are rendered in a temporary copy; generated files",
             "  remain immutable during deployment.",
+            "- v0.2.0 validates this generated plan statically. It does not claim Jenkins",
+            "  controller, plugin-matrix, credential, deployment, or rollback execution.",
             "",
             f"Registry operations reference Jenkins credential ID `{model.credential_id}` only.",
             "",
@@ -561,13 +815,48 @@ def _render_environment(model: NormalizedDevOpsModel, environment: EnvironmentMo
         "environment": environment.name,
         "branchPatterns": list(model.branch_environment_map[environment.name]),
         "image": model.image_reference,
+        "imageContract": "resolved-digest",
         "imageTagExpression": model.image_tag_expression,
+        "deploymentImageSource": "out/execution/artifact.json#immutableImageReference",
+        "mutableTagDeploymentAllowed": False,
         "kubernetesOverlay": f"{GENERATED_ROOT}/k8s/overlays/{environment.name}",
         "namespace": environment.namespace,
         "productionApproval": (
             model.production_approval if environment.name == "production" else False
         ),
         "replicas": environment.replicas,
+    }
+    return json.dumps(value, indent=2, sort_keys=True) + "\n"
+
+
+def _render_artifact_contract(model: NormalizedDevOpsModel) -> str:
+    value = {
+        "schemaVersion": "jenkins-artifact-contract-v1",
+        "verificationScope": "generated-static-plan-only",
+        "jenkinsExecutionVerified": False,
+        "build": {
+            "maximumImageBuildInvocations": 1,
+            "command": f"./{GENERATED_ROOT}/docker/build.sh --push",
+            "marker": "out/execution/build-invocation.json",
+        },
+        "identity": {
+            "intentEnvironment": "IMAGE_TAG_REF",
+            "digestEnvironment": "IMAGE_DIGEST",
+            "immutableReferenceEnvironment": "IMAGE_REF",
+            "artifact": "out/execution/artifact.json",
+            "requiredReferenceForm": f"{model.image_name}@sha256:<64-lowercase-hex>",
+        },
+        "evidence": {
+            "sbom": "out/supply-chain/sbom.json",
+            "vulnerabilityReport": "out/supply-chain/vulnerabilities.json",
+            "provenance": "out/supply-chain/provenance.json",
+            "provenanceVerification": "unsigned-unattached-file-only",
+        },
+        "deployment": {
+            "imageSource": "out/execution/artifact.json#immutableImageReference",
+            "mutableTagsAllowed": False,
+            "rollbackRebuildAllowed": False,
+        },
     }
     return json.dumps(value, indent=2, sort_keys=True) + "\n"
 
@@ -714,26 +1003,17 @@ def _local_supply_chain_capability(model: NormalizedDevOpsModel) -> AdapterDiagn
         for name in ("sbom", "scan")
         if model.supply_chain.get(name, {}).get("enabled", False)
     )
-    if requested and len(model.architectures) != 1:
-        return AdapterDiagnostic(
-            status=FAILED,
-            check="jenkins_local_supply_chain_capability",
-            message=(
-                "Local pre-push SBOM and image scanning require exactly one "
-                "architecture; the final registry tag will not be published."
-            ),
-            details={
-                "architectures": list(model.architectures),
-                "requested": list(requested),
-            },
-        )
     return AdapterDiagnostic(
         status=PASSED,
         check="jenkins_local_supply_chain_capability",
-        message="The requested pre-push supply-chain checks have a local image path.",
+        message=(
+            "Requested supply-chain checks consume the immutable registry digest "
+            "after the single push; no local rebuild is generated."
+        ),
         details={
             "architectures": list(model.architectures),
             "requested": list(requested),
+            "subject": "IMAGE_REPOSITORY@IMAGE_DIGEST",
         },
     )
 
@@ -765,9 +1045,16 @@ def _internal_structure_diagnostic(
         issues.append("Job DSL braces are unbalanced")
     required_jenkins = (
         "pipeline {",
+        "stage('Checkout')",
         "stage('Container Plan Validation')",
-        "stage('Supply Chain Scan')",
-        "stage('Registry Push')",
+        "stage('Build Once')",
+        "stage('Resolve Digest')",
+        "stage('Generate SBOM')",
+        "stage('Scan Same Digest')",
+        "stage('Produce Provenance')",
+        "stage('Verify Artifact Contract')",
+        "stage('Deploy Same Digest dev')",
+        "stage('Verify Rollout dev')",
         "kustomize edit set image",
     )
     for required in required_jenkins:
@@ -783,16 +1070,33 @@ def _internal_structure_diagnostic(
         if required not in job_dsl:
             issues.append(f"Job DSL is missing {required}")
     ordered_stages = (
-        "stage('Build')",
+        "stage('Checkout')",
+        "stage('Application Build')",
         "stage('Test')",
         "stage('Container Plan Validation')",
-        "stage('Container Build')",
-        "stage('Supply Chain Scan')",
-        "stage('Registry Push')",
+        "stage('Build Once')",
+        "stage('Resolve Digest')",
+        "stage('Generate SBOM')",
+        "stage('Scan Same Digest')",
+        "stage('Produce Provenance')",
+        "stage('Verify Artifact Contract')",
     )
     positions = [jenkinsfile.find(stage) for stage in ordered_stages]
     if any(position < 0 for position in positions) or positions != sorted(positions):
-        issues.append("build, test, local scan, and final push stages are out of order")
+        issues.append("build-once and digest-consumer stages are out of order")
+    if jenkinsfile.count("./generated/docker/build.sh --push") != 1:
+        issues.append("Jenkinsfile must invoke the official image build/push exactly once")
+    if "./generated/docker/build.sh --load" in jenkinsfile:
+        issues.append("Jenkinsfile must not create a second local image build")
+    resolved = jenkinsfile.find('env.IMAGE_REF = "${env.IMAGE_REPOSITORY}@${env.IMAGE_DIGEST}"')
+    last_build = jenkinsfile.rfind("./generated/docker/build.sh --push")
+    if resolved < 0 or last_build < 0 or resolved < last_build:
+        issues.append("immutable IMAGE_REF must be resolved after the only image build")
+    if any(
+        token in jenkinsfile[resolved:]
+        for token in ("docker build ", "docker buildx build ", "docker/build.sh --load")
+    ):
+        issues.append("a downstream digest-consumer stage contains a rebuild command")
     return AdapterDiagnostic(
         status=FAILED if issues else PASSED,
         check="jenkins_generated_structure",
@@ -869,6 +1173,11 @@ class JenkinsPipelineAdapter:
                 path="jenkins/job-dsl.groovy",
                 content=job_dsl,
                 origins=("normalized-model", origin),
+            ),
+            GeneratedArtifact(
+                path="jenkins/artifact-contract.json",
+                content=_render_artifact_contract(model),
+                origins=("normalized-model", "jenkins:build-once-digest-contract"),
             ),
             GeneratedArtifact(
                 path="jenkins/README.md",
