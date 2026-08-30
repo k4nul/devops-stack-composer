@@ -6,7 +6,7 @@ from pathlib import Path
 
 from devops_stack_composer.doctor import ProbeResult, ToolProbe, run_doctor
 from devops_stack_composer.locks import TemplateLock
-from devops_stack_composer.sources import SourceResolution, SourceResolver
+from devops_stack_composer.sources import SourceResolution
 from devops_stack_composer.validation import ValidationStatus
 
 

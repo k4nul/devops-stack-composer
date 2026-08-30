@@ -18,7 +18,7 @@ from devops_stack_composer.adapters.kubernetes import (
     KubernetesAdapter,
     validate_yaml_artifacts,
 )
-from devops_stack_composer.config import load_config, parse_config, validate_config
+from devops_stack_composer.config import parse_config, validate_config
 from devops_stack_composer.model import normalize_config
 from devops_stack_composer.sources import SourceResolution
 from devops_stack_composer.validation import ValidationStatus, validate_cross_project_contract

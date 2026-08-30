@@ -15,7 +15,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 from urllib.parse import urlsplit
 import zipfile
 
@@ -175,7 +175,11 @@ class ReleaseAssetRecord:
             raise ValueError(f"unsupported release asset role: {self.role}")
         if not _SHA256.fullmatch(self.sha256):
             raise ValueError("release asset SHA-256 must be lowercase hexadecimal")
-        if isinstance(self.size, bool) or not isinstance(self.size, int) or self.size < 0:
+        if (
+            isinstance(self.size, bool)
+            or not isinstance(self.size, int)
+            or self.size < 0
+        ):
             raise ValueError("release asset size must be a non-negative integer")
 
     def to_dict(self) -> dict[str, Any]:
@@ -207,8 +211,12 @@ class ReleaseManifest:
             raise ValueError("manifest asset names must be unique")
         roles = {item.role for item in values}
         if roles != _PAYLOAD_ROLES or len(values) != len(_PAYLOAD_ROLES):
-            raise ValueError("manifest must contain exactly one asset for every required role")
-        object.__setattr__(self, "assets", tuple(sorted(values, key=lambda item: item.name)))
+            raise ValueError(
+                "manifest must contain exactly one asset for every required role"
+            )
+        object.__setattr__(
+            self, "assets", tuple(sorted(values, key=lambda item: item.name))
+        )
         if not isinstance(self.evidence_run_id, str) or not self.evidence_run_id:
             raise ValueError("evidence run ID must be non-empty")
         _validate_oci_digest(self.evidence_digest)
@@ -216,10 +224,18 @@ class ReleaseManifest:
             raise ValueError("unsupported provenance verification mode")
         if not isinstance(self.cryptographically_verified, bool):
             raise ValueError("cryptographicallyVerified must be boolean")
-        if self.provenance_mode == "file-provenance" and self.cryptographically_verified:
+        if (
+            self.provenance_mode == "file-provenance"
+            and self.cryptographically_verified
+        ):
             raise ValueError("file provenance cannot claim cryptographic verification")
-        if self.provenance_mode == "keyless-attestation" and not self.cryptographically_verified:
-            raise ValueError("keyless attestation must record cryptographic verification")
+        if (
+            self.provenance_mode == "keyless-attestation"
+            and not self.cryptographically_verified
+        ):
+            raise ValueError(
+                "keyless attestation must record cryptographic verification"
+            )
 
     @property
     def tag(self) -> str:
@@ -276,7 +292,9 @@ class ReleaseAssetAssembler:
 
     def assemble(self, request: ReleaseAssemblyRequest) -> ReleaseAssetVerification:
         if not isinstance(request, ReleaseAssemblyRequest):
-            raise ReleaseAssetError("RELEASE_INPUT_INVALID", "request has the wrong type")
+            raise ReleaseAssetError(
+                "RELEASE_INPUT_INVALID", "request has the wrong type"
+            )
         project = project_root(request.project)
         output = _contained(project, request.output_directory)
         if output.exists():
@@ -304,7 +322,8 @@ class ReleaseAssetAssembler:
         resolved_sources = [path.resolve() for path in sources.values()]
         if len(set(resolved_sources)) != len(resolved_sources):
             raise ReleaseAssetError(
-                "RELEASE_INPUT_DUPLICATED", "release inputs must be distinct regular files"
+                "RELEASE_INPUT_DUPLICATED",
+                "release inputs must be distinct regular files",
             )
 
         _validate_package_archive_names(
@@ -449,21 +468,26 @@ class ReleaseAssetVerifier:
         directory = _contained(root, relative_directory)
         if directory.is_symlink() or not directory.is_dir():
             raise ReleaseAssetError(
-                "RELEASE_DIRECTORY_INVALID", "release directory is not a regular directory"
+                "RELEASE_DIRECTORY_INVALID",
+                "release directory is not a regular directory",
             )
         paths = tuple(sorted(directory.iterdir(), key=lambda path: path.name))
         if any(path.is_symlink() or not path.is_file() for path in paths):
             raise ReleaseAssetError(
-                "RELEASE_ASSET_UNSAFE", "release directory may contain only regular files"
+                "RELEASE_ASSET_UNSAFE",
+                "release directory may contain only regular files",
             )
-        if len({path.name for path in paths}) != len(paths):  # pragma: no cover - filesystem
+        if len({path.name for path in paths}) != len(
+            paths
+        ):  # pragma: no cover - filesystem
             raise ReleaseAssetError("RELEASE_ASSET_DUPLICATED", "duplicate asset names")
 
         checksum_path = directory / "SHA256SUMS"
         manifest_path = directory / "release-manifest.json"
         if not checksum_path.is_file() or not manifest_path.is_file():
             raise ReleaseAssetError(
-                "RELEASE_ASSET_MISSING", "SHA256SUMS and release-manifest.json are required"
+                "RELEASE_ASSET_MISSING",
+                "SHA256SUMS and release-manifest.json are required",
             )
         physical = {path.name: path for path in paths}
         payloads = {
@@ -500,11 +524,13 @@ class ReleaseAssetVerifier:
         manifest = _parse_manifest(manifest_value)
         if expected_version is not None and manifest.version != expected_version:
             raise ReleaseAssetError(
-                "RELEASE_VERSION_MISMATCH", "manifest version differs from expected version"
+                "RELEASE_VERSION_MISMATCH",
+                "manifest version differs from expected version",
             )
         if expected_commit is not None and manifest.source_commit != expected_commit:
             raise ReleaseAssetError(
-                "RELEASE_COMMIT_MISMATCH", "manifest commit differs from expected commit"
+                "RELEASE_COMMIT_MISMATCH",
+                "manifest commit differs from expected commit",
             )
         expected_files = {item.name for item in manifest.assets} | {
             "release-manifest.json",
@@ -512,7 +538,8 @@ class ReleaseAssetVerifier:
         }
         if set(physical) != expected_files:
             raise ReleaseAssetError(
-                "RELEASE_INVENTORY_MISMATCH", "manifest asset inventory differs from files"
+                "RELEASE_INVENTORY_MISMATCH",
+                "manifest asset inventory differs from files",
             )
         for item in manifest.assets:
             if (
@@ -520,14 +547,16 @@ class ReleaseAssetVerifier:
                 or len(payloads[item.name]) != item.size
             ):
                 raise ReleaseAssetError(
-                    "RELEASE_MANIFEST_MISMATCH", f"manifest metadata differs: {item.name}"
+                    "RELEASE_MANIFEST_MISMATCH",
+                    f"manifest metadata differs: {item.name}",
                 )
 
         by_role = {item.role: item for item in manifest.assets}
         for role, name in _STATIC_ASSETS.items():
             if by_role[role].name != name:
                 raise ReleaseAssetError(
-                    "RELEASE_MANIFEST_INVALID", f"{role} must use the canonical filename"
+                    "RELEASE_MANIFEST_INVALID",
+                    f"{role} must use the canonical filename",
                 )
         wheel = physical[by_role["wheel"].name]
         sdist = physical[by_role["sdist"].name]
@@ -539,16 +568,12 @@ class ReleaseAssetVerifier:
             payloads[by_role["report-schema"].name],
             payloads[by_role["execution-evidence-schema"].name],
         )
-        _validate_example_config(
-            payloads[by_role["example-config"].name], schemas[0]
-        )
+        _validate_example_config(payloads[by_role["example-config"].name], schemas[0])
         package_subjects = {
             wheel.name: by_role["wheel"].sha256,
             sdist.name: by_role["sdist"].sha256,
         }
-        _validate_package_sbom(
-            payloads[by_role["package-sbom"].name], package_subjects
-        )
+        _validate_package_sbom(payloads[by_role["package-sbom"].name], package_subjects)
         provenance = _validate_provenance_material(
             payloads[by_role["provenance-verification"].name],
             version=manifest.version,
@@ -625,7 +650,9 @@ class ReleaseAssetVerifier:
         )
 
 
-def assemble_release_assets(request: ReleaseAssemblyRequest) -> ReleaseAssetVerification:
+def assemble_release_assets(
+    request: ReleaseAssemblyRequest,
+) -> ReleaseAssetVerification:
     return ReleaseAssetAssembler().assemble(request)
 
 
@@ -654,9 +681,7 @@ def prepare_release_materials(request: ReleaseMaterialRequest) -> ReleaseMateria
     }
     _validate_wheel_payload(package_payloads[wheel.name], request.version)
     _validate_sdist_payload(package_payloads[sdist.name], request.version)
-    subjects = {
-        name: _sha256(payload) for name, payload in package_payloads.items()
-    }
+    subjects = {name: _sha256(payload) for name, payload in package_payloads.items()}
     namespace = (
         request.source_repository.rstrip("/")
         + f"/releases/tag/v{request.version}/package.spdx.json"
@@ -789,8 +814,10 @@ def _normalized_timestamp(value: str) -> str:
         raise ValueError("release creation time must be an RFC 3339 timestamp") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("release creation time must include a timezone")
-    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
-        "+00:00", "Z"
+    return (
+        parsed.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
     )
 
 
@@ -883,7 +910,11 @@ def _json_bytes(value: Mapping[str, Any]) -> bytes:
     try:
         return (
             json.dumps(
-                dict(value), indent=2, sort_keys=True, allow_nan=False, ensure_ascii=False
+                dict(value),
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+                ensure_ascii=False,
             )
             + "\n"
         ).encode("utf-8")
@@ -908,27 +939,35 @@ def _parse_checksums(payload: bytes) -> dict[str, str]:
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ReleaseAssetError("RELEASE_CHECKSUMS_INVALID", "SHA256SUMS is not UTF-8") from exc
+        raise ReleaseAssetError(
+            "RELEASE_CHECKSUMS_INVALID", "SHA256SUMS is not UTF-8"
+        ) from exc
     lines = text.splitlines(keepends=True)
     if not lines or any(not line.endswith("\n") for line in lines):
         raise ReleaseAssetError(
-            "RELEASE_CHECKSUMS_INVALID", "SHA256SUMS must be non-empty and newline-terminated"
+            "RELEASE_CHECKSUMS_INVALID",
+            "SHA256SUMS must be non-empty and newline-terminated",
         )
     result: dict[str, str] = {}
     order: list[str] = []
     for line in lines:
         match = _CHECKSUM_LINE.fullmatch(line[:-1])
         if match is None:
-            raise ReleaseAssetError("RELEASE_CHECKSUMS_INVALID", "invalid SHA256SUMS line")
+            raise ReleaseAssetError(
+                "RELEASE_CHECKSUMS_INVALID", "invalid SHA256SUMS line"
+            )
         digest, name = match.groups()
         if name == "SHA256SUMS" or name in result:
             raise ReleaseAssetError(
-                "RELEASE_ASSET_DUPLICATED", f"duplicate or recursive checksum name: {name}"
+                "RELEASE_ASSET_DUPLICATED",
+                f"duplicate or recursive checksum name: {name}",
             )
         result[name] = digest
         order.append(name)
     if order != sorted(order):
-        raise ReleaseAssetError("RELEASE_CHECKSUMS_INVALID", "SHA256SUMS must be sorted")
+        raise ReleaseAssetError(
+            "RELEASE_CHECKSUMS_INVALID", "SHA256SUMS must be sorted"
+        )
     return result
 
 
@@ -946,10 +985,14 @@ def _validate_package_archive_names(wheel: str, sdist: str, version: str) -> Non
 
 def _safe_archive_name(value: str) -> PurePosixPath:
     if not value or "\\" in value or value.startswith("/") or "\x00" in value:
-        raise ReleaseAssetError("RELEASE_ARCHIVE_UNSAFE", f"unsafe archive path: {value!r}")
+        raise ReleaseAssetError(
+            "RELEASE_ARCHIVE_UNSAFE", f"unsafe archive path: {value!r}"
+        )
     path = PurePosixPath(value)
     if path.as_posix() != value or any(part in {"", ".", ".."} for part in path.parts):
-        raise ReleaseAssetError("RELEASE_ARCHIVE_UNSAFE", f"unsafe archive path: {value!r}")
+        raise ReleaseAssetError(
+            "RELEASE_ARCHIVE_UNSAFE", f"unsafe archive path: {value!r}"
+        )
     return path
 
 
@@ -957,7 +1000,9 @@ def _metadata_headers(payload: bytes, source: str) -> dict[str, str]:
     try:
         lines = payload.decode("utf-8").splitlines()
     except UnicodeDecodeError as exc:
-        raise ReleaseAssetError("RELEASE_PACKAGE_INVALID", f"{source} is not UTF-8") from exc
+        raise ReleaseAssetError(
+            "RELEASE_PACKAGE_INVALID", f"{source} is not UTF-8"
+        ) from exc
     headers: dict[str, str] = {}
     for line in lines:
         if not line:
@@ -966,7 +1011,9 @@ def _metadata_headers(payload: bytes, source: str) -> dict[str, str]:
             continue
         name, separator, value = line.partition(":")
         if not separator:
-            raise ReleaseAssetError("RELEASE_PACKAGE_INVALID", f"invalid {source} header")
+            raise ReleaseAssetError(
+                "RELEASE_PACKAGE_INVALID", f"invalid {source} header"
+            )
         if name in headers:
             raise ReleaseAssetError(
                 "RELEASE_PACKAGE_INVALID", f"duplicate {source} header: {name}"
@@ -990,11 +1037,15 @@ def _validate_wheel_payload(compressed: bytes, version: str) -> None:
                 name = info.filename[:-1] if info.is_dir() else info.filename
                 _safe_archive_name(name)
                 if info.filename in names:
-                    raise ReleaseAssetError("RELEASE_ASSET_DUPLICATED", "wheel path duplicated")
+                    raise ReleaseAssetError(
+                        "RELEASE_ASSET_DUPLICATED", "wheel path duplicated"
+                    )
                 names.add(info.filename)
                 mode = info.external_attr >> 16
                 if mode and stat.S_ISLNK(mode):
-                    raise ReleaseAssetError("RELEASE_ARCHIVE_UNSAFE", "wheel contains a symlink")
+                    raise ReleaseAssetError(
+                        "RELEASE_ARCHIVE_UNSAFE", "wheel contains a symlink"
+                    )
                 if info.flag_bits & 0x1:
                     raise ReleaseAssetError(
                         "RELEASE_ARCHIVE_UNSAFE", "wheel contains an encrypted member"
@@ -1017,7 +1068,9 @@ def _validate_wheel_payload(compressed: bytes, version: str) -> None:
                         )
                     metadata.append(payload)
     except (OSError, zipfile.BadZipFile) as exc:
-        raise ReleaseAssetError("RELEASE_PACKAGE_INVALID", "wheel is not a valid ZIP") from exc
+        raise ReleaseAssetError(
+            "RELEASE_PACKAGE_INVALID", "wheel is not a valid ZIP"
+        ) from exc
     if len(metadata) != 1:
         raise ReleaseAssetError(
             "RELEASE_PACKAGE_INVALID", "wheel must contain exactly one METADATA file"
@@ -1042,15 +1095,22 @@ def _validate_sdist_payload(compressed: bytes, version: str) -> None:
             roots: set[str] = set()
             total = 0
             for member in members:
-                name = member.name[:-1] if member.isdir() and member.name.endswith("/") else member.name
+                name = (
+                    member.name[:-1]
+                    if member.isdir() and member.name.endswith("/")
+                    else member.name
+                )
                 parsed = _safe_archive_name(name)
                 roots.add(parsed.parts[0])
                 if name in names:
-                    raise ReleaseAssetError("RELEASE_ASSET_DUPLICATED", "sdist path duplicated")
+                    raise ReleaseAssetError(
+                        "RELEASE_ASSET_DUPLICATED", "sdist path duplicated"
+                    )
                 names.add(name)
                 if not (member.isdir() or member.isfile()):
                     raise ReleaseAssetError(
-                        "RELEASE_ARCHIVE_UNSAFE", "sdist contains a link or special file"
+                        "RELEASE_ARCHIVE_UNSAFE",
+                        "sdist contains a link or special file",
                     )
                 if member.isfile():
                     total += member.size
@@ -1062,10 +1122,16 @@ def _validate_sdist_payload(compressed: bytes, version: str) -> None:
                             "RELEASE_PACKAGE_INVALID",
                             "sdist uncompressed content exceeds the release limit",
                         )
-                if member.isfile() and parsed.name == "PKG-INFO" and len(parsed.parts) == 2:
+                if (
+                    member.isfile()
+                    and parsed.name == "PKG-INFO"
+                    and len(parsed.parts) == 2
+                ):
                     extracted = archive.extractfile(member)
                     if extracted is None:  # pragma: no cover - tarfile invariant
-                        raise ReleaseAssetError("RELEASE_PACKAGE_INVALID", "PKG-INFO unreadable")
+                        raise ReleaseAssetError(
+                            "RELEASE_PACKAGE_INVALID", "PKG-INFO unreadable"
+                        )
                     payload = extracted.read(_MAX_PACKAGE_MEMBER_BYTES + 1)
                     if len(payload) != member.size:
                         raise ReleaseAssetError(
@@ -1073,7 +1139,9 @@ def _validate_sdist_payload(compressed: bytes, version: str) -> None:
                         )
                     metadata.append(payload)
     except (OSError, tarfile.TarError) as exc:
-        raise ReleaseAssetError("RELEASE_PACKAGE_INVALID", "sdist is not valid tar.gz") from exc
+        raise ReleaseAssetError(
+            "RELEASE_PACKAGE_INVALID", "sdist is not valid tar.gz"
+        ) from exc
     if len(roots) != 1 or len(metadata) != 1:
         raise ReleaseAssetError(
             "RELEASE_PACKAGE_INVALID", "sdist needs one root and one root PKG-INFO"
@@ -1109,7 +1177,9 @@ def _validate_schemas(
     except (SchemaError, Exception) as exc:
         if isinstance(exc, ReleaseAssetError):
             raise
-        raise ReleaseAssetError("RELEASE_SCHEMA_INVALID", "release schema is invalid") from exc
+        raise ReleaseAssetError(
+            "RELEASE_SCHEMA_INVALID", "release schema is invalid"
+        ) from exc
     return values
 
 
@@ -1138,16 +1208,21 @@ def _validate_example_config(payload: bytes, schema: Mapping[str, Any]) -> None:
     try:
         value = yaml.load(payload.decode("utf-8"), Loader=_UniqueKeyLoader)
     except (UnicodeDecodeError, yaml.YAMLError) as exc:
-        raise ReleaseAssetError("RELEASE_EXAMPLE_INVALID", "example config is invalid YAML") from exc
+        raise ReleaseAssetError(
+            "RELEASE_EXAMPLE_INVALID", "example config is invalid YAML"
+        ) from exc
     if not isinstance(value, Mapping):
-        raise ReleaseAssetError("RELEASE_EXAMPLE_INVALID", "example config must be an object")
+        raise ReleaseAssetError(
+            "RELEASE_EXAMPLE_INVALID", "example config must be an object"
+        )
     errors = sorted(
         Draft7Validator(schema, format_checker=FormatChecker()).iter_errors(value),
         key=lambda error: tuple(str(part) for part in error.absolute_path),
     )
     if errors:
         raise ReleaseAssetError(
-            "RELEASE_EXAMPLE_INVALID", f"example config violates schema: {errors[0].message}"
+            "RELEASE_EXAMPLE_INVALID",
+            f"example config violates schema: {errors[0].message}",
         )
 
 
@@ -1164,22 +1239,32 @@ def _validate_package_sbom(payload: bytes, package_subjects: Mapping[str, str]) 
     if not isinstance(creators, list) or not any(
         isinstance(item, str) and item.startswith("Tool: ") for item in creators
     ):
-        raise ReleaseAssetError("RELEASE_SBOM_INVALID", "package SBOM has no tool creator")
+        raise ReleaseAssetError(
+            "RELEASE_SBOM_INVALID", "package SBOM has no tool creator"
+        )
     packages = value.get("packages")
     if not isinstance(packages, list) or not packages:
-        raise ReleaseAssetError("RELEASE_SBOM_INVALID", "package SBOM package list is empty")
+        raise ReleaseAssetError(
+            "RELEASE_SBOM_INVALID", "package SBOM package list is empty"
+        )
     files = value.get("files")
     if not isinstance(files, list):
-        raise ReleaseAssetError("RELEASE_SBOM_INVALID", "package SBOM files must be an array")
+        raise ReleaseAssetError(
+            "RELEASE_SBOM_INVALID", "package SBOM files must be an array"
+        )
     found: dict[str, str] = {}
     for item in files:
         if not isinstance(item, Mapping):
-            raise ReleaseAssetError("RELEASE_SBOM_INVALID", "package SBOM file is invalid")
+            raise ReleaseAssetError(
+                "RELEASE_SBOM_INVALID", "package SBOM file is invalid"
+            )
         name = item.get("fileName")
-        if name not in package_subjects:
+        if not isinstance(name, str) or name not in package_subjects:
             continue
         if name in found:
-            raise ReleaseAssetError("RELEASE_ASSET_DUPLICATED", f"duplicate SBOM file: {name}")
+            raise ReleaseAssetError(
+                "RELEASE_ASSET_DUPLICATED", f"duplicate SBOM file: {name}"
+            )
         checksums = item.get("checksums")
         matches = [
             entry.get("checksumValue")
@@ -1193,7 +1278,8 @@ def _validate_package_sbom(payload: bytes, package_subjects: Mapping[str, str]) 
         found[name] = matches[0]
     if found != dict(package_subjects):
         raise ReleaseAssetError(
-            "RELEASE_SBOM_SUBJECT_MISMATCH", "package SBOM subjects differ from packages"
+            "RELEASE_SBOM_SUBJECT_MISMATCH",
+            "package SBOM subjects differ from packages",
         )
 
 
@@ -1215,17 +1301,27 @@ def _validate_provenance_material(
         "tag",
         "subjects",
     }
-    if set(value) != required or value.get("schemaVersion") != _VERIFICATION_SCHEMA_VERSION:
+    if (
+        set(value) != required
+        or value.get("schemaVersion") != _VERIFICATION_SCHEMA_VERSION
+    ):
         raise ReleaseAssetError(
             "RELEASE_PROVENANCE_INVALID", "provenance material fields do not match"
         )
     mode = value.get("mode")
     crypto = value.get("cryptographicallyVerified")
-    if mode not in {"file-provenance", "keyless-attestation"} or not isinstance(crypto, bool):
-        raise ReleaseAssetError("RELEASE_PROVENANCE_INVALID", "provenance mode is invalid")
-    if (mode == "file-provenance" and crypto) or (mode == "keyless-attestation" and not crypto):
+    if mode not in {"file-provenance", "keyless-attestation"} or not isinstance(
+        crypto, bool
+    ):
         raise ReleaseAssetError(
-            "RELEASE_PROVENANCE_INVALID", "provenance mode overclaims or underclaims verification"
+            "RELEASE_PROVENANCE_INVALID", "provenance mode is invalid"
+        )
+    if (mode == "file-provenance" and crypto) or (
+        mode == "keyless-attestation" and not crypto
+    ):
+        raise ReleaseAssetError(
+            "RELEASE_PROVENANCE_INVALID",
+            "provenance mode overclaims or underclaims verification",
         )
     if value.get("sourceCommit") != source_commit or value.get("tag") != f"v{version}":
         raise ReleaseAssetError(
@@ -1233,7 +1329,9 @@ def _validate_provenance_material(
         )
     repository = value.get("sourceRepository")
     if not isinstance(repository, str):
-        raise ReleaseAssetError("RELEASE_PROVENANCE_INVALID", "source repository is missing")
+        raise ReleaseAssetError(
+            "RELEASE_PROVENANCE_INVALID", "source repository is missing"
+        )
     try:
         _validate_repository_url(repository)
     except ValueError as exc:
@@ -1246,24 +1344,37 @@ def _validate_provenance_material(
         or set(tool) != {"name", "version"}
         or not all(isinstance(tool.get(key), str) and tool.get(key) for key in tool)
     ):
-        raise ReleaseAssetError("RELEASE_PROVENANCE_INVALID", "verification tool is invalid")
+        raise ReleaseAssetError(
+            "RELEASE_PROVENANCE_INVALID", "verification tool is invalid"
+        )
     subjects = value.get("subjects")
     if not isinstance(subjects, list):
-        raise ReleaseAssetError("RELEASE_PROVENANCE_INVALID", "subjects must be an array")
+        raise ReleaseAssetError(
+            "RELEASE_PROVENANCE_INVALID", "subjects must be an array"
+        )
     found: dict[str, str] = {}
     for subject in subjects:
         if not isinstance(subject, Mapping) or set(subject) != {"name", "sha256"}:
             raise ReleaseAssetError("RELEASE_PROVENANCE_INVALID", "subject is invalid")
         name = subject.get("name")
         digest = subject.get("sha256")
-        if not isinstance(name, str) or not isinstance(digest, str) or not _SHA256.fullmatch(digest):
-            raise ReleaseAssetError("RELEASE_PROVENANCE_INVALID", "subject fields are invalid")
+        if (
+            not isinstance(name, str)
+            or not isinstance(digest, str)
+            or not _SHA256.fullmatch(digest)
+        ):
+            raise ReleaseAssetError(
+                "RELEASE_PROVENANCE_INVALID", "subject fields are invalid"
+            )
         if name in found:
-            raise ReleaseAssetError("RELEASE_ASSET_DUPLICATED", f"duplicate subject: {name}")
+            raise ReleaseAssetError(
+                "RELEASE_ASSET_DUPLICATED", f"duplicate subject: {name}"
+            )
         found[name] = digest
     if found != dict(package_subjects):
         raise ReleaseAssetError(
-            "RELEASE_PROVENANCE_SUBJECT_MISMATCH", "provenance subjects differ from packages"
+            "RELEASE_PROVENANCE_SUBJECT_MISMATCH",
+            "provenance subjects differ from packages",
         )
     return value
 
@@ -1299,9 +1410,8 @@ def _sanitize_evidence(relative: str, payload: bytes) -> None:
     path = PurePosixPath(relative)
     for part in path.parts:
         lowered = part.lower()
-        if (
-            lowered in _SENSITIVE_PATH_NAMES
-            or lowered.endswith((".pem", ".key", ".p12"))
+        if lowered in _SENSITIVE_PATH_NAMES or lowered.endswith(
+            (".pem", ".key", ".p12")
         ):
             raise ReleaseAssetError(
                 "RELEASE_EVIDENCE_SENSITIVE", f"sensitive evidence filename: {relative}"
@@ -1322,21 +1432,28 @@ def _sanitize_evidence(relative: str, payload: bytes) -> None:
         or _SENSITIVE_ASSIGNMENT.search(text)
     ):
         raise ReleaseAssetError(
-            "RELEASE_EVIDENCE_SENSITIVE", f"example evidence contains sensitive data: {relative}"
+            "RELEASE_EVIDENCE_SENSITIVE",
+            f"example evidence contains sensitive data: {relative}",
         )
 
 
 def _build_evidence_archive(bundle: Any) -> bytes:
     root = bundle.root
-    entries = tuple(sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()))
+    entries = tuple(
+        sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+    )
     files = [path for path in entries if path.is_file()]
     if len(files) > _MAX_EVIDENCE_FILES:
-        raise ReleaseAssetError("RELEASE_EVIDENCE_INVALID", "example evidence has too many files")
+        raise ReleaseAssetError(
+            "RELEASE_EVIDENCE_INVALID", "example evidence has too many files"
+        )
     payloads: dict[str, bytes] = {}
     total = 0
     for path in files:
         if path.is_symlink():
-            raise ReleaseAssetError("RELEASE_ARCHIVE_UNSAFE", "evidence contains a symlink")
+            raise ReleaseAssetError(
+                "RELEASE_ARCHIVE_UNSAFE", "evidence contains a symlink"
+            )
         relative = path.relative_to(root).as_posix()
         payload = _read_regular(
             path,
@@ -1345,17 +1462,25 @@ def _build_evidence_archive(bundle: Any) -> bytes:
         )
         total += len(payload)
         if total > _MAX_EVIDENCE_BYTES:
-            raise ReleaseAssetError("RELEASE_EVIDENCE_INVALID", "example evidence is too large")
+            raise ReleaseAssetError(
+                "RELEASE_EVIDENCE_INVALID", "example evidence is too large"
+            )
         _sanitize_evidence(relative, payload)
         payloads[relative] = payload
 
     prefix = PurePosixPath(".devops-stack", "runs", bundle.run_id)
     raw = io.BytesIO()
     with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
-        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        with tarfile.open(
+            fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT
+        ) as archive:
             directories = {prefix, prefix.parent, prefix.parent.parent}
-            directories.update(prefix / path.relative_to(root) for path in entries if path.is_dir())
-            for directory in sorted(directories, key=lambda item: (len(item.parts), item.as_posix())):
+            directories.update(
+                prefix / path.relative_to(root) for path in entries if path.is_dir()
+            )
+            for directory in sorted(
+                directories, key=lambda item: (len(item.parts), item.as_posix())
+            ):
                 info = tarfile.TarInfo(directory.as_posix())
                 info.type = tarfile.DIRTYPE
                 info.mode = 0o700
@@ -1390,7 +1515,8 @@ def _verify_evidence_archive(path: Path, run_id: str) -> tuple[str, str]:
                 parsed = _safe_archive_name(member.name)
                 if member.name in names:
                     raise ReleaseAssetError(
-                        "RELEASE_ASSET_DUPLICATED", "example evidence archive path duplicated"
+                        "RELEASE_ASSET_DUPLICATED",
+                        "example evidence archive path duplicated",
                     )
                 names.add(member.name)
                 if (
@@ -1399,31 +1525,33 @@ def _verify_evidence_archive(path: Path, run_id: str) -> tuple[str, str]:
                     and prefix not in parsed.parents
                 ):
                     raise ReleaseAssetError(
-                        "RELEASE_ARCHIVE_UNSAFE", "evidence archive has an unexpected root"
+                        "RELEASE_ARCHIVE_UNSAFE",
+                        "evidence archive has an unexpected root",
                     )
                 if not (member.isdir() or member.isfile()):
                     raise ReleaseAssetError(
-                        "RELEASE_ARCHIVE_UNSAFE", "evidence archive contains a special file"
+                        "RELEASE_ARCHIVE_UNSAFE",
+                        "evidence archive contains a special file",
                     )
                 payload = None
                 if member.isfile():
                     total += member.size
-                    if (
-                        member.size > _MAX_EVIDENCE_BYTES
-                        or total > _MAX_EVIDENCE_BYTES
-                    ):
+                    if member.size > _MAX_EVIDENCE_BYTES or total > _MAX_EVIDENCE_BYTES:
                         raise ReleaseAssetError(
-                            "RELEASE_EVIDENCE_INVALID", "example evidence archive is too large"
+                            "RELEASE_EVIDENCE_INVALID",
+                            "example evidence archive is too large",
                         )
                     extracted = archive.extractfile(member)
                     if extracted is None:  # pragma: no cover - tarfile invariant
                         raise ReleaseAssetError(
-                            "RELEASE_EVIDENCE_INVALID", "example evidence member unreadable"
+                            "RELEASE_EVIDENCE_INVALID",
+                            "example evidence member unreadable",
                         )
                     payload = extracted.read(member.size + 1)
                     if len(payload) != member.size:
                         raise ReleaseAssetError(
-                            "RELEASE_EVIDENCE_INVALID", "example evidence member is truncated"
+                            "RELEASE_EVIDENCE_INVALID",
+                            "example evidence member is truncated",
                         )
                     relative = parsed.relative_to(prefix).as_posix()
                     _sanitize_evidence(relative, payload)
@@ -1433,7 +1561,9 @@ def _verify_evidence_archive(path: Path, run_id: str) -> tuple[str, str]:
             "RELEASE_EVIDENCE_INVALID", "example evidence is not valid tar.gz"
         ) from exc
     if (prefix / "SHA256SUMS").as_posix() not in names:
-        raise ReleaseAssetError("RELEASE_EVIDENCE_INVALID", "evidence archive lacks SHA256SUMS")
+        raise ReleaseAssetError(
+            "RELEASE_EVIDENCE_INVALID", "evidence archive lacks SHA256SUMS"
+        )
 
     with tempfile.TemporaryDirectory() as temporary:
         project = Path(temporary)
@@ -1467,13 +1597,17 @@ def _parse_manifest(value: Mapping[str, Any]) -> ReleaseManifest:
         "provenance",
     }
     if set(value) != required or value.get("schemaVersion") != _SCHEMA_VERSION:
-        raise ReleaseAssetError("RELEASE_MANIFEST_INVALID", "manifest fields do not match")
+        raise ReleaseAssetError(
+            "RELEASE_MANIFEST_INVALID", "manifest fields do not match"
+        )
     if value.get("distribution") != _DISTRIBUTION:
         raise ReleaseAssetError("RELEASE_MANIFEST_INVALID", "distribution name differs")
     version = value.get("version")
     source_commit = value.get("sourceCommit")
     if not isinstance(version, str) or value.get("tag") != f"v{version}":
-        raise ReleaseAssetError("RELEASE_VERSION_MISMATCH", "manifest tag/version differs")
+        raise ReleaseAssetError(
+            "RELEASE_VERSION_MISMATCH", "manifest tag/version differs"
+        )
     if not isinstance(source_commit, str):
         raise ReleaseAssetError("RELEASE_MANIFEST_INVALID", "source commit is missing")
     raw_assets = value.get("assets")
@@ -1482,7 +1616,12 @@ def _parse_manifest(value: Mapping[str, Any]) -> ReleaseManifest:
     assets: list[ReleaseAssetRecord] = []
     try:
         for item in raw_assets:
-            if not isinstance(item, Mapping) or set(item) != {"name", "role", "sha256", "size"}:
+            if not isinstance(item, Mapping) or set(item) != {
+                "name",
+                "role",
+                "sha256",
+                "size",
+            }:
                 raise ValueError("asset fields differ")
             assets.append(
                 ReleaseAssetRecord(

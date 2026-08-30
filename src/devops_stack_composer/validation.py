@@ -2323,12 +2323,12 @@ def _kubernetes_artifact_mismatches(
                 readiness_probe,
             ),
         ):
-            for field, expected in expected_probe.items():
+            for probe_field, expected in expected_probe.items():
                 _mismatch(
                     mismatches,
-                    f"{prefix}.{probe_name}.{field}",
+                    f"{prefix}.{probe_name}.{probe_field}",
                     expected,
-                    probe.get(field) if isinstance(probe, dict) else None,
+                    probe.get(probe_field) if isinstance(probe, dict) else None,
                 )
         security = container.get("securityContext", {}) if isinstance(container, dict) else {}
         expected_container_security: dict[str, Any] = {

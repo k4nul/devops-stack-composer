@@ -28,9 +28,7 @@ REPOSITORY = "https://github.com/k4nul/devops-stack-composer"
 
 def _wheel(path: Path) -> None:
     metadata = (
-        "Metadata-Version: 2.1\n"
-        "Name: devops-stack-composer\n"
-        f"Version: {VERSION}\n\n"
+        f"Metadata-Version: 2.1\nName: devops-stack-composer\nVersion: {VERSION}\n\n"
     )
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
@@ -42,9 +40,7 @@ def _wheel(path: Path) -> None:
 
 def _sdist(path: Path) -> None:
     metadata = (
-        "Metadata-Version: 2.1\n"
-        "Name: devops-stack-composer\n"
-        f"Version: {VERSION}\n\n"
+        f"Metadata-Version: 2.1\nName: devops-stack-composer\nVersion: {VERSION}\n\n"
     ).encode()
     root = f"devops_stack_composer-{VERSION}"
     with tarfile.open(path, "w:gz") as archive:
@@ -63,7 +59,9 @@ class ReleaseAssetTests(unittest.TestCase):
         self.project = Path(self.temporary.name)
         BundleFixture(self.project)
         (self.project / "dist").mkdir()
-        self.wheel = self.project / "dist" / f"devops_stack_composer-{VERSION}-py3-none-any.whl"
+        self.wheel = (
+            self.project / "dist" / f"devops_stack_composer-{VERSION}-py3-none-any.whl"
+        )
         self.sdist = self.project / "dist" / f"devops_stack_composer-{VERSION}.tar.gz"
         _wheel(self.wheel)
         _sdist(self.sdist)

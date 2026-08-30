@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import json
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from devops_stack_composer.evidence_store import EvidenceStore, EvidenceStoreError
 from devops_stack_composer.oci import parse_digest, validate_sha256_hex
