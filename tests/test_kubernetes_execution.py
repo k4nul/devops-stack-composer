@@ -169,6 +169,7 @@ class FakeKubectlRunner:
         self.rollback_undone = False
         self.restored_reference = REFERENCE
         self.restored_runtime_image_id = f"containerd://{DIGEST}"
+        self.pod_output_truncated = False
         self.forward_started = threading.Event()
         self.forward_stopped = threading.Event()
         self.forward_readiness = "Forwarding from 127.0.0.1:45123 -> 8080\n"
@@ -212,7 +213,11 @@ class FakeKubectlRunner:
         if action[:2] == ("get", "service"):
             return self._result(command, stdout=json.dumps(self._service()))
         if action and action[0] == "get" and "pods" in action:
-            return self._result(command, stdout=json.dumps(self._pods()))
+            return self._result(
+                command,
+                stdout=("{\"items\":[" if self.pod_output_truncated else json.dumps(self._pods())),
+                stdout_truncated=self.pod_output_truncated,
+            )
         if action[:2] == ("get", "events"):
             return self._result(command, stdout='{"items":[{"reason":"Unhealthy"}]}')
         if action and action[0] == "logs":
@@ -253,6 +258,7 @@ class FakeKubectlRunner:
         stdout: str = "",
         stderr: str = "",
         category: ProcessErrorCategory | None = None,
+        stdout_truncated: bool = False,
     ) -> ProcessResult:
         return ProcessResult(
             command,
@@ -262,6 +268,7 @@ class FakeKubectlRunner:
             stderr,
             0.01,
             category,
+            stdout_truncated=stdout_truncated,
         )
 
     def _deployment(self) -> dict[str, object]:
@@ -585,6 +592,21 @@ users:
 
         self.assertEqual(raised.exception.code, "RUNTIME_DIGEST_MISMATCH")
         self.assertEqual(raised.exception.identity.runtime_digest, OTHER_DIGEST)
+        self.assertFalse(self.runner.forward_started.is_set())
+        self.assertEqual(self.http.calls, [])
+
+    def test_rejects_truncated_kubectl_json_before_parsing_or_smoke(self) -> None:
+        self.runner.pod_output_truncated = True
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(raised.exception.code, "KUBECTL_OUTPUT_TRUNCATED")
+        self.assertEqual(raised.exception.stage, "runtime-attestation")
         self.assertFalse(self.runner.forward_started.is_set())
         self.assertEqual(self.http.calls, [])
 

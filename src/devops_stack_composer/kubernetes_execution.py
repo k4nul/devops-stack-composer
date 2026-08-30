@@ -1614,6 +1614,14 @@ class KubernetesExecutor:
         stage: str,
         identity: KubernetesArtifactIdentity,
     ) -> Mapping[str, object]:
+        if result.stdout_truncated:
+            raise KubernetesExecutionError(
+                "KUBECTL_OUTPUT_TRUNCATED",
+                stage,
+                "kubectl JSON exceeded the bounded process output limit",
+                identity=identity,
+                process_result=result,
+            )
         try:
             value = json.loads(result.stdout)
         except json.JSONDecodeError as exc:

@@ -90,6 +90,7 @@ _EXECUTION_TOOLS = frozenset(
 _EXECUTION_ENVIRONMENT_KEYS = frozenset(
     (*DEFAULT_ALLOWED_ENVIRONMENT_KEYS, "SYFT_REGISTRY_INSECURE_USE_HTTP")
 )
+_MAX_EXECUTION_OUTPUT_BYTES = 1024 * 1024
 _OVERALL_EXECUTION_TIMEOUT_SECONDS = 3600.0
 
 
@@ -318,6 +319,7 @@ class ExecutionOrchestrator:
             project,
             allowed_executables=_EXECUTION_TOOLS,
             allowed_environment_keys=_EXECUTION_ENVIRONMENT_KEYS,
+            max_output_bytes=_MAX_EXECUTION_OUTPUT_BYTES,
             default_timeout=300.0,
             overall_deadline=time.monotonic() + _OVERALL_EXECUTION_TIMEOUT_SECONDS,
         )
