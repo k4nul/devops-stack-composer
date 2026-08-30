@@ -20,6 +20,8 @@ class ValidationProfile(str, Enum):
     def parse(cls, value: str | "ValidationProfile") -> "ValidationProfile":
         if isinstance(value, cls):
             return value
+        if value == "local-kind":
+            value = cls.KIND_E2E.value
         try:
             return cls(value)
         except ValueError as exc:
@@ -35,7 +37,7 @@ _STATIC_STAGES = (
     "adapter-contracts",
     "generated-files",
 )
-_SUPPLY_CHAIN_STAGES = _STATIC_STAGES + (
+_SUPPLY_CHAIN_CORE_STAGES = _STATIC_STAGES + (
     "registry-lifecycle",
     "build-once",
     "resolve-digest",
@@ -44,7 +46,8 @@ _SUPPLY_CHAIN_STAGES = _STATIC_STAGES + (
     "provenance",
     "artifact-contract",
 )
-_KIND_STAGES = _SUPPLY_CHAIN_STAGES + (
+_SUPPLY_CHAIN_STAGES = _SUPPLY_CHAIN_CORE_STAGES + ("cleanup",)
+_KIND_STAGES = _SUPPLY_CHAIN_CORE_STAGES + (
     "kubernetes-schema",
     "server-side-dry-run",
     "deployment",

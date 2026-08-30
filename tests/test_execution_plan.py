@@ -5,6 +5,7 @@ import unittest
 
 from devops_stack_composer.execution_models import ArtifactIntent
 from devops_stack_composer.execution_plan import ExecutionPlan
+from devops_stack_composer.policies import ValidationProfile
 
 
 def intent() -> ArtifactIntent:
@@ -23,6 +24,12 @@ def intent() -> ArtifactIntent:
 
 
 class ExecutionPlanTests(unittest.TestCase):
+    def test_local_kind_config_alias_maps_to_kind_e2e(self) -> None:
+        self.assertEqual(
+            ValidationProfile.parse("local-kind"),
+            ValidationProfile.KIND_E2E,
+        )
+
     def test_plan_is_profile_ordered_and_hash_ignores_run_id(self) -> None:
         first = ExecutionPlan.create(
             run_id="run-one",
@@ -38,7 +45,8 @@ class ExecutionPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(first.build_plan_hash, second.build_plan_hash)
-        self.assertEqual(first.stages[-1].stage_id, "artifact-contract")
+        self.assertEqual(first.stages[-2].stage_id, "artifact-contract")
+        self.assertEqual(first.stages[-1].stage_id, "cleanup")
         self.assertTrue(all(stage.required for stage in first.stages))
         self.assertEqual(json.loads(first.to_json())["buildPlanHash"], first.build_plan_hash)
 
