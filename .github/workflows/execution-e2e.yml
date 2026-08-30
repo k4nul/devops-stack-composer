@@ -117,12 +117,18 @@ jobs:
               (Path(os.environ["RUNNER_TEMP"]) / "execution-show.json").read_text()
           )
           digest = artifact["manifestDigest"]
+          deployment_evidence = deployment["deploymentEvidence"]
+          bundle = verification["bundleVerification"]
           assert artifact["buildInvocationCount"] == 1, artifact
           assert artifact["sourceRevision"] == os.environ["GITHUB_SHA"], artifact
           assert attestation["artifactDigest"] == digest, attestation
-          assert deployment["artifactDigest"] == digest, deployment
-          assert verification["verified"] is True, verification
-          assert verification["executionSucceeded"] is True, verification
+          assert deployment_evidence["expectedDigest"] == digest, deployment
+          assert deployment_evidence["finalDigest"] == digest, deployment
+          assert deployment_evidence["actualPodImageId"].endswith(f"@{digest}"), deployment
+          assert verification["passed"] is True, verification
+          assert bundle["verified"] is True, verification
+          assert bundle["executionSucceeded"] is True, verification
+          assert bundle["artifactDigest"] == digest, verification
           assert shown["bundleVerification"]["artifactDigest"] == digest, shown
           assert shown["resources"]["cleaned"] is True, shown["resources"]
           PY

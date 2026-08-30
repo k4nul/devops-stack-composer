@@ -372,8 +372,12 @@ jobs:
           assert release["sourceCommit"] == os.environ["GITHUB_SHA"], release
           assert release["tagCommit"] == os.environ["GITHUB_SHA"], release
           assert artifact["buildInvocationCount"] == 1, artifact
-          assert verification["executionSucceeded"] is True, verification
-          assert verification["artifactDigest"] == artifact["manifestDigest"], verification
+          assert verification["passed"] is True, verification
+          assert verification["bundleVerification"]["executionSucceeded"] is True, verification
+          assert (
+              verification["bundleVerification"]["artifactDigest"]
+              == artifact["manifestDigest"]
+          ), verification
           PY
 
       - name: Retry exact owned-resource cleanup
