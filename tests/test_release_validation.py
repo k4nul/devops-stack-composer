@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from devops_stack_composer.process_runner import ProcessResult
+from devops_stack_composer.process_runner import (
+    NonZeroExitError,
+    ProcessErrorCategory,
+    ProcessResult,
+)
 from devops_stack_composer.release_assets import (
     ReleaseAssemblyRequest,
     ReleaseMaterialRequest,
@@ -80,14 +86,17 @@ class FakeRunner:
     def __init__(self, release: Path) -> None:
         self.release = release
         self.commands: list[tuple[str, ...]] = []
+        self.environments: list[dict[str, str]] = []
         self.dirty = False
         self.download_tampered = False
+        self.attestation_failure_name: str | None = None
         self.head_commit = SOURCE_REVISION
         self.tag_commit = SOURCE_REVISION
 
-    def run(self, argv, *, cwd=None, timeout=None):
+    def run(self, argv, *, cwd=None, environment=None, timeout=None):
         command = tuple(argv)
         self.commands.append(command)
+        self.environments.append(dict(environment or {}))
         stdout = ""
         if command[:3] == ("gh", "release", "download"):
             target = Path(command[command.index("--dir") + 1])
@@ -96,6 +105,18 @@ class FakeRunner:
             if self.download_tampered:
                 manifest = target / "release-manifest.json"
                 manifest.write_bytes(manifest.read_bytes() + b"changed")
+        elif command[:3] == ("gh", "attestation", "verify"):
+            if self.attestation_failure_name == Path(command[3]).name:
+                result = ProcessResult(
+                    argv=command,
+                    cwd=Path(cwd),
+                    returncode=1,
+                    stdout="",
+                    stderr="attestation rejected",
+                    duration_seconds=0.01,
+                )
+                raise NonZeroExitError(ProcessErrorCategory.NONZERO, result)
+            stdout = "[]\n"
         elif command[:2] == ("git", "status"):
             stdout = "?? private-name.txt\n" if self.dirty else ""
         elif command == ("git", "rev-parse", "--verify", "HEAD^{commit}"):
@@ -144,6 +165,11 @@ class ReleaseValidationTests(unittest.TestCase):
         )
         self.assertEqual(result.local.checksums, result.downloaded.checksums)
         self.assertTrue(result.to_dict()["downloadedFromGitHub"])
+        self.assertTrue(result.to_dict()["githubArtifactAttestationsVerified"])
+        self.assertEqual(
+            result.verified_attestation_count,
+            len(result.downloaded.checksums) + 1,
+        )
         parent = self.project / ".devops-stack" / "release-downloads"
         self.assertEqual(tuple(parent.iterdir()), ())
 
@@ -177,6 +203,16 @@ class ReleaseValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseGateError, "RELEASE_TAG_COMMIT_MISMATCH"):
             validate_published_release(self.request, self.runner)
 
+    def test_one_missing_github_attestation_fails_the_download_gate(self) -> None:
+        self.runner.attestation_failure_name = "SHA256SUMS"
+
+        with self.assertRaisesRegex(
+            ReleaseGateError, "RELEASE_ATTESTATION_INVALID"
+        ) as raised:
+            validate_published_release(self.request, self.runner)
+
+        self.assertEqual(raised.exception.stage_id, "release-download-verification")
+
     def test_repository_argument_is_closed_before_process_execution(self) -> None:
         with self.assertRaisesRegex(ValueError, "safe GitHub OWNER/REPO"):
             ReleaseGateRequest(
@@ -188,6 +224,37 @@ class ReleaseValidationTests(unittest.TestCase):
             )
 
         self.assertEqual(self.runner.commands, [])
+
+    def test_github_token_is_scoped_to_download_and_not_serialized(self) -> None:
+        with patch.dict(os.environ, {"GH_TOKEN": "release-token"}):
+            result = validate_published_release(self.request, self.runner)
+
+        download_index = self.runner.commands.index(
+            next(
+                command
+                for command in self.runner.commands
+                if command[:3] == ("gh", "release", "download")
+            )
+        )
+        self.assertEqual(
+            self.runner.environments[download_index],
+            {"GH_TOKEN": "release-token"},
+        )
+        github_indexes = {
+            index
+            for index, command in enumerate(self.runner.commands)
+            if command[:2] == ("gh", "attestation")
+            or command[:3] == ("gh", "release", "download")
+        }
+        self.assertTrue(
+            all(
+                environment == {"GH_TOKEN": "release-token"}
+                if index in github_indexes
+                else environment == {}
+                for index, environment in enumerate(self.runner.environments)
+            )
+        )
+        self.assertNotIn("release-token", str(result.to_dict()))
 
 
 if __name__ == "__main__":

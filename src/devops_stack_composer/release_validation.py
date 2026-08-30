@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from devops_stack_composer.filesystem import (
     contained_path,
@@ -45,6 +46,7 @@ class ReleaseCommandRunner(Protocol):
         argv: Sequence[str],
         *,
         cwd: Path | None = None,
+        environment: Mapping[str, str] | None = None,
         timeout: float | None = None,
     ) -> ProcessResult: ...
 
@@ -127,10 +129,17 @@ class ReleaseGateResult:
     stages: tuple[ReleaseGateStage, ...]
     head_commit: str
     tag_commit: str
+    verified_attestation_count: int
 
     def __post_init__(self) -> None:
         if tuple(stage.stage_id for stage in self.stages) != _STAGES:
             raise ValueError("release gate result must contain every gate in order")
+        if (
+            isinstance(self.verified_attestation_count, bool)
+            or not isinstance(self.verified_attestation_count, int)
+            or self.verified_attestation_count < 1
+        ):
+            raise ValueError("release gate result must verify at least one attestation")
 
     def to_dict(self) -> dict[str, Any]:
         manifest = self.local.manifest
@@ -146,6 +155,8 @@ class ReleaseGateResult:
             "evidenceDigest": manifest.evidence_digest,
             "provenanceMode": manifest.provenance_mode,
             "cryptographicallyVerified": manifest.cryptographically_verified,
+            "githubArtifactAttestationsVerified": True,
+            "verifiedAttestationSubjectCount": self.verified_attestation_count,
             "downloadedFromGitHub": True,
             "workingTreeClean": True,
             "headCommit": self.head_commit,
@@ -163,9 +174,15 @@ def _run(
     stage_id: str,
     code: str,
     completed: Sequence[ReleaseGateStage],
+    environment: Mapping[str, str] | None = None,
 ) -> ProcessResult:
     try:
-        return runner.run(tuple(argv), cwd=project, timeout=timeout)
+        return runner.run(
+            tuple(argv),
+            cwd=project,
+            environment=environment,
+            timeout=timeout,
+        )
     except ProcessExecutionError as exc:
         raise ReleaseGateError(
             code,
@@ -253,6 +270,9 @@ def validate_published_release(
         raise TypeError("request must be a ReleaseGateRequest")
     project = project_root(request.project)
     local = _verify_local(request)
+    github_environment = (
+        {"GH_TOKEN": os.environ["GH_TOKEN"]} if os.environ.get("GH_TOKEN") else None
+    )
     completed: list[ReleaseGateStage] = [
         ReleaseGateStage(
             "package",
@@ -311,8 +331,36 @@ def validate_published_release(
             stage_id="release-download-verification",
             code="RELEASE_DOWNLOAD_FAILED",
             completed=completed,
+            environment=github_environment,
         )
         downloaded = _verify_downloaded(request, relative, local, completed)
+        downloaded_names = tuple(sorted({*downloaded.checksums, "SHA256SUMS"}))
+        for name in downloaded_names:
+            _run(
+                runner,
+                (
+                    "gh",
+                    "attestation",
+                    "verify",
+                    str(downloaded_directory / name),
+                    "--repo",
+                    request.repository,
+                    "--signer-workflow",
+                    f"{request.repository}/.github/workflows/release.yml",
+                    "--source-digest",
+                    request.source_commit,
+                    "--source-ref",
+                    f"refs/tags/v{request.version}",
+                    "--format",
+                    "json",
+                ),
+                project=project,
+                timeout=120.0,
+                stage_id="release-download-verification",
+                code="RELEASE_ATTESTATION_INVALID",
+                completed=completed,
+                environment=github_environment,
+            )
     completed.append(
         ReleaseGateStage(
             "release-download-verification",
@@ -327,7 +375,10 @@ def validate_published_release(
                 "--dir",
                 "<private-temporary-directory>",
             ),
-            "Fresh GitHub release download exactly matched the local closed asset set",
+            (
+                "Fresh GitHub release download exactly matched the local closed asset set; "
+                f"{len(downloaded_names)} GitHub artifact attestations passed"
+            ),
         )
     )
 
@@ -419,6 +470,7 @@ def validate_published_release(
         stages=tuple(completed),
         head_commit=head_commit,
         tag_commit=tag_commit,
+        verified_attestation_count=len(downloaded_names),
     )
 
 
