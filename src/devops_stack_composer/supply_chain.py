@@ -838,16 +838,22 @@ class SupplyChainGenerator:
         timeout_seconds: int,
         source: str,
         code: str,
+        environment: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "cwd": cwd,
+            "capture_output": True,
+            "text": True,
+            "check": False,
+            "shell": False,
+            "timeout": timeout_seconds,
+        }
+        if environment is not None:
+            options["env"] = dict(environment)
         try:
             completed = self._command_runner(
                 list(command),
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                check=False,
-                shell=False,
-                timeout=timeout_seconds,
+                **options,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise SupplyChainError(
@@ -885,6 +891,7 @@ class SupplyChainGenerator:
         vulnerability_report_path: str = "vulnerabilities.json",
         provenance_path: str = "provenance.json",
         timeout_seconds: int = 900,
+        insecure_local_registry: bool = False,
     ) -> SupplyChainEvidence:
         """Generate all evidence for one immutable ``repository@sha256`` subject."""
 
@@ -898,6 +905,16 @@ class SupplyChainGenerator:
             or timeout_seconds <= 0
         ):
             raise ValueError("timeout_seconds must be a positive integer")
+        if not isinstance(insecure_local_registry, bool):
+            raise ValueError("insecure_local_registry must be boolean")
+        if insecure_local_registry and artifact.registry_endpoint.split(":", 1)[0] not in {
+            "127.0.0.1",
+            "localhost",
+        }:
+            raise SupplyChainError(
+                "INSECURE_REGISTRY_FORBIDDEN",
+                "plain HTTP scanning is restricted to a loopback registry",
+            )
         root = project_root(Path(run_root))
         reference = _immutable_reference(
             artifact.immutable_image_reference,
@@ -935,6 +952,11 @@ class SupplyChainGenerator:
             timeout_seconds=timeout_seconds,
             source="Syft SPDX output",
             code="MALFORMED_SBOM",
+            environment=(
+                {"SYFT_REGISTRY_INSECURE_USE_HTTP": "true"}
+                if insecure_local_registry
+                else None
+            ),
         )
         sbom_generator = validate_spdx_document(
             sbom_document,
@@ -950,7 +972,14 @@ class SupplyChainGenerator:
         validate_spdx_document(sbom_document, immutable_reference)
 
         vulnerability_report = self._run_json(
-            ("trivy", "image", "--format", "json", immutable_reference),
+            (
+                "trivy",
+                "image",
+                *(("--insecure",) if insecure_local_registry else ()),
+                "--format",
+                "json",
+                immutable_reference,
+            ),
             cwd=root,
             timeout_seconds=timeout_seconds,
             source="Trivy image scan output",

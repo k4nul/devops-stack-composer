@@ -158,6 +158,23 @@ class FixtureRunner:
         return subprocess.CompletedProcess(command, 0, json.dumps(output), "")
 
 
+class InsecureFixtureRunner(FixtureRunner):
+    def __call__(
+        self, command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        value = tuple(command)
+        self.calls.append((value, dict(kwargs)))
+        if value[0] == "syft":
+            output = self.sbom
+        elif value[:3] == ("trivy", "image", "--insecure"):
+            output = self.scan
+        elif value == ("trivy", "version", "--format", "json"):
+            output = self.version
+        else:
+            raise AssertionError(f"unexpected command: {value}")
+        return subprocess.CompletedProcess(command, 0, json.dumps(output), "")
+
+
 class SupplyChainTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -271,6 +288,50 @@ class SupplyChainTests(unittest.TestCase):
         self.assertFalse(evidence.policy_result["passed"])
         self.assertEqual(len(evidence.policy_result["violatingFindings"]), 1)
         self.assertTrue((self.run_root / evidence.provenance_path).is_file())
+
+    def test_insecure_registry_transport_is_loopback_only_and_explicit(self) -> None:
+        local = ResolvedArtifact(
+            **{
+                **artifact().__dict__,
+                "immutable_image_reference": REFERENCE.replace(
+                    "registry.example", "localhost:49153"
+                ),
+                "repository": REPOSITORY.replace(
+                    "registry.example", "localhost:49153"
+                ),
+                "registry_endpoint": "localhost:49153",
+            }
+        )
+        local_scan = trivy_fixture()
+        local_scan["ArtifactName"] = local.immutable_image_reference
+        runner = InsecureFixtureRunner(scan=local_scan)
+
+        SupplyChainGenerator(runner, clock=lambda: GENERATED_AT).generate(
+            run_root=self.run_root,
+            artifact=local,
+            policy=VulnerabilityPolicy(),
+            builder_id="https://ci.example/builders/local",
+            insecure_local_registry=True,
+        )
+
+        syft = runner.calls[0]
+        scan = runner.calls[1]
+        self.assertEqual(
+            syft[1]["env"], {"SYFT_REGISTRY_INSECURE_USE_HTTP": "true"}
+        )
+        self.assertIn("--insecure", scan[0])
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                SupplyChainError, "INSECURE_REGISTRY_FORBIDDEN"
+            ):
+                SupplyChainGenerator(FixtureRunner()).generate(
+                    run_root=Path(directory),
+                    artifact=artifact(),
+                    policy=VulnerabilityPolicy(),
+                    builder_id="https://ci.example/builders/local",
+                    insecure_local_registry=True,
+                )
 
     def test_empty_or_non_syft_spdx_is_rejected_before_any_write(self) -> None:
         for mutation in ("packages", "creator"):
