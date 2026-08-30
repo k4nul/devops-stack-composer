@@ -63,6 +63,18 @@
     },
     "policies": {
       "$ref": "#/definitions/policies"
+    },
+    "execution": {
+      "$ref": "#/definitions/execution"
+    },
+    "registry": {
+      "$ref": "#/definitions/registry"
+    },
+    "kubernetes": {
+      "$ref": "#/definitions/kubernetes"
+    },
+    "validation": {
+      "$ref": "#/definitions/validationPolicy"
     }
   },
   "definitions": {
@@ -447,24 +459,51 @@
     "supplyChain": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sbom", "provenance", "scan"],
+      "required": ["sbom", "provenance"],
+      "anyOf": [
+        {"required": ["scan"]},
+        {"required": ["vulnerability"]}
+      ],
       "properties": {
         "sbom": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["enabled", "format"],
+          "required": ["format"],
+          "anyOf": [
+            {"required": ["enabled"]},
+            {"required": ["required"]}
+          ],
           "properties": {
             "enabled": {"type": "boolean", "examples": [true]},
+            "required": {"type": "boolean", "examples": [true]},
             "format": {"type": "string", "enum": ["spdx-json", "cyclonedx-json"], "examples": ["spdx-json"]}
+          },
+          "not": {
+            "required": ["enabled", "required"],
+            "properties": {
+              "enabled": {"const": false},
+              "required": {"const": true}
+            }
           }
         },
         "provenance": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["enabled", "mode"],
+          "anyOf": [
+            {"required": ["enabled"]},
+            {"required": ["required"]}
+          ],
           "properties": {
             "enabled": {"type": "boolean", "examples": [true]},
+            "required": {"type": "boolean", "examples": [true]},
             "mode": {"type": "string", "enum": ["min", "max"], "examples": ["max"]}
+          },
+          "not": {
+            "required": ["enabled", "required"],
+            "properties": {
+              "enabled": {"const": false},
+              "required": {"const": true}
+            }
           }
         },
         "scan": {
@@ -475,6 +514,172 @@
             "enabled": {"type": "boolean", "examples": [true]},
             "failOn": {"type": "string", "enum": ["critical", "high", "medium", "never"], "examples": ["high"]}
           }
+        },
+        "vulnerability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["required", "severities", "ignoreUnfixed", "maximumAllowed"],
+          "properties": {
+            "required": {"type": "boolean", "examples": [true]},
+            "severities": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "enum": ["UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+              },
+              "examples": [["CRITICAL"]]
+            },
+            "ignoreUnfixed": {"type": "boolean", "examples": [true]},
+            "maximumAllowed": {"type": "integer", "minimum": 0, "examples": [0]},
+            "allowlist": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"$ref": "#/definitions/vulnerabilityException"},
+              "default": []
+            }
+          }
+        },
+        "verification": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requireSingleDigest", "requireDigestPinnedDeployment"],
+          "properties": {
+            "requireSingleDigest": {"type": "boolean", "examples": [true]},
+            "requireDigestPinnedDeployment": {"type": "boolean", "examples": [true]}
+          }
+        }
+      }
+    },
+    "vulnerabilityException": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "package", "reason", "owner", "expiresAt"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "examples": ["CVE-2026-12345"]
+        },
+        "package": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000-\\u001F\\u007F]+$", "examples": ["openssl"]},
+        "reason": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000-\\u001F\\u007F]+$", "examples": ["No reachable vulnerable code path"]},
+        "owner": {"type": "string", "minLength": 1, "pattern": "^[^\\u0000-\\u001F\\u007F]+$", "examples": ["security-team"]},
+        "expiresAt": {"type": "string", "format": "date", "examples": ["2026-12-31"]}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "workDirectory", "cleanup", "retainFailureEvidence"],
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": ["static", "supply-chain", "kind-e2e", "release", "local-kind"],
+          "examples": ["local-kind"]
+        },
+        "workDirectory": {"$ref": "#/definitions/relativePath"},
+        "cleanup": {
+          "type": "string",
+          "enum": ["always", "on-success", "never"],
+          "examples": ["always"]
+        },
+        "retainFailureEvidence": {"type": "boolean", "examples": [true]}
+      }
+    },
+    "registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "host", "repository", "insecureLocalhostOnly"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["ephemeral-local", "existing"],
+          "examples": ["ephemeral-local"]
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$",
+          "examples": ["auto", "registry.example:5000"]
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9]+(?:(?:[._]|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|-+)[a-z0-9]+)*)*$",
+          "examples": ["sample/python-service"]
+        },
+        "insecureLocalhostOnly": {"type": "boolean", "examples": [true]}
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["mode"],
+            "properties": {"mode": {"const": "ephemeral-local"}}
+          },
+          "then": {
+            "properties": {
+              "host": {"const": "auto"},
+              "insecureLocalhostOnly": {"const": true}
+            }
+          },
+          "else": {
+            "properties": {
+              "host": {"not": {"const": "auto"}}
+            }
+          }
+        }
+      ]
+    },
+    "kubernetes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["e2e"],
+      "properties": {
+        "e2e": {"$ref": "#/definitions/kubernetesE2E"}
+      }
+    },
+    "kubernetesE2E": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "environment",
+        "serverSideDryRunEnvironments",
+        "rolloutTimeoutSeconds",
+        "healthPath",
+        "readinessPath",
+        "rollbackTest",
+        "cleanup"
+      ],
+      "properties": {
+        "provider": {"type": "string", "const": "kind", "examples": ["kind"]},
+        "environment": {"type": "string", "enum": ["dev", "staging", "production"], "examples": ["staging"]},
+        "serverSideDryRunEnvironments": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "enum": ["dev", "staging", "production"]},
+          "examples": [["dev", "staging", "production"]]
+        },
+        "rolloutTimeoutSeconds": {"type": "integer", "minimum": 1, "examples": [180]},
+        "healthPath": {"type": "string", "pattern": "^/[^\\u0000-\\u001F\\u007F]*$", "examples": ["/health"]},
+        "readinessPath": {"type": "string", "pattern": "^/[^\\u0000-\\u001F\\u007F]*$", "examples": ["/ready"]},
+        "rollbackTest": {"type": "boolean", "examples": [true]},
+        "cleanup": {"type": "string", "enum": ["always", "on-success", "never"], "examples": ["always"]}
+      }
+    },
+    "validationPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile"],
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": ["static", "supply-chain", "kind-e2e", "release"],
+          "examples": ["static"]
         }
       }
     },

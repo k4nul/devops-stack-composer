@@ -79,6 +79,10 @@ class NormalizedDevOpsModel:
     supply_chain: dict[str, Any]
     security: dict[str, Any]
     policies: dict[str, Any]
+    execution: dict[str, Any]
+    registry: dict[str, Any]
+    kubernetes_e2e: dict[str, Any]
+    validation_profile: str
 
     @property
     def image_name(self) -> str:
@@ -166,6 +170,66 @@ def normalize_config(config: dict[str, Any]) -> NormalizedDevOpsModel:
 
     application = config["application"]
     build = config["build"]
+    validation_profile = config.get("validation", {}).get("profile", "static")
+
+    execution = deepcopy(
+        config.get(
+            "execution",
+            {
+                "profile": validation_profile,
+                "workDirectory": ".devops-stack/runs",
+                "cleanup": "always",
+                "retainFailureEvidence": True,
+            },
+        )
+    )
+    registry = deepcopy(
+        config.get(
+            "registry",
+            {
+                "mode": "existing",
+                "host": config["image"]["registry"],
+                "repository": config["image"]["repository"],
+                "insecureLocalhostOnly": False,
+            },
+        )
+    )
+    kubernetes_e2e = deepcopy(
+        config.get(
+            "kubernetes",
+            {
+                "e2e": {
+                    "provider": "kind",
+                    "environment": "staging",
+                    "serverSideDryRunEnvironments": list(ENVIRONMENT_ORDER),
+                    "rolloutTimeoutSeconds": 180,
+                    "healthPath": environments[1].health_path,
+                    "readinessPath": environments[1].readiness_path,
+                    "rollbackTest": True,
+                    "cleanup": "always",
+                }
+            },
+        )["e2e"]
+    )
+
+    supply_chain = deepcopy(config["supplyChain"])
+    for capability_name in ("sbom", "provenance"):
+        capability = supply_chain[capability_name]
+        if "enabled" not in capability:
+            capability["enabled"] = capability["required"]
+        if "required" not in capability:
+            capability["required"] = capability["enabled"]
+    supply_chain["provenance"].setdefault("mode", "max")
+    if "vulnerability" in supply_chain:
+        supply_chain["vulnerability"].setdefault("allowlist", [])
+    supply_chain.setdefault(
+        "verification",
+        {
+            "requireSingleDigest": False,
+            "requireDigestPinnedDeployment": False,
+        },
+    )
+
     return NormalizedDevOpsModel(
         application_name=application["name"],
         service_name=application["serviceName"],
@@ -193,7 +257,11 @@ def normalize_config(config: dict[str, Any]) -> NormalizedDevOpsModel:
         production_approval=config["ci"]["approval"]["production"],
         build=deepcopy(build),
         environments=tuple(environments),
-        supply_chain=deepcopy(config["supplyChain"]),
+        supply_chain=supply_chain,
         security=deepcopy(config["security"]),
         policies=deepcopy(config["policies"]),
+        execution=execution,
+        registry=registry,
+        kubernetes_e2e=kubernetes_e2e,
+        validation_profile=validation_profile,
     )
