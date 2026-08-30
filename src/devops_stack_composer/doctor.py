@@ -109,7 +109,12 @@ def run_doctor(
         ("java", ("java", "-version"), False, "Jenkins JVM validation will be skipped"),
         ("groovy", ("groovy", "--version"), False, "standalone Groovy syntax validation will be skipped"),
         ("kustomize", ("kustomize", "version"), False, "external overlay rendering will be skipped"),
-        ("kubectl", ("kubectl", "version", "--client"), False, "kubectl schema fallback will be skipped"),
+        (
+            "kubectl",
+            ("kubectl", "version", "--client"),
+            False,
+            "kubectl kustomize cross-check will be skipped",
+        ),
         ("kubeconform", ("kubeconform", "-v"), False, "strict Kubernetes schema validation will be skipped"),
         ("helm", ("helm", "version", "--short"), False, "upstream Helm rendering will be skipped"),
         ("syft", ("syft", "version"), False, "standalone SBOM inspection will be skipped"),

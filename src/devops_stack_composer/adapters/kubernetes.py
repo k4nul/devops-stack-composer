@@ -1580,8 +1580,18 @@ class KubernetesAdapter:
             (
                 "renderedBundle",
                 "validate-rendered-bundle.ps1",
-                ("-RenderedPath", str(rendered_root), "-SchemaValidator", "auto"),
-                ("-RenderedPath", "<ephemeral-render>", "-SchemaValidator", "auto"),
+                (
+                    "-RenderedPath",
+                    str(rendered_root),
+                    "-SchemaValidator",
+                    "kubeconform",
+                ),
+                (
+                    "-RenderedPath",
+                    "<ephemeral-render>",
+                    "-SchemaValidator",
+                    "kubeconform",
+                ),
             ),
             (
                 "securityBaseline",

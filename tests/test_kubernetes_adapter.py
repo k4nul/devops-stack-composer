@@ -658,6 +658,17 @@ class KubernetesAdapterTests(unittest.TestCase):
             if any(value.endswith("check-placeholders.ps1") for value in command)
         )
         self.assertIn("-FailOnMatch", placeholder_command)
+        rendered_bundle_command = next(
+            command
+            for command, _ in pwsh_calls
+            if any(value.endswith("validate-rendered-bundle.ps1") for value in command)
+        )
+        self.assertEqual(
+            rendered_bundle_command[
+                rendered_bundle_command.index("-SchemaValidator") + 1
+            ],
+            "kubeconform",
+        )
         platform_command = next(
             command
             for command, _ in query_calls

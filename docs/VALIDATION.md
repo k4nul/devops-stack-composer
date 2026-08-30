@@ -43,6 +43,11 @@ Adapters report deterministic render checks and results from official upstream s
 - Kubernetes profile/plan/render/security scripts;
 - optional Groovy, Kustomize, kubectl, and kubeconform checks.
 
+The upstream Kubernetes bundle validator is pinned to offline `kubeconform` mode;
+its built-in structural preflight still runs when kubeconform is absent. Separate
+`kustomize build` and `kubectl kustomize` checks exercise overlay rendering without
+contacting a cluster.
+
 Commands run in temporary staging directories with timeouts. Their bounded diagnostic
 details are available in JSON output and reports.
 

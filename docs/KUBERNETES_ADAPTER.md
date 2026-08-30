@@ -100,5 +100,11 @@ If installed, `kustomize build` and `kubectl kustomize` render all three overlay
 overlay is `FAILED`. PowerShell is required for the official upstream integration and
 its absence is `BLOCKED_MISSING_REQUIRED_TOOL`.
 
+The official rendered-bundle check is explicitly pinned to its `kubeconform` mode.
+This keeps repository validation offline: if kubeconform is unavailable, the
+upstream structural preflight runs and the schema check is reported as skipped.
+Composer does not allow the upstream `auto` mode to select `kubectl apply`, which
+may require API discovery even with client-side dry-run.
+
 The adapter does not contact a cluster, run `kubectl apply`, or generate Helm charts.
 Application deployment is the generated Jenkins pipeline's responsibility.
