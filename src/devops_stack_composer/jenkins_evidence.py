@@ -21,6 +21,8 @@ from devops_stack_composer.oci import (
     validate_sha256_hex,
     validate_tag,
 )
+from devops_stack_composer.policies import VulnerabilityPolicy
+from devops_stack_composer.supply_chain import parse_trivy_findings
 
 
 _FIELDS = {
@@ -86,6 +88,7 @@ def verify_jenkins_artifact_files(
     sbom_path: str | None = None,
     scan_path: str | None = None,
     provenance_path: str | None = None,
+    vulnerability_policy: VulnerabilityPolicy | None = None,
 ) -> ArtifactVerification:
     """Strictly compare every supplied Jenkins evidence subject offline."""
 
@@ -177,6 +180,16 @@ def verify_jenkins_artifact_files(
     if scan_path is not None:
         scan = load_strict_json_file(project, scan_path)
         validate_scan_subject(scan, expected_digest=manifest_digest)
+        if vulnerability_policy is not None:
+            result = vulnerability_policy.evaluate(
+                parse_trivy_findings(scan, immutable_reference)
+            )
+            if not result.passed:
+                raise ArtifactContractError(
+                    "VULNERABILITY_POLICY_FAILED",
+                    "Jenkins scanner findings exceed the configured policy",
+                    evidence_path=scan_path,
+                )
         artifact_name = scan["ArtifactName"]
         assert isinstance(artifact_name, str)
         subjects["scan"] = str(digest_from_subject(artifact_name))
@@ -195,4 +208,3 @@ def verify_jenkins_artifact_files(
         authoritative_digest=str(authoritative),
         subjects=subjects,
     )
-

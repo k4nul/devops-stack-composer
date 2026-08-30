@@ -21,7 +21,11 @@ from devops_stack_composer.adapters.base import (
 )
 from devops_stack_composer.archives import extract_locked_source
 from devops_stack_composer.errors import SourceResolutionError
-from devops_stack_composer.model import IMAGE_TAG_PLACEHOLDER, NormalizedDevOpsModel
+from devops_stack_composer.model import (
+    IMAGE_TAG_PLACEHOLDER,
+    NormalizedDevOpsModel,
+    supply_chain_scan_requested,
+)
 from devops_stack_composer.sources import SourceResolution
 
 
@@ -692,7 +696,6 @@ esac
         )
         sbom = model.supply_chain.get("sbom", {})
         provenance = model.supply_chain.get("provenance", {})
-        scan = model.supply_chain.get("scan", {})
         value: dict[str, Any] = {
             "adapterVersion": ADAPTER_VERSION,
             "applicationType": model.application_type,
@@ -731,7 +734,7 @@ esac
                     "wired": True,
                 },
                 "scan": {
-                    "requested": bool(scan.get("enabled")),
+                    "requested": supply_chain_scan_requested(model.supply_chain),
                     "supportedByUpstream": False,
                     "wired": False,
                 },

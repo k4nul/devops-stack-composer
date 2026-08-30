@@ -20,7 +20,11 @@ from devops_stack_composer.adapters.base import (
     AdapterResult,
     GeneratedArtifact,
 )
-from devops_stack_composer.model import EnvironmentModel, NormalizedDevOpsModel
+from devops_stack_composer.model import (
+    EnvironmentModel,
+    NormalizedDevOpsModel,
+    supply_chain_scan_requested,
+)
 from devops_stack_composer.sources import SourceResolution
 from devops_stack_composer.validation import ValidationStatus
 
@@ -463,17 +467,28 @@ def _scan_stage_lines(
     routed_branches: tuple[str, ...],
 ) -> list[str]:
     scan = model.supply_chain.get("scan", {})
-    enabled = bool(scan.get("enabled", False))
-    fail_on = str(scan.get("failOn", "high"))
-    severities = (
-        "LOW,MEDIUM,HIGH,CRITICAL" if fail_on == "never" else _scan_severities(fail_on)
-    )
-    exit_code = 0 if fail_on == "never" else 1
+    vulnerability = model.supply_chain.get("vulnerability")
+    if isinstance(vulnerability, dict):
+        enabled = vulnerability.get("required") is True
+        # The subsequent composer verifier applies thresholds, expiring
+        # exceptions, and unknown-severity handling to the complete JSON report.
+        exit_code = 0
+        policy_arguments = ""
+    else:
+        enabled = bool(scan.get("enabled", False))
+        fail_on = str(scan.get("failOn", "high"))
+        severities = (
+            "LOW,MEDIUM,HIGH,CRITICAL"
+            if fail_on == "never"
+            else _scan_severities(fail_on)
+        )
+        exit_code = 0 if fail_on == "never" else 1
+        policy_arguments = f" --severity {severities}"
     output_path = "out/supply-chain/vulnerabilities.json"
     command = (
         "mkdir -p out/supply-chain && "
         f"trivy image --format json --output {output_path} --exit-code {exit_code} "
-        f"--severity {severities} \"$IMAGE_REF\""
+        f"{policy_arguments.strip()}\"$IMAGE_REF\""
     )
     lines = ["        stage('Scan Same Digest') {"]
     lines.extend(_branch_when_lines(routed_branches, "            "))
@@ -535,7 +550,7 @@ def _verify_artifact_stage_lines(
     arguments = ["--artifact out/execution/artifact.json"]
     if model.supply_chain.get("sbom", {}).get("enabled", False):
         arguments.append("--sbom out/supply-chain/sbom.json")
-    if model.supply_chain.get("scan", {}).get("enabled", False):
+    if supply_chain_scan_requested(model.supply_chain):
         arguments.append("--scan out/supply-chain/vulnerabilities.json")
     if model.supply_chain.get("provenance", {}).get("enabled", False):
         arguments.append("--provenance out/supply-chain/provenance.json")
@@ -1000,8 +1015,11 @@ def _summarize_upstream_plan(
 def _local_supply_chain_capability(model: NormalizedDevOpsModel) -> AdapterDiagnostic:
     requested = tuple(
         name
-        for name in ("sbom", "scan")
-        if model.supply_chain.get(name, {}).get("enabled", False)
+        for name, enabled in (
+            ("sbom", bool(model.supply_chain.get("sbom", {}).get("enabled", False))),
+            ("scan", supply_chain_scan_requested(model.supply_chain)),
+        )
+        if enabled
     )
     return AdapterDiagnostic(
         status=PASSED,

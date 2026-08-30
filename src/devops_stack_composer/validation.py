@@ -13,7 +13,10 @@ from typing import Any, Iterable
 import yaml
 
 from devops_stack_composer.adapters.base import AdapterResult
-from devops_stack_composer.model import NormalizedDevOpsModel
+from devops_stack_composer.model import (
+    NormalizedDevOpsModel,
+    supply_chain_scan_requested,
+)
 
 
 class ValidationStatus(str, Enum):
@@ -574,7 +577,7 @@ def _docker_artifact_mismatches(
     capability_expectations = {
         "sbom": bool(model.supply_chain.get("sbom", {}).get("enabled")),
         "provenance": bool(provenance.get("enabled")),
-        "scan": bool(model.supply_chain.get("scan", {}).get("enabled")),
+        "scan": supply_chain_scan_requested(model.supply_chain),
         "cache": bool(
             model.build.get("cache", {}).get("enabled")
             or model.build.get("cache", {}).get("from")
@@ -1064,7 +1067,7 @@ def _jenkins_v2_artifact_mismatches(
             'syft "$IMAGE_REF"',
         ),
         "Scan Same Digest": (
-            bool(model.supply_chain.get("scan", {}).get("enabled", False)),
+            supply_chain_scan_requested(model.supply_chain),
             'trivy image --format json --output out/supply-chain/vulnerabilities.json',
         ),
         "Produce Provenance": (
@@ -1856,7 +1859,7 @@ def _jenkins_artifact_mismatches(
         container_lines = [line.strip() for line in container_entry[1].splitlines()]
         local_checks_requested = bool(
             model.supply_chain.get("sbom", {}).get("enabled", False)
-            or model.supply_chain.get("scan", {}).get("enabled", False)
+            or supply_chain_scan_requested(model.supply_chain)
         )
         if local_checks_requested and len(model.architectures) == 1:
             expected_local_intent = "sh './generated/docker/build.sh --load'"

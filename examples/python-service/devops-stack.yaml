@@ -55,10 +55,6 @@ environments:
     replicas: 2
     environment:
       APP_ENV: staging
-    secretRefs:
-      - name: python-service-secrets
-        keys:
-          - API_TOKEN
   production:
     namespace: python-service-production
     replicas: 3
@@ -110,14 +106,46 @@ deployment:
     revisionHistoryLimit: 10
 supplyChain:
   sbom:
-    enabled: true
+    required: true
     format: spdx-json
   provenance:
-    enabled: true
+    required: true
     mode: max
-  scan:
-    enabled: true
-    failOn: high
+  vulnerability:
+    required: true
+    severities:
+      - CRITICAL
+    ignoreUnfixed: true
+    maximumAllowed: 0
+    allowlist: []
+  verification:
+    requireSingleDigest: true
+    requireDigestPinnedDeployment: true
+execution:
+  profile: kind-e2e
+  workDirectory: .devops-stack/runs
+  cleanup: always
+  retainFailureEvidence: true
+registry:
+  mode: ephemeral-local
+  host: auto
+  repository: k4nul/devops-stack-composer-example
+  insecureLocalhostOnly: true
+kubernetes:
+  e2e:
+    provider: kind
+    environment: staging
+    serverSideDryRunEnvironments:
+      - dev
+      - staging
+      - production
+    rolloutTimeoutSeconds: 180
+    healthPath: /health
+    readinessPath: /ready
+    rollbackTest: true
+    cleanup: always
+validation:
+  profile: kind-e2e
 security:
   runAsNonRoot: true
   runAsUser: 10001

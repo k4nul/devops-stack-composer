@@ -26,6 +26,7 @@ from devops_stack_composer.evidence_store import EvidenceStore
 from devops_stack_composer.execution import (
     ExecutionOptions,
     ExecutionOrchestrator,
+    vulnerability_policy_from_model,
 )
 from devops_stack_composer.execution_bundle import (
     inspect_execution_bundle,
@@ -263,6 +264,11 @@ def build_parser() -> argparse.ArgumentParser:
     artifact_verify.add_argument("--sbom", help="Jenkins SBOM JSON path")
     artifact_verify.add_argument("--scan", help="Jenkins vulnerability JSON path")
     artifact_verify.add_argument("--provenance", help="Jenkins provenance JSON path")
+    artifact_verify.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG,
+        help="configuration used to evaluate Jenkins vulnerability policy",
+    )
     artifact_verify.add_argument(
         "--output",
         default=".devops-stack/runs",
@@ -581,6 +587,10 @@ def _run_execute(args: argparse.Namespace) -> int:
         lock=_load_lock(args, project),
         explicit_template_paths=_explicit_templates(args),
         fetch_templates=not args.no_fetch,
+        # Execution reuses only immutable adapter output and runs its own runtime
+        # validators. Read-only upstream smoke queries remain part of `validate`,
+        # where transient template-tool latency cannot occur after resources start.
+        validate_upstream=False,
     )
     work_directory = args.output or composition.loaded_config.model.execution[
         "workDirectory"
@@ -655,12 +665,21 @@ def _run_artifact_verify(args: argparse.Namespace) -> int:
         )
         value = verification.to_dict()
     else:
+        vulnerability_policy = None
+        if args.scan is not None:
+            from devops_stack_composer.config import load_config
+
+            loaded = load_config(contained_path(project, args.config))
+            vulnerability_policy = vulnerability_policy_from_model(
+                loaded.model.supply_chain
+            )
         verification = verify_jenkins_artifact_files(
             project,
             args.artifact,
             sbom_path=args.sbom,
             scan_path=args.scan,
             provenance_path=args.provenance,
+            vulnerability_policy=vulnerability_policy,
         )
         value = verification.to_dict()
     if args.json_output:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from devops_stack_composer.evidence_validation import ArtifactContractError
 from devops_stack_composer.jenkins_evidence import verify_jenkins_artifact_files
+from devops_stack_composer.policies import VulnerabilityPolicy
 
 
 DIGEST = "sha256:" + "a" * 64
@@ -113,6 +114,45 @@ class JenkinsEvidenceTests(unittest.TestCase):
                     root,
                     "artifact.json",
                     scan_path="scan.json",
+                )
+
+    def test_applies_configured_policy_to_complete_trivy_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.records(root)
+            write_json(
+                root,
+                "scan.json",
+                {
+                    "SchemaVersion": 2,
+                    "ArtifactName": REFERENCE,
+                    "ArtifactType": "container_image",
+                    "Results": [
+                        {
+                            "Vulnerabilities": [
+                                {
+                                    "VulnerabilityID": "CVE-2026-1",
+                                    "PkgName": "sample",
+                                    "InstalledVersion": "1.0",
+                                    "FixedVersion": "2.0",
+                                    "Severity": "CRITICAL",
+                                    "Status": "affected",
+                                }
+                            ]
+                        }
+                    ],
+                },
+            )
+
+            with self.assertRaisesRegex(
+                ArtifactContractError,
+                "VULNERABILITY_POLICY_FAILED",
+            ):
+                verify_jenkins_artifact_files(
+                    root,
+                    "artifact.json",
+                    scan_path="scan.json",
+                    vulnerability_policy=VulnerabilityPolicy(ignore_unfixed=False),
                 )
 
 

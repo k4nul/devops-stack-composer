@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 
 ENVIRONMENT_ORDER = ("dev", "staging", "production")
@@ -15,6 +15,16 @@ TAG_EXPRESSIONS = {
     "semver": "${VERSION}",
 }
 IMAGE_TAG_PLACEHOLDER = "__IMAGE_TAG__"
+
+
+def supply_chain_scan_requested(value: Mapping[str, Any]) -> bool:
+    """Return one capability flag for both v0.1 and v0.2 policy shapes."""
+
+    vulnerability = value.get("vulnerability")
+    if isinstance(vulnerability, Mapping):
+        return vulnerability.get("required") is True
+    scan = value.get("scan")
+    return isinstance(scan, Mapping) and scan.get("enabled") is True
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

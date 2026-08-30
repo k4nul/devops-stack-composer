@@ -655,6 +655,46 @@ class JenkinsAdapterTests(unittest.TestCase):
         sbom_stage = jenkinsfile[sbom_start:sbom_end]
         self.assertIn("branch pattern: 'main', comparator: 'GLOB'", sbom_stage)
 
+    def test_v02_vulnerability_policy_emits_complete_scan_for_composer_evaluation(self) -> None:
+        raw = copy.deepcopy(load_config(CONFIG_FIXTURE).raw)
+        raw["image"]["architectures"] = ["linux/amd64"]
+        raw["supplyChain"] = {
+            "sbom": {"required": True, "format": "spdx-json"},
+            "provenance": {"required": True},
+            "vulnerability": {
+                "required": True,
+                "severities": ["CRITICAL"],
+                "ignoreUnfixed": True,
+                "maximumAllowed": 0,
+                "allowlist": [],
+            },
+            "verification": {
+                "requireSingleDigest": True,
+                "requireDigestPinnedDeployment": True,
+            },
+        }
+        model = normalize_config(raw)
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.render_without_validation(
+                make_source(Path(directory)),
+                model=model,
+            )
+
+        jenkinsfile = result.artifact("jenkins/Jenkinsfile").content
+        self.assertIn(
+            "--exit-code 0 \"$IMAGE_REF\"",
+            jenkinsfile,
+        )
+        self.assertNotIn("--severity CRITICAL", jenkinsfile)
+        self.assertNotIn("--ignore-unfixed", jenkinsfile)
+        self.assertIn(
+            "devops-stack artifact verify --artifact out/execution/artifact.json "
+            "--sbom out/supply-chain/sbom.json "
+            "--scan out/supply-chain/vulnerabilities.json "
+            "--provenance out/supply-chain/provenance.json",
+            jenkinsfile,
+        )
+
     def test_generated_shell_fragments_are_syntactically_valid(self) -> None:
         scripts = [
             _authenticated_push_script(),
