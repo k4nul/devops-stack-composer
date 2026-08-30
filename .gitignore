@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Generated and local runtime state
+generated/
+generated-preview/
+.devops-stack/
+
+# Local-only operator and agent state
+AGENTS.md
+.codex/
+docs/management/
+.env
+.env.*
+!.env.example
+*.log
+*.pem
+*.key
+*.p12
