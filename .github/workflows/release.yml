@@ -1,0 +1,436 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Build and verify closed release assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release-version.outputs.version }}
+      evidence-run: ${{ steps.execution-run.outputs.run-id }}
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Validate tag, version, commit, and worktree
+        id: release-version
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          match = re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag)
+          assert match is not None, tag
+          version = tag[1:]
+          metadata = tomllib.loads(Path("pyproject.toml").read_text())
+          assert metadata["project"]["version"] == version, metadata["project"]["version"]
+          head = subprocess.run(
+              ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.strip()
+          tagged = subprocess.run(
+              ["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.strip()
+          status = subprocess.run(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout
+          assert head == tagged == os.environ["GITHUB_SHA"], (head, tagged)
+          assert status == "", status
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+              stream.write(f"version={version}\n")
+          PY
+
+      - name: Install package and release tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . build==1.6.0 twine==7.0.0
+          python -m pip check
+
+      - name: Run the complete unit and integration suite
+        run: python -m unittest discover -s tests -q
+
+      - name: Install checksum-pinned execution tools
+        run: |
+          scripts/install-kind-e2e-tools.sh "$RUNNER_TEMP/devops-stack-tools"
+          echo "$RUNNER_TEMP/devops-stack-tools" >> "$GITHUB_PATH"
+
+      - name: Resolve immutable templates and diagnose the release host
+        run: |
+          devops-stack templates list \
+            --project examples/python-service \
+            --json > "$RUNNER_TEMP/templates.json"
+          devops-stack doctor \
+            --project examples/python-service \
+            --no-fetch \
+            --profile kind-e2e \
+            --json > "$RUNNER_TEMP/doctor.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads((Path(os.environ["RUNNER_TEMP"]) / "doctor.json").read_text())
+          assert report["passed"] is True, report
+          assert report["counts"]["BLOCKED_MISSING_REQUIRED_TOOL"] == 0, report["counts"]
+          PY
+
+      - name: Allocate an execution run ID
+        id: execution-run
+        run: |
+          RUN_ID=$(python -c 'from devops_stack_composer.evidence_store import new_run_id; print(new_run_id())')
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          echo "run-id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Produce real Docker and kind evidence
+        run: |
+          devops-stack execute \
+            --project examples/python-service \
+            --no-fetch \
+            --environment staging \
+            --profile kind-e2e \
+            --output .devops-stack/release-runs \
+            --image-tag "release-${GITHUB_SHA::12}" \
+            --run "$RUN_ID" \
+            --json > "$RUNNER_TEMP/execution.json"
+          devops-stack artifact verify \
+            --project examples/python-service \
+            --run "$RUN_ID" \
+            --output .devops-stack/release-runs \
+            --json > "$RUNNER_TEMP/evidence-verification.json"
+
+      - name: Build and inspect distributions
+        run: |
+          python -m build
+          python -m twine check dist/*.whl dist/*.tar.gz
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          wheel = tuple(Path("dist").glob("devops_stack_composer-*.whl"))
+          sdist = tuple(Path("dist").glob("devops_stack_composer-*.tar.gz"))
+          assert len(wheel) == len(sdist) == 1, (wheel, sdist)
+          with zipfile.ZipFile(wheel[0]) as archive:
+              names = archive.namelist()
+          assert any(name.endswith("/METADATA") for name in names), names
+          with tarfile.open(sdist[0], "r:gz") as archive:
+              names = archive.getnames()
+          assert any(name.endswith("/PKG-INFO") for name in names), names
+          PY
+
+      - name: Assemble and offline-verify the release set
+        run: |
+          devops-stack release materials \
+            --project . \
+            --version "${GITHUB_REF_NAME#v}" \
+            --commit "$GITHUB_SHA" \
+            --output dist/release-materials \
+            --json > "$RUNNER_TEMP/release-materials.json"
+          devops-stack release assemble \
+            --project . \
+            --version "${GITHUB_REF_NAME#v}" \
+            --commit "$GITHUB_SHA" \
+            --materials dist/release-materials \
+            --evidence-run "$RUN_ID" \
+            --evidence-output examples/python-service/.devops-stack/release-runs \
+            --output "dist/release-${GITHUB_REF_NAME}" \
+            --json > "$RUNNER_TEMP/release-assembly.json"
+          devops-stack release verify \
+            --project . \
+            --directory "dist/release-${GITHUB_REF_NAME}" \
+            --version "${GITHUB_REF_NAME#v}" \
+            --commit "$GITHUB_SHA" \
+            --json > "$RUNNER_TEMP/release-verification.json"
+          python -m json.tool "$RUNNER_TEMP/release-verification.json"
+
+      - name: Retry exact owned-resource cleanup
+        if: ${{ always() }}
+        run: |
+          run_directory="examples/python-service/.devops-stack/release-runs/$RUN_ID"
+          if [[ -d "$run_directory" ]]; then
+            devops-stack execution cleanup \
+              --project examples/python-service \
+              --run "$RUN_ID" \
+              --output .devops-stack/release-runs \
+              --json
+          fi
+
+      - name: Upload the closed release set
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ github.ref_name }}
+          path: dist/release-${{ github.ref_name }}
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-github:
+    name: Attest, publish, and independently download
+    needs: build-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install the verifier
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip check
+
+      - name: Download the closed set from the build job
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: release-${{ github.ref_name }}
+          path: release-assets
+
+      - name: Generate GitHub artifact attestations
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-assets/*
+
+      - name: Publish the GitHub release
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "DevOps Stack Composer $GITHUB_REF_NAME" \
+            --generate-notes
+
+      - name: Independently download and verify publication
+        run: |
+          mkdir -p .devops-stack/published-release
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir .devops-stack/published-release
+          devops-stack release verify \
+            --project . \
+            --directory .devops-stack/published-release \
+            --version "${GITHUB_REF_NAME#v}" \
+            --commit "$GITHUB_SHA" \
+            --json > "$RUNNER_TEMP/published-verification.json"
+          python - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+
+          def inventory(directory):
+              return {
+                  path.name: sha256(path.read_bytes()).hexdigest()
+                  for path in directory.iterdir()
+                  if path.is_file() and not path.is_symlink()
+              }
+
+          assert inventory(Path("release-assets")) == inventory(
+              Path(".devops-stack/published-release")
+          )
+          PY
+          for asset in .devops-stack/published-release/*; do
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF" \
+              --format json > /dev/null
+          done
+          gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,publishedAt,assets \
+            > "$RUNNER_TEMP/publication.json"
+          python -m json.tool "$RUNNER_TEMP/publication.json"
+
+  post-publication:
+    name: Run the cumulative published-release profile
+    needs:
+      - build-release
+      - publish-github
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      RELEASE_VERSION: ${{ needs.build-release.outputs.version }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package and checksum-pinned execution tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip check
+          scripts/install-kind-e2e-tools.sh "$RUNNER_TEMP/devops-stack-tools"
+          echo "$RUNNER_TEMP/devops-stack-tools" >> "$GITHUB_PATH"
+
+      - name: Download the local comparison set
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: release-${{ github.ref_name }}
+          path: examples/python-service/.devops-stack/release-${{ github.ref_name }}
+
+      - name: Resolve immutable templates
+        run: |
+          devops-stack templates list \
+            --project examples/python-service \
+            --json > "$RUNNER_TEMP/templates.json"
+
+      - name: Allocate a post-publication run ID
+        run: |
+          RUN_ID=$(python -c 'from devops_stack_composer.evidence_store import new_run_id; print(new_run_id())')
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+
+      - name: Execute every release gate
+        run: |
+          devops-stack execute \
+            --project examples/python-service \
+            --no-fetch \
+            --environment staging \
+            --profile release \
+            --output .devops-stack/post-release-runs \
+            --image-tag "published-${GITHUB_SHA::12}" \
+            --run "$RUN_ID" \
+            --release-assets ".devops-stack/release-${GITHUB_REF_NAME}" \
+            --release-version "$RELEASE_VERSION" \
+            --release-repository "$GITHUB_REPOSITORY" \
+            --json > "$RUNNER_TEMP/post-release.json"
+          devops-stack artifact verify \
+            --project examples/python-service \
+            --run "$RUN_ID" \
+            --output .devops-stack/post-release-runs \
+            --json > "$RUNNER_TEMP/post-release-verification.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("examples/python-service/.devops-stack/post-release-runs") / os.environ["RUN_ID"]
+          release = json.loads((root / "release-validation.json").read_text())
+          artifact = json.loads((root / "artifact.json").read_text())
+          verification = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "post-release-verification.json").read_text()
+          )
+          assert release["downloadedFromGitHub"] is True, release
+          assert release["githubArtifactAttestationsVerified"] is True, release
+          assert release["workingTreeClean"] is True, release
+          assert release["sourceCommit"] == os.environ["GITHUB_SHA"], release
+          assert release["tagCommit"] == os.environ["GITHUB_SHA"], release
+          assert artifact["buildInvocationCount"] == 1, artifact
+          assert verification["executionSucceeded"] is True, verification
+          assert verification["artifactDigest"] == artifact["manifestDigest"], verification
+          PY
+
+      - name: Retry exact owned-resource cleanup
+        if: ${{ always() && env.RUN_ID != '' }}
+        run: |
+          run_directory="examples/python-service/.devops-stack/post-release-runs/$RUN_ID"
+          if [[ -d "$run_directory" ]]; then
+            devops-stack execution cleanup \
+              --project examples/python-service \
+              --run "$RUN_ID" \
+              --output .devops-stack/post-release-runs \
+              --json
+          fi
+
+      - name: Upload post-publication evidence
+        if: ${{ always() && env.RUN_ID != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: post-publication-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: examples/python-service/.devops-stack/post-release-runs/${{ env.RUN_ID }}
+          if-no-files-found: warn
+          retention-days: 30
+
+  publish-pypi:
+    name: Publish distributions to PyPI
+    if: ${{ vars.PUBLISH_TO_PYPI == 'true' }}
+    needs:
+      - build-release
+      - publish-github
+      - post-publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/devops-stack-composer
+    permissions:
+      actions: read
+      id-token: write
+    steps:
+      - name: Download the verified release set
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: release-${{ github.ref_name }}
+          path: release-assets
+
+      - name: Select only Python distributions
+        run: |
+          mkdir pypi-dist
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          assets = Path("release-assets")
+          wheels = tuple(assets.glob("devops_stack_composer-*.whl"))
+          sdists = tuple(assets.glob("devops_stack_composer-*.tar.gz"))
+          assert len(wheels) == len(sdists) == 1, (wheels, sdists)
+          for source in (*wheels, *sdists):
+              shutil.copyfile(source, Path("pypi-dist") / source.name)
+          PY
+
+      - name: Publish with PyPI trusted publishing
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          packages-dir: pypi-dist/

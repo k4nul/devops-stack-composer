@@ -1,0 +1,189 @@
+name: Execution E2E
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: execution-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kind-e2e:
+    name: Docker, registry, and kind execution
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip check
+
+      - name: Install checksum-pinned execution tools
+        run: |
+          scripts/install-kind-e2e-tools.sh "$RUNNER_TEMP/devops-stack-tools"
+          echo "$RUNNER_TEMP/devops-stack-tools" >> "$GITHUB_PATH"
+
+      - name: Verify host and resolve immutable templates
+        run: |
+          docker version
+          docker buildx version
+          pwsh --version
+          devops-stack templates list \
+            --project examples/python-service \
+            --json > "$RUNNER_TEMP/templates.json"
+          devops-stack doctor \
+            --project examples/python-service \
+            --no-fetch \
+            --profile kind-e2e \
+            --json > "$RUNNER_TEMP/doctor.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads((Path(os.environ["RUNNER_TEMP"]) / "doctor.json").read_text())
+          assert report["passed"] is True, report
+          assert report["counts"]["FAILED"] == 0, report["counts"]
+          assert report["counts"]["BLOCKED_MISSING_REQUIRED_TOOL"] == 0, report["counts"]
+          PY
+
+      - name: Allocate an explicit run ID
+        run: |
+          RUN_ID=$(python -c 'from devops_stack_composer.evidence_store import new_run_id; print(new_run_id())')
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+
+      - name: Execute the real kind profile
+        run: |
+          set +e
+          devops-stack execute \
+            --project examples/python-service \
+            --no-fetch \
+            --environment staging \
+            --profile kind-e2e \
+            --output .devops-stack/ci-runs \
+            --image-tag "ci-${GITHUB_SHA::12}" \
+            --run "$RUN_ID" \
+            --json > "$RUNNER_TEMP/execution.json"
+          execution_status=$?
+          set -e
+          if [[ -s "$RUNNER_TEMP/execution.json" ]]; then
+            python -m json.tool "$RUNNER_TEMP/execution.json"
+          fi
+          exit "$execution_status"
+
+      - name: Verify the closed evidence and same-digest invariant
+        run: |
+          devops-stack artifact verify \
+            --project examples/python-service \
+            --run "$RUN_ID" \
+            --output .devops-stack/ci-runs \
+            --json > "$RUNNER_TEMP/evidence-verification.json"
+          devops-stack execution show \
+            --project examples/python-service \
+            --run "$RUN_ID" \
+            --output .devops-stack/ci-runs \
+            --json > "$RUNNER_TEMP/execution-show.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("examples/python-service/.devops-stack/ci-runs") / os.environ["RUN_ID"]
+          artifact = json.loads((root / "artifact.json").read_text())
+          attestation = json.loads((root / "attestation.json").read_text())
+          deployment = json.loads((root / "deployment.json").read_text())
+          verification = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "evidence-verification.json").read_text()
+          )
+          shown = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "execution-show.json").read_text()
+          )
+          digest = artifact["manifestDigest"]
+          assert artifact["buildInvocationCount"] == 1, artifact
+          assert artifact["sourceRevision"] == os.environ["GITHUB_SHA"], artifact
+          assert attestation["artifactDigest"] == digest, attestation
+          assert deployment["artifactDigest"] == digest, deployment
+          assert verification["verified"] is True, verification
+          assert verification["executionSucceeded"] is True, verification
+          assert shown["bundleVerification"]["artifactDigest"] == digest, shown
+          assert shown["resources"]["cleaned"] is True, shown["resources"]
+          PY
+
+      - name: Retry exact owned-resource cleanup
+        if: ${{ always() && env.RUN_ID != '' }}
+        run: |
+          run_directory="examples/python-service/.devops-stack/ci-runs/$RUN_ID"
+          if [[ -d "$run_directory" ]]; then
+            devops-stack execution cleanup \
+              --project examples/python-service \
+              --run "$RUN_ID" \
+              --output .devops-stack/ci-runs \
+              --json
+          fi
+
+      - name: Assert owned Docker resources are absent
+        if: ${{ always() && env.RUN_ID != '' }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          run_id = os.environ["RUN_ID"]
+          root = Path("examples/python-service/.devops-stack/ci-runs") / run_id
+          resources_path = root / "resources.json"
+          if resources_path.is_file():
+              resources = json.loads(resources_path.read_text())
+              assert resources["registry"]["status"] == "removed", resources
+              assert resources["kind"]["status"] == "removed", resources
+              for resource in (resources["registry"], *resources["kind"]["nodes"]):
+                  result = subprocess.run(
+                      ["docker", "inspect", resource["containerId"]],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                      check=False,
+                  )
+                  assert result.returncode != 0, resource
+          result = subprocess.run(
+              [
+                  "docker",
+                  "ps",
+                  "--all",
+                  "--quiet",
+                  "--filter",
+                  f"label=io.devops-stack-composer.run-id={run_id}",
+              ],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          assert result.stdout.strip() == "", result.stdout
+          PY
+
+      - name: Upload execution evidence
+        if: ${{ always() && env.RUN_ID != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: execution-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: examples/python-service/.devops-stack/ci-runs/${{ env.RUN_ID }}
+          if-no-files-found: warn
+          retention-days: 14
