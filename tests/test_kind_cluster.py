@@ -283,12 +283,22 @@ class KindClusterTests(unittest.TestCase):
         self.assertEqual(handle.context, f"kind-{cluster.name}")
         self.assertEqual(handle.nodes, (f"{cluster.name}-control-plane",))
         self.assertEqual(handle.node_container_ids, (NODE_ID,))
+        recovery = cluster.recovery_identity
+        assert recovery is not None
+        self.assertEqual(recovery.run_id, cluster.run_id)
+        self.assertEqual(recovery.name, cluster.name)
+        self.assertEqual(recovery.context, handle.context)
+        self.assertEqual(recovery.node_image, KIND_NODE_IMAGE)
+        self.assertEqual(recovery.nodes[0].name, handle.nodes[0])
+        self.assertEqual(recovery.nodes[0].container_id, NODE_ID)
+        self.assertEqual(recovery.nodes[0].role, "control-plane")
         for options in runner.call_options:
             self.assertFalse(options["check"])
             self.assertTrue(options["capture_output"])
             self.assertTrue(options["text"])
             self.assertNotIn("input", options)
         cluster.destroy()
+        self.assertIsNone(cluster.recovery_identity)
 
     def test_generated_names_are_unique_dns_safe_and_run_scoped(self) -> None:
         with patch(
