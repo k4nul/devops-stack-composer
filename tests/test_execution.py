@@ -24,8 +24,11 @@ from devops_stack_composer.execution_bundle import verify_execution_bundle
 from devops_stack_composer.execution_models import StageStatus, SupplyChainEvidence
 from devops_stack_composer.evidence_store import EvidenceStore
 from devops_stack_composer.kubernetes_execution import (
-    DiagnosticRecord,
+    HttpSmokeResult,
+    KubernetesArtifactIdentity,
     KubernetesExecutionError,
+    KubernetesExecutionResult,
+    KubernetesPreflightResult,
 )
 from devops_stack_composer.kubernetes_runtime import ResolvedKubernetesManifest
 from devops_stack_composer.locks import TemplateLock
@@ -306,23 +309,88 @@ class FakeKindFactory:
 class FailingKubernetesExecutor:
     def __init__(
         self,
+        root: Path,
         *,
         code: str = "READINESS_PROBE_FAILED",
-        phase: str = "readiness",
-        diagnostics: tuple[DiagnosticRecord, ...] = (),
+        stage: str = "readiness",
+        diagnostics: tuple[tuple[str, str], ...] = (),
     ) -> None:
+        self.root = root
         self.code = code
-        self.phase = phase
+        self.stage = stage
         self.diagnostics = diagnostics
         self.execute_count = 0
 
-    def execute(self, request):
+    def _write(self, relative: str, content: str) -> None:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def server_side_dry_run(self, manifests):
+        selected = tuple(manifests)
+        relative = "kubernetes/server-side-dry-run.json"
+        self._write(relative, '{"passed":true}\n')
+        return KubernetesPreflightResult(
+            tuple(manifest.environment for manifest in selected),
+            tuple(manifest.namespace for manifest in selected),
+            relative,
+        )
+
+    def execute(self, manifest, *, expected_image_reference, expected_digest):
         self.execute_count += 1
+        for relative, content in self.diagnostics:
+            self._write(relative, content)
         raise KubernetesExecutionError(
             self.code,
-            self.phase,
+            self.stage,
             "the requested endpoint did not become ready",
-            diagnostics=self.diagnostics,
+            identity=KubernetesArtifactIdentity(
+                expected_image_reference,
+                expected_digest,
+                manifest_image_reference=manifest.immutable_image_reference,
+            ),
+            diagnostics_paths=tuple(relative for relative, _ in self.diagnostics),
+        )
+
+
+class SuccessfulKubernetesExecutor(FailingKubernetesExecutor):
+    def execute(self, manifest, *, expected_image_reference, expected_digest):
+        self.execute_count += 1
+        paths = {
+            "kubernetes/resolved.yaml": manifest.content,
+            "kubernetes/applied-deployment.json": "{}\n",
+            "kubernetes/applied-service.json": "{}\n",
+            "kubernetes/runtime-pods.json": "{}\n",
+            "kubernetes/smoke.json": "{}\n",
+            "kubernetes/rollback.json": "{}\n",
+            "kubernetes/deployment.json": "{}\n",
+        }
+        for relative, content in paths.items():
+            self._write(relative, content)
+        identity = KubernetesArtifactIdentity(
+            expected_image_reference,
+            expected_digest,
+            manifest_image_reference=expected_image_reference,
+            applied_image_reference=expected_image_reference,
+            pod_spec_image_reference=expected_image_reference,
+            runtime_image_id=f"containerd://{expected_digest}",
+            runtime_digest=expected_digest,
+        )
+        return KubernetesExecutionResult(
+            identity=identity,
+            namespace=manifest.namespace,
+            deployment_name="sample-api",
+            service_name="sample-api",
+            pod_name="sample-api-abc",
+            ready_replica_count=1,
+            manifest_path="kubernetes/resolved.yaml",
+            applied_deployment_path="kubernetes/applied-deployment.json",
+            applied_service_path="kubernetes/applied-service.json",
+            runtime_pods_path="kubernetes/runtime-pods.json",
+            rollback_path="kubernetes/rollback.json",
+            final_revision="3",
+            health=HttpSmokeResult("/health", 200, '{"status":"healthy"}'),
+            readiness=HttpSmokeResult("/ready", 200, '{"status":"ready"}'),
         )
 
 
@@ -480,18 +548,21 @@ class ExecutionTests(unittest.TestCase):
     def test_kubernetes_failure_persists_diagnostics_and_truthful_stage_progress(self) -> None:
         registry_factory = FakeRegistryFactory()
         kind_factory = FakeKindFactory()
-        kubernetes = FailingKubernetesExecutor(
-            diagnostics=(
-                DiagnosticRecord(
-                    "kubernetes/diagnostics/events.txt",
-                    "bounded readiness diagnostics\n",
-                ),
-            ),
-        )
         with tempfile.TemporaryDirectory() as directory, patch(
             "devops_stack_composer.execution.render_resolved_environment",
             side_effect=resolved_manifest,
         ):
+            project = Path(directory)
+            run_id = "20260830T120000Z-222222222222"
+            kubernetes = FailingKubernetesExecutor(
+                project / ".devops-stack" / "runs" / run_id,
+                diagnostics=(
+                    (
+                        "kubernetes/diagnostics/events.txt",
+                        "bounded readiness diagnostics\n",
+                    ),
+                ),
+            )
             result = self.orchestrator(
                 build_executor=FakeBuildExecutor(),
                 supply_chain_generator=FakeSupplyChainGenerator(),
@@ -500,10 +571,10 @@ class ExecutionTests(unittest.TestCase):
                 kubernetes_executor=kubernetes,
                 schema_command_runner=schema_success,
             ).execute(
-                kind_composition(Path(directory)),
+                kind_composition(project),
                 ExecutionOptions(
                     profile="kind-e2e",
-                    run_id="20260830T120000Z-222222222222",
+                    run_id=run_id,
                 ),
             )
 
@@ -536,7 +607,7 @@ class ExecutionTests(unittest.TestCase):
                 )
             )
             self.assertEqual(error_record["code"], "READINESS_PROBE_FAILED")
-            self.assertEqual(error_record["phase"], "readiness")
+            self.assertEqual(error_record["stage"], "readiness")
             self.assertEqual(error_record["failureStage"], "readiness")
             self.assertEqual(
                 error_record["completedStages"],
@@ -552,12 +623,65 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(registry_factory.instance.cleanup_count, 1)
             result.store.verify_checksums()
 
+    def test_kind_success_maps_managed_runtime_identity_into_closed_evidence(self) -> None:
+        registry_factory = FakeRegistryFactory()
+        kind_factory = FakeKindFactory()
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "devops_stack_composer.execution.render_resolved_environment",
+            side_effect=resolved_manifest,
+        ):
+            project = Path(directory)
+            run_id = "20260830T120000Z-444444444444"
+            kubernetes = SuccessfulKubernetesExecutor(
+                project / ".devops-stack" / "runs" / run_id
+            )
+            result = self.orchestrator(
+                build_executor=FakeBuildExecutor(),
+                supply_chain_generator=FakeSupplyChainGenerator(),
+                registry_factory=registry_factory,
+                kind_factory=kind_factory,
+                kubernetes_executor=kubernetes,
+                schema_command_runner=schema_success,
+            ).execute(
+                kind_composition(project),
+                ExecutionOptions(profile="kind-e2e", run_id=run_id),
+            )
+
+            self.assertTrue(result.passed)
+            self.assertEqual(kubernetes.execute_count, 1)
+            self.assertEqual(
+                result.run.deployment_evidence.expected_digest,
+                DIGEST,
+            )
+            self.assertEqual(
+                result.run.deployment_evidence.actual_pod_image_id,
+                f"containerd://{DIGEST}",
+            )
+            self.assertEqual(result.run.deployment_evidence.ready_replica_count, 1)
+            self.assertEqual(
+                [
+                    self.stage(result, stage_id).status
+                    for stage_id in (
+                        "server-side-dry-run",
+                        "deployment",
+                        "rollout",
+                        "pod-image",
+                        "health",
+                        "readiness",
+                        "rollback",
+                    )
+                ],
+                [StageStatus.PASSED] * 7,
+            )
+            self.assertEqual(kind_factory.instance.destroy_count, 1)
+            self.assertEqual(registry_factory.instance.cleanup_count, 1)
+            result.store.verify_checksums()
+
     def test_cleanup_attempts_are_independent_and_aggregate_write_and_remove_failures(self) -> None:
         registry_factory = FakeRegistryFactory()
         kind_factory = FakeKindFactory()
         registry_factory.cleanup_error = RuntimeError("registry cleanup failed")
         kind_factory.destroy_error = RuntimeError("kind destroy failed")
-        kubernetes = FailingKubernetesExecutor()
         original_write_text = EvidenceStore.write_text
 
         def failing_lifecycle_writes(store, relative, content, **kwargs):
@@ -571,6 +695,11 @@ class ExecutionTests(unittest.TestCase):
             "devops_stack_composer.execution.render_resolved_environment",
             side_effect=resolved_manifest,
         ), patch.object(EvidenceStore, "write_text", new=failing_lifecycle_writes):
+            project = Path(directory)
+            run_id = "20260830T120000Z-333333333333"
+            kubernetes = FailingKubernetesExecutor(
+                project / ".devops-stack" / "runs" / run_id
+            )
             result = self.orchestrator(
                 build_executor=FakeBuildExecutor(),
                 supply_chain_generator=FakeSupplyChainGenerator(),
@@ -579,10 +708,10 @@ class ExecutionTests(unittest.TestCase):
                 kubernetes_executor=kubernetes,
                 schema_command_runner=schema_success,
             ).execute(
-                kind_composition(Path(directory)),
+                kind_composition(project),
                 ExecutionOptions(
                     profile="kind-e2e",
-                    run_id="20260830T120000Z-333333333333",
+                    run_id=run_id,
                 ),
             )
 

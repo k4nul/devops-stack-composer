@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import subprocess
 import shutil
+import subprocess
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,7 +40,11 @@ from devops_stack_composer.filesystem import (
     sha256_file,
 )
 from devops_stack_composer.kind_cluster import KindCluster
-from devops_stack_composer.kubernetes_execution import KubernetesExecutionError
+from devops_stack_composer.kubernetes_execution import (
+    KubernetesExecutionError,
+    KubernetesExecutionResult,
+    KubernetesExecutor,
+)
 from devops_stack_composer.kubernetes_runtime import render_resolved_environment
 from devops_stack_composer.oci import validate_tag
 from devops_stack_composer.policies import (
@@ -50,6 +55,14 @@ from devops_stack_composer.policies import (
 )
 from devops_stack_composer.registry import EphemeralRegistry
 from devops_stack_composer.report import redact_sensitive
+from devops_stack_composer.process_compat import (
+    SafeBuildCommandRunner,
+    SafeSubprocessAdapter,
+)
+from devops_stack_composer.process_runner import (
+    DEFAULT_ALLOWED_ENVIRONMENT_KEYS,
+    SafeProcessRunner,
+)
 from devops_stack_composer.supply_chain import SupplyChainGenerator
 
 
@@ -59,6 +72,25 @@ RegistryFactory = Callable[[str], EphemeralRegistry]
 KindFactory = Callable[[str], KindCluster]
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ToolResolver = Callable[[str], str | None]
+ProcessRunnerFactory = Callable[[Path], SafeProcessRunner]
+
+_EXECUTION_TOOLS = frozenset(
+    {
+        "cosign",
+        "docker",
+        "gh",
+        "git",
+        "kind",
+        "kubeconform",
+        "kubectl",
+        "syft",
+        "trivy",
+    }
+)
+_EXECUTION_ENVIRONMENT_KEYS = frozenset(
+    (*DEFAULT_ALLOWED_ENVIRONMENT_KEYS, "SYFT_REGISTRY_INSECURE_USE_HTTP")
+)
+_OVERALL_EXECUTION_TIMEOUT_SECONDS = 3600.0
 
 
 class ExecutionError(DevOpsStackError):
@@ -140,9 +172,12 @@ def _timestamp(value: datetime) -> str:
     return rendered.replace("+00:00", "Z")
 
 
-def _default_source_revision(project: Path) -> str:
+def _default_source_revision(
+    project: Path,
+    command_runner: CommandRunner = subprocess.run,
+) -> str:
     try:
-        result = subprocess.run(
+        result = command_runner(
             ["git", "-C", str(project), "rev-parse", "HEAD"],
             cwd=project,
             capture_output=True,
@@ -253,25 +288,39 @@ class ExecutionOrchestrator:
         *,
         build_executor: BuildOnceExecutor | None = None,
         supply_chain_generator: SupplyChainGenerator | None = None,
-        registry_factory: RegistryFactory = EphemeralRegistry,
-        kind_factory: KindFactory = KindCluster,
+        registry_factory: RegistryFactory | None = None,
+        kind_factory: KindFactory | None = None,
         kubernetes_executor: object | None = None,
         schema_command_runner: CommandRunner | None = None,
         tool_resolver: ToolResolver | None = None,
         source_revision_resolver: SourceRevisionResolver | None = None,
+        process_runner_factory: ProcessRunnerFactory | None = None,
         clock: Clock | None = None,
     ) -> None:
-        self._build_executor = build_executor or BuildOnceExecutor()
-        self._supply_chain_generator = supply_chain_generator or SupplyChainGenerator()
+        self._build_executor = build_executor
+        self._supply_chain_generator = supply_chain_generator
         self._registry_factory = registry_factory
         self._kind_factory = kind_factory
         self._kubernetes_executor = kubernetes_executor
-        self._schema_command_runner = schema_command_runner or subprocess.run
+        self._schema_command_runner = schema_command_runner
         self._tool_resolver = tool_resolver or shutil.which
-        self._source_revision_resolver = (
-            source_revision_resolver or _default_source_revision
-        )
+        self._source_revision_resolver = source_revision_resolver
+        self._process_runner_factory = process_runner_factory
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _process_runner(self, project: Path) -> SafeProcessRunner:
+        if self._process_runner_factory is not None:
+            runner = self._process_runner_factory(project)
+            if not isinstance(runner, SafeProcessRunner):
+                raise TypeError("process_runner_factory must return SafeProcessRunner")
+            return runner
+        return SafeProcessRunner(
+            project,
+            allowed_executables=_EXECUTION_TOOLS,
+            allowed_environment_keys=_EXECUTION_ENVIRONMENT_KEYS,
+            default_timeout=300.0,
+            overall_deadline=time.monotonic() + _OVERALL_EXECUTION_TIMEOUT_SECONDS,
+        )
 
     def _now(self) -> str:
         return _timestamp(self._clock())
@@ -450,27 +499,26 @@ class ExecutionOrchestrator:
             "health",
             "readiness",
         )
-        phase = error.phase
-        if phase in {"preflight", "namespace-bootstrap", "server-side-dry-run"}:
-            return (), "server-side-dry-run"
-        if phase == "apply":
-            return initial_stages[:1], "deployment"
-        if phase == "rollout":
-            if error.code == "DEPLOYMENT_IMAGE_DIGEST_MISMATCH":
-                return initial_stages[:1], "deployment"
-            if error.code.startswith("POD_"):
-                return initial_stages[:3], "pod-image"
-            return initial_stages[:2], "rollout"
-        if phase == "health":
-            return initial_stages[:4], "health"
-        if phase == "readiness":
-            return initial_stages[:5], "readiness"
-        if phase in {
-            "rollback-smoke",
-            "rollback",
-            "post-rollback-health",
-            "post-rollback-readiness",
+        stage = error.stage.split(":", 1)[0]
+        if stage in {
+            "manifest-validation",
+            "persist-manifest",
+            "namespace-server-side-dry-run",
+            "namespace-bootstrap",
+            "server-side-dry-run",
         }:
+            return (), "server-side-dry-run"
+        if stage in {"apply", "applied-deployment", "applied-service"}:
+            return initial_stages[:1], "deployment"
+        if stage == "rollout":
+            return initial_stages[:2], "rollout"
+        if stage == "runtime-attestation":
+            return initial_stages[:3], "pod-image"
+        if stage in {"smoke", "health"}:
+            return initial_stages[:4], "health"
+        if stage == "readiness":
+            return initial_stages[:5], "readiness"
+        if stage in {"rollback", "persist-result"}:
             return initial_stages, "rollback"
         return (), "server-side-dry-run"
 
@@ -487,13 +535,15 @@ class ExecutionOrchestrator:
         completed_stages, failure_stage = self._kubernetes_progress(error)
         persistence_failures: list[str] = []
         diagnostic_paths: list[str] = []
-        for record in error.diagnostics:
+        for relative in error.diagnostics_paths:
             try:
-                store.write_text(record.path, record.content)
-                diagnostic_paths.append(record.path)
-            except BaseException as write_error:
+                path = store.path(relative)
+                if not path.is_file() or path.is_symlink():
+                    raise OSError("diagnostic evidence is missing or not a regular file")
+                diagnostic_paths.append(relative)
+            except (DevOpsStackError, OSError, ValueError) as write_error:
                 persistence_failures.append(
-                    f"{record.path}: {_safe_failure(write_error)}"
+                    f"{relative}: {_safe_failure(write_error)}"
                 )
 
         error_record_path = "kubernetes/execution-error.json"
@@ -503,11 +553,10 @@ class ExecutionOrchestrator:
                 {
                     "schemaVersion": "1.0.0",
                     "code": error.code,
-                    "phase": error.phase,
+                    "stage": error.stage,
                     "failureStage": failure_stage,
                     "completedStages": list(completed_stages),
-                    "rollbackAttempted": error.rollback_attempted,
-                    "rollbackSucceeded": error.rollback_succeeded,
+                    "identity": error.identity.to_dict(),
                     "diagnosticsPaths": diagnostic_paths,
                     "failureReason": _safe_failure(error),
                 },
@@ -535,7 +584,7 @@ class ExecutionOrchestrator:
                     tool="kubectl",
                     output=(
                         f"The Kubernetes executor completed {stage_id} before "
-                        f"the reported {error.phase} failure"
+                        f"the reported {error.stage} failure"
                     ),
                     evidence_paths=evidence_paths,
                 )
@@ -724,11 +773,36 @@ class ExecutionOrchestrator:
         model = composition.loaded_config.model
         profile = options.profile
         assert isinstance(profile, ValidationProfile)
+        process_runner = self._process_runner(composition.project)
+        subprocess_adapter = SafeSubprocessAdapter(process_runner)
+        build_executor = self._build_executor or BuildOnceExecutor(
+            SafeBuildCommandRunner(subprocess_adapter)
+        )
+        supply_chain_generator = self._supply_chain_generator or SupplyChainGenerator(
+            subprocess_adapter
+        )
+        registry_factory = self._registry_factory or (
+            lambda run_id: EphemeralRegistry(
+                run_id,
+                command_runner=subprocess_adapter,
+            )
+        )
+        kind_factory = self._kind_factory or (
+            lambda run_id: KindCluster(
+                run_id,
+                command_runner=subprocess_adapter,
+            )
+        )
+        schema_command_runner = self._schema_command_runner or subprocess_adapter
         missing_tools = self._missing_required_tools(
             profile,
             registry_mode=model.registry["mode"],
         )
-        source_revision = self._source_revision_resolver(composition.project)
+        source_revision = (
+            self._source_revision_resolver(composition.project)
+            if self._source_revision_resolver is not None
+            else _default_source_revision(composition.project, subprocess_adapter)
+        )
         store = EvidenceStore.create(
             composition.project,
             work_directory=options.work_directory,
@@ -817,7 +891,7 @@ class ExecutionOrchestrator:
                 current_stage = "registry-lifecycle"
                 registry_started = self._now()
                 if model.registry["mode"] == "ephemeral-local":
-                    registry = self._registry_factory(store.run_id)
+                    registry = registry_factory(store.run_id)
                     handle = registry.start()
                     registry_endpoint = f"localhost:{handle.host_port}"
                     repository_path = model.registry["repository"]
@@ -873,7 +947,7 @@ class ExecutionOrchestrator:
 
                 current_stage = "build-once"
                 build_started = self._now()
-                build_result = self._build_executor.execute(
+                build_result = build_executor.execute(
                     BuildRequest(
                         project=composition.project,
                         context=(
@@ -925,7 +999,7 @@ class ExecutionOrchestrator:
                     registry_endpoint=registry_endpoint,
                 )
                 validate_artifact_contract(artifact)
-                self._build_executor.verify_tag_unchanged(
+                build_executor.verify_tag_unchanged(
                     build_result,
                     project=composition.project,
                 )
@@ -944,7 +1018,7 @@ class ExecutionOrchestrator:
                 current_stage = "sbom"
                 supply_started = self._now()
                 policy = vulnerability_policy_from_model(model.supply_chain)
-                supply_chain = self._supply_chain_generator.generate(
+                supply_chain = supply_chain_generator.generate(
                     run_root=store.root,
                     artifact=artifact,
                     policy=policy,
@@ -1011,7 +1085,7 @@ class ExecutionOrchestrator:
 
                 current_stage = "artifact-contract"
                 contract_started = self._now()
-                self._build_executor.verify_tag_unchanged(
+                build_executor.verify_tag_unchanged(
                     build_result,
                     project=composition.project,
                 )
@@ -1056,7 +1130,7 @@ class ExecutionOrchestrator:
                         store.write_text(relative, manifest.content)
                         manifest_paths.append(relative)
                     kubernetes_manifest_paths = tuple(manifest_paths)
-                    schema_result = self._schema_command_runner(
+                    schema_result = schema_command_runner(
                         [
                             "kubeconform",
                             "-strict",
@@ -1093,7 +1167,7 @@ class ExecutionOrchestrator:
                     current_stage = "server-side-dry-run"
                     cluster_started = self._now()
                     assert registry is not None
-                    cluster = self._kind_factory(store.run_id)
+                    cluster = kind_factory(store.run_id)
                     cluster_handle = cluster.create()
                     store.write_json("kind-cluster-ownership.json", cluster_handle.to_dict())
                     cluster.configure_local_registry(registry)
@@ -1103,41 +1177,101 @@ class ExecutionOrchestrator:
                             "KUBECONFIG_UNAVAILABLE",
                             "owned kind cluster has no private runtime kubeconfig",
                         )
+                    environment_model = model.environment(options.environment)
                     if self._kubernetes_executor is None:
-                        from devops_stack_composer.kubernetes_execution import (
-                            KubernetesExecutor,
+                        kubernetes_executor = KubernetesExecutor(
+                            process_runner,
+                            store,
+                            kubeconfig=kubeconfig,
+                            app_name=model.service_name,
+                            deployment_name=model.service_name,
+                            service_name=model.service_name,
+                            service_port=environment_model.service_port,
+                            health_path=model.kubernetes_e2e["healthPath"],
+                            readiness_path=model.kubernetes_e2e["readinessPath"],
+                            rollout_timeout_seconds=model.kubernetes_e2e[
+                                "rolloutTimeoutSeconds"
+                            ],
                         )
-
-                        kubernetes_executor = KubernetesExecutor()
                     else:
                         kubernetes_executor = self._kubernetes_executor
-                    from devops_stack_composer.kubernetes_execution import (
-                        KubernetesExecutionRequest,
+                    preflight_result = kubernetes_executor.server_side_dry_run(
+                        manifests
                     )
-
-                    environment_model = model.environment(options.environment)
-                    request = KubernetesExecutionRequest(
-                        kubeconfig_path=kubeconfig,
-                        manifests=manifests,
+                    selected_manifests = tuple(
+                        manifest
+                        for manifest in manifests
+                        if manifest.environment == options.environment
+                    )
+                    if len(selected_manifests) != 1:
+                        raise ExecutionError(
+                            "KUBERNETES_ENVIRONMENT_INVALID",
+                            "execution requires exactly one selected environment manifest",
+                        )
+                    selected_manifest = selected_manifests[0]
+                    kubernetes_result = kubernetes_executor.execute(
+                        selected_manifest,
+                        expected_image_reference=artifact.immutable_image_reference,
+                        expected_digest=artifact.manifest_digest,
+                    )
+                    if not isinstance(kubernetes_result, KubernetesExecutionResult):
+                        raise ExecutionError(
+                            "KUBERNETES_RESULT_INVALID",
+                            "Kubernetes executor returned an unsupported result",
+                        )
+                    identity = kubernetes_result.identity
+                    if (
+                        identity.applied_image_reference is None
+                        or identity.runtime_image_id is None
+                        or identity.runtime_digest is None
+                    ):
+                        raise ExecutionError(
+                            "KUBERNETES_IDENTITY_INCOMPLETE",
+                            "Kubernetes result omitted required runtime identity evidence",
+                        )
+                    kubernetes_paths = tuple(
+                        dict.fromkeys(
+                            (
+                                preflight_result.evidence_path,
+                                kubernetes_result.manifest_path,
+                                kubernetes_result.applied_deployment_path,
+                                kubernetes_result.applied_service_path,
+                                kubernetes_result.runtime_pods_path,
+                                "kubernetes/smoke.json",
+                                kubernetes_result.rollback_path,
+                                "kubernetes/deployment.json",
+                            )
+                        )
+                    )
+                    deployment = DeploymentEvidence(
                         environment=options.environment,
-                        deployment_name=model.application_name,
-                        service_name=model.service_name,
-                        service_port=environment_model.service_port,
-                        health_path=model.kubernetes_e2e["healthPath"],
-                        readiness_path=model.kubernetes_e2e["readinessPath"],
-                        artifact=artifact,
+                        namespace=kubernetes_result.namespace,
                         cluster_type="kind",
                         cluster_identifier=cluster_handle.name,
-                        run_id=store.run_id,
-                        rollout_timeout_seconds=model.kubernetes_e2e[
-                            "rolloutTimeoutSeconds"
-                        ],
-                        approve_production=options.approve_production,
+                        manifest_hash=selected_manifest.sha256,
+                        deployed_image_reference=identity.applied_image_reference,
+                        expected_digest=artifact.manifest_digest,
+                        actual_pod_image_id=identity.runtime_image_id,
+                        rollout_status="PASSED",
+                        ready_replica_count=kubernetes_result.ready_replica_count,
+                        health_endpoint_result={
+                            "status": kubernetes_result.health.status_code,
+                            "path": kubernetes_result.health.path,
+                            "body": kubernetes_result.health.body,
+                            "truncated": kubernetes_result.health.truncated,
+                        },
+                        readiness_endpoint_result={
+                            "status": kubernetes_result.readiness.status_code,
+                            "path": kubernetes_result.readiness.path,
+                            "body": kubernetes_result.readiness.body,
+                            "truncated": kubernetes_result.readiness.truncated,
+                        },
+                        rollback_attempted=True,
+                        rollback_result="PASSED",
+                        final_revision=kubernetes_result.final_revision,
+                        final_digest=identity.runtime_digest,
+                        diagnostics_paths=kubernetes_paths,
                     )
-                    kubernetes_result = kubernetes_executor.execute(request)
-                    for record in kubernetes_result.diagnostics:
-                        store.write_text(record.path, record.content)
-                    deployment = kubernetes_result.deployment
                     store.write_json("deployment.json", deployment.to_dict())
                     store.write_json(
                         "kubernetes/execution-result.json",
@@ -1157,7 +1291,7 @@ class ExecutionOrchestrator:
                         *manifest_paths,
                         "deployment.json",
                         "kubernetes/execution-result.json",
-                        *deployment.diagnostics_paths,
+                        *kubernetes_paths,
                     )
                     for stage_id in (
                         "server-side-dry-run",

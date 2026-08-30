@@ -2,422 +2,771 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
-import subprocess
+import re
 import tempfile
+import threading
 import unittest
-from typing import Any
 
 import yaml
 
-from devops_stack_composer.execution_models import ResolvedArtifact
+from devops_stack_composer.evidence_store import EvidenceStore
 from devops_stack_composer.kubernetes_execution import (
+    HttpSmokeResult,
     KubernetesExecutionError,
-    KubernetesExecutionRequest,
     KubernetesExecutor,
 )
 from devops_stack_composer.kubernetes_runtime import ResolvedKubernetesManifest
+from devops_stack_composer.process_runner import (
+    CancellationToken,
+    NonZeroExitError,
+    ProcessCancelledError,
+    ProcessErrorCategory,
+    ProcessResult,
+)
 
 
 DIGEST = "sha256:" + "a" * 64
 OTHER_DIGEST = "sha256:" + "b" * 64
-IMAGE = f"localhost:5000/team/sample@{DIGEST}"
+REFERENCE = "127.0.0.1:49153/team/service@" + DIGEST
+OTHER_REFERENCE = "127.0.0.1:49153/team/service@" + OTHER_DIGEST
 
 
-def deployment_document(namespace: str) -> dict[str, Any]:
-    return {
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": {"name": "sample-api", "namespace": namespace},
-        "spec": {
-            "replicas": 2,
-            "revisionHistoryLimit": 10,
-            "selector": {"matchLabels": {"app.kubernetes.io/name": "sample-api"}},
-            "template": {
-                "metadata": {"labels": {"app.kubernetes.io/name": "sample-api"}},
-                "spec": {
-                    "containers": [
-                        {
-                            "name": "sample-api",
-                            "image": IMAGE,
-                            "ports": [{"containerPort": 8000}],
-                            "livenessProbe": {"httpGet": {"path": "/health", "port": 8000}},
-                            "readinessProbe": {"httpGet": {"path": "/ready", "port": 8000}},
-                        }
-                    ]
-                },
-            },
-        },
-    }
-
-
-def resolved_manifest(environment: str) -> ResolvedKubernetesManifest:
-    namespace = f"sample-{environment}"
-    documents = (
-        {
-            "apiVersion": "v1",
-            "kind": "Namespace",
-            "metadata": {"name": namespace},
-        },
-        {
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {"name": "sample-api", "namespace": namespace},
-            "spec": {
-                "selector": {"app.kubernetes.io/name": "sample-api"},
-                "ports": [{"name": "http", "port": 80, "targetPort": 8000}],
-            },
-        },
-        deployment_document(namespace),
-    )
-    content = "---\n".join(
-        yaml.safe_dump(document, sort_keys=False) for document in documents
-    )
+def resolved_manifest(image: str = REFERENCE) -> ResolvedKubernetesManifest:
+    content = f"""apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service
+  namespace: staging
+spec:
+  selector:
+    app.kubernetes.io/name: service
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: service
+  namespace: staging
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: service
+    spec:
+      containers:
+      - name: service
+        image: {image}
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+"""
     return ResolvedKubernetesManifest(
-        environment=environment,
-        namespace=namespace,
-        immutable_image_reference=IMAGE,
+        environment="staging",
+        namespace="staging",
+        immutable_image_reference=image,
         content=content,
         sha256=hashlib.sha256(content.encode()).hexdigest(),
-        resource_ids=tuple(
-            f"{document['apiVersion']}/{document['kind']}/"
-            f"{document['metadata'].get('namespace', '')}/{document['metadata']['name']}"
-            for document in documents
+        resource_ids=(
+            "v1/Namespace//staging",
+            "v1/Service/staging/service",
+            "apps/v1/Deployment/staging/service",
         ),
     )
 
 
-def artifact() -> ResolvedArtifact:
-    return ResolvedArtifact(
-        immutable_image_reference=IMAGE,
-        repository="localhost:5000/team/sample",
-        tag="run-1",
-        manifest_digest=DIGEST,
-        platform_digest=DIGEST,
-        media_type="application/vnd.oci.image.manifest.v1+json",
-        architecture="amd64",
-        operating_system="linux",
-        image_size=100,
-        config_digest="sha256:" + "c" * 64,
-        source_revision="d" * 40,
-        build_plan_hash="e" * 64,
-        created_by_tool_version="0.2.0",
-        registry_endpoint="localhost:5000",
-        build_invocation_count=1,
+def environment_manifest(
+    environment: str,
+    *,
+    namespace: str | None = None,
+) -> ResolvedKubernetesManifest:
+    selected_namespace = namespace or environment
+    source = resolved_manifest()
+    content = source.content.replace("staging", selected_namespace)
+    return ResolvedKubernetesManifest(
+        environment=environment,
+        namespace=selected_namespace,
+        immutable_image_reference=source.immutable_image_reference,
+        content=content,
+        sha256=hashlib.sha256(content.encode()).hexdigest(),
+        resource_ids=tuple(
+            resource.replace("staging", selected_namespace)
+            for resource in source.resource_ids
+        ),
     )
 
 
-class FixtureKubectlRunner:
-    def __init__(self) -> None:
-        self.calls: list[tuple[list[str], dict[str, Any]]] = []
-        self.failure_applied = False
-        self.undo_attempted = False
-        self.undone = False
-        self.pod_digest = DIGEST
-        self.pod_restart_count = 0
-        self.health_failure = False
-        self.readiness_failure = False
-        self.intentional_rollout_succeeds = False
-        self.rollback_failure = False
-        self.malformed_deployment_json = False
-        self.include_readiness_diagnostic = True
+class FakeManagedProcess:
+    def __init__(
+        self,
+        runner: FakeKubectlRunner,
+        command: tuple[str, ...],
+        cancellation_token: CancellationToken | None,
+    ) -> None:
+        self.runner = runner
+        self.command = command
+        self.cancellation_token = cancellation_token
+        self._running = True
 
-    def __call__(
-        self, command: list[str], **kwargs: Any
-    ) -> subprocess.CompletedProcess[str]:
-        self.calls.append((list(command), dict(kwargs)))
-        arguments = command[4:]
-        stdin = kwargs.get("input") or ""
-        if arguments and arguments[0] == "apply":
-            if "__devops-stack-intentional-readiness-failure__" in stdin:
-                self.failure_applied = True
-            return self.result(command)
-        if arguments[:2] == ["rollout", "undo"]:
-            self.undo_attempted = True
-            if self.rollback_failure:
-                return self.result(command, 1, stderr="rollback denied")
-            self.undone = True
-            return self.result(command, stdout="deployment.apps/sample-api rolled back\n")
-        if arguments[:2] == ["rollout", "status"]:
-            if self.failure_applied and not self.undone:
-                if self.intentional_rollout_succeeds:
-                    return self.result(command, stdout="successfully rolled out\n")
-                return self.result(command, 1, stderr="timed out waiting for the condition")
-            return self.result(command, stdout="successfully rolled out\n")
-        if arguments[:2] == ["get", "deployment"]:
-            if self.malformed_deployment_json:
-                return self.result(command, stdout="{not-json")
-            return self.result(command, stdout=json.dumps(self.deployment_fixture()))
-        if arguments[:2] == ["get", "pods"]:
-            return self.result(command, stdout=json.dumps(self.pods_fixture()))
-        if arguments[:2] == ["get", "--raw"]:
-            path = arguments[2]
-            if path.endswith("/health"):
-                if self.health_failure:
-                    return self.result(command, 1, stderr="HTTP 503")
-                return self.result(command, stdout='{"status":"healthy"}')
-            if path.endswith("/ready"):
-                if self.readiness_failure:
-                    return self.result(command, 1, stderr="HTTP 503")
-                return self.result(command, stdout='{"status":"ready"}')
-        if arguments[:2] == ["get", "events"]:
-            marker = (
-                "Readiness probe failed: HTTP probe failed with statuscode: 404"
-                if self.include_readiness_diagnostic
-                else "deployment exceeded its progress deadline"
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def output(self) -> tuple[str, str]:
+        return self.runner.forward_readiness, ""
+
+    def wait_for_output(
+        self,
+        pattern: re.Pattern[str],
+        *,
+        timeout: float,
+    ) -> re.Match[str]:
+        del timeout
+        if self.cancellation_token is not None and self.cancellation_token.is_cancelled():
+            self._running = False
+            result = self.runner._result(
+                self.command,
+                returncode=-15,
+                category=ProcessErrorCategory.CANCELLED,
             )
-            return self.result(
+            raise ProcessCancelledError(ProcessErrorCategory.CANCELLED, result)
+        match = pattern.search(self.runner.forward_readiness)
+        if match is None:
+            raise TimeoutError("simulated readiness timeout")
+        return match
+
+    def close(self, timeout: float | None = None) -> bool:
+        del timeout
+        self._running = False
+        self.runner.forward_stopped.set()
+        return self.runner.forward_cleanup_succeeds
+
+
+class FakeKubectlRunner:
+    def __init__(self, project: Path) -> None:
+        self.project = project
+        self.calls: list[tuple[str, ...]] = []
+        self.applied_reference = REFERENCE
+        self.pod_reference = REFERENCE
+        self.runtime_image_id = f"containerd://{DIGEST}"
+        self.rollout_failure = False
+        self.rollback_failure_observed = True
+        self.rollback_undo_failure = False
+        self.rollback_recovery_failure = False
+        self.rollback_failure_applied = False
+        self.rollback_undone = False
+        self.restored_reference = REFERENCE
+        self.restored_runtime_image_id = f"containerd://{DIGEST}"
+        self.forward_started = threading.Event()
+        self.forward_stopped = threading.Event()
+        self.forward_readiness = "Forwarding from 127.0.0.1:45123 -> 8080\n"
+        self.forward_cleanup_succeeds = True
+        self.cancellation_token: CancellationToken | None = None
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path | None = None,
+        timeout: float | None = None,
+        cancellation_token: CancellationToken | None = None,
+    ) -> ProcessResult:
+        command = tuple(argv)
+        self.calls.append(command)
+        action = command[5:]
+        if action and action[0] == "apply" and any(
+            value.endswith("rollback-failure.yaml") for value in action
+        ):
+            self.rollback_failure_applied = True
+        if action[:2] == ("rollout", "undo"):
+            if self.rollback_undo_failure:
+                self._raise_nonzero(command, "rollback undo failed")
+            self.rollback_undone = True
+        if action[:2] == ("rollout", "status") and self.rollback_failure_applied:
+            if not self.rollback_undone and self.rollback_failure_observed:
+                self._raise_nonzero(command, "intentional rollout failed")
+            if self.rollback_undone and self.rollback_recovery_failure:
+                self._raise_nonzero(command, "restored rollout failed")
+        elif action[:2] == ("rollout", "status") and self.rollout_failure:
+            result = self._result(
                 command,
-                stdout=f"{marker}\ntoken=diagnostic-secret\n/tmp/private/runtime.log\n",
+                returncode=1,
+                stderr="password=rollout-secret\nrollout failed\n",
+                category=ProcessErrorCategory.NONZERO,
             )
-        if arguments and arguments[0] in {"describe", "logs"}:
-            return self.result(command, stdout="bounded diagnostic\n")
-        if arguments[:2] == ["get", "replicasets"]:
-            return self.result(command, stdout="items: []\n")
-        if arguments[:2] == ["rollout", "history"]:
-            return self.result(command, stdout="REVISION  CHANGE-CAUSE\n1 <none>\n2 <none>\n")
-        return self.result(command, 1, stderr=f"unexpected fixture command: {arguments!r}")
+            raise NonZeroExitError(ProcessErrorCategory.NONZERO, result)
+        if action[:2] == ("get", "deployment"):
+            return self._result(command, stdout=json.dumps(self._deployment()))
+        if action[:2] == ("get", "service"):
+            return self._result(command, stdout=json.dumps(self._service()))
+        if action and action[0] == "get" and "pods" in action:
+            return self._result(command, stdout=json.dumps(self._pods()))
+        if action[:2] == ("get", "events"):
+            return self._result(command, stdout='{"items":[{"reason":"Unhealthy"}]}')
+        if action and action[0] == "logs":
+            return self._result(command, stdout="bounded pod diagnostic\n")
+        return self._result(command, stdout="ok\n")
 
-    def deployment_fixture(self) -> dict[str, Any]:
-        document = deployment_document("sample-staging")
-        if self.failure_applied and not self.undone:
-            document["spec"]["template"]["spec"]["containers"][0][
-                "readinessProbe"
-            ]["httpGet"][
-                "path"
-            ] = "/__devops-stack-intentional-readiness-failure__"
-        document["metadata"].update(
-            {
-                "generation": 3 if self.failure_applied else 2,
+    def _raise_nonzero(self, command: tuple[str, ...], message: str) -> None:
+        result = self._result(
+            command,
+            returncode=1,
+            stderr=message + "\n",
+            category=ProcessErrorCategory.NONZERO,
+        )
+        raise NonZeroExitError(ProcessErrorCategory.NONZERO, result)
+
+    def start(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path | None = None,
+        timeout: float | None = None,
+        cancellation_token: CancellationToken | None = None,
+    ) -> FakeManagedProcess:
+        del cwd, timeout
+        command = tuple(argv)
+        self.calls.append(command)
+        action = command[5:]
+        if not action or action[0] != "port-forward":
+            raise AssertionError("only port-forward may use the managed process API")
+        self.forward_started.set()
+        return FakeManagedProcess(self, command, cancellation_token)
+
+    def _result(
+        self,
+        command: tuple[str, ...],
+        *,
+        returncode: int | None = 0,
+        stdout: str = "",
+        stderr: str = "",
+        category: ProcessErrorCategory | None = None,
+    ) -> ProcessResult:
+        return ProcessResult(
+            command,
+            self.project,
+            returncode,
+            stdout,
+            stderr,
+            0.01,
+            category,
+        )
+
+    def _deployment(self) -> dict[str, object]:
+        reference = self.restored_reference if self.rollback_undone else self.applied_reference
+        return {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "service",
+                "namespace": "staging",
                 "annotations": {
                     "deployment.kubernetes.io/revision": (
-                        "3" if self.undone else "2" if self.failure_applied else "1"
+                        "3" if self.rollback_undone else "1"
                     )
                 },
-            }
-        )
-        document["status"] = {
-            "observedGeneration": 3 if self.failure_applied else 2,
-            "replicas": 2,
-            "updatedReplicas": 2,
-            "availableReplicas": 2,
-            "readyReplicas": 2,
-            "conditions": [{"type": "Available", "status": "True"}],
+            },
+            "spec": {
+                "selector": {
+                    "matchLabels": {"app.kubernetes.io/name": "service"}
+                },
+                "template": {
+                    "metadata": {"labels": {"app.kubernetes.io/name": "service"}},
+                    "spec": {
+                        "containers": [
+                            {"name": "service", "image": reference}
+                        ]
+                    },
+                }
+            },
         }
-        return document
 
-    def pods_fixture(self) -> dict[str, Any]:
+    def _pods(self) -> dict[str, object]:
+        reference = self.restored_reference if self.rollback_undone else self.pod_reference
+        image_id = (
+            self.restored_runtime_image_id
+            if self.rollback_undone
+            else self.runtime_image_id
+        )
+        return {
+            "items": [
+                {
+                    "metadata": {
+                        "name": "service-abc",
+                        "namespace": "staging",
+                        "labels": {"app.kubernetes.io/name": "service"},
+                    },
+                    "spec": {
+                        "containers": [
+                            {"name": "service", "image": reference}
+                        ]
+                    },
+                    "status": {
+                        "phase": "Running",
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "containerStatuses": [
+                            {
+                                "name": "service",
+                                "ready": True,
+                                "imageID": image_id,
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+
+    @staticmethod
+    def _service() -> dict[str, object]:
         return {
             "apiVersion": "v1",
-            "kind": "PodList",
-            "items": [self.pod_fixture(index) for index in range(2)],
-        }
-
-    def pod_fixture(self, index: int) -> dict[str, Any]:
-        return {
-            "metadata": {"name": f"sample-api-fixture-{index}"},
-            "status": {
-                "phase": "Running",
-                "conditions": [{"type": "Ready", "status": "True"}],
-                "containerStatuses": [
+            "kind": "Service",
+            "metadata": {"name": "service", "namespace": "staging"},
+            "spec": {
+                "selector": {"app.kubernetes.io/name": "service"},
+                "ports": [
                     {
-                        "name": "sample-api",
-                        "ready": True,
-                        "restartCount": self.pod_restart_count,
-                        "imageID": f"containerd://{self.pod_digest}",
+                        "name": "http",
+                        "port": 8080,
+                        "targetPort": 8080,
+                        "protocol": "TCP",
                     }
                 ],
             },
         }
 
-    @staticmethod
-    def result(
-        command: list[str],
-        returncode: int = 0,
-        stdout: str = "",
-        stderr: str = "",
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+class FakeHttpGetter:
+    def __init__(self, statuses: dict[str, int] | None = None) -> None:
+        self.statuses = statuses or {}
+        self.calls: list[tuple[str, int, str, float]] = []
+        self.failure_path: str | None = None
+
+    def __call__(
+        self, host: str, port: int, path: str, timeout: float
+    ) -> HttpSmokeResult:
+        self.calls.append((host, port, path, timeout))
+        if path == self.failure_path:
+            raise ConnectionRefusedError("simulated loopback failure")
+        return HttpSmokeResult(
+            path,
+            self.statuses.get(path, 200),
+            f'{{"path":"{path}","token":"should-redact"}}',
+        )
 
 
 class KubernetesExecutorTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.runtime = tempfile.TemporaryDirectory()
-        self.kubeconfig = Path(self.runtime.name) / "kubeconfig"
-        self.kubeconfig.write_text("apiVersion: v1\n", encoding="utf-8")
-        os.chmod(self.kubeconfig, 0o600)
-        self.runner = FixtureKubectlRunner()
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.project = Path(self.temporary.name)
+        self.kubeconfig = self.project / "kubeconfig"
+        self.kubeconfig.write_text(
+            """apiVersion: v1
+kind: Config
+current-context: kind-test
+clusters:
+- name: kind-test
+  cluster:
+    server: https://127.0.0.1:6443
+    certificate-authority-data: ZmFrZQ==
+contexts:
+- name: kind-test
+  context:
+    cluster: kind-test
+    user: kind-test
+users:
+- name: kind-test
+  user:
+    client-certificate-data: ZmFrZQ==
+    client-key-data: ZmFrZQ==
+""",
+            encoding="utf-8",
+        )
+        self.kubeconfig.chmod(0o600)
+        self.store = EvidenceStore.create(
+            self.project,
+            run_id="20260830T120000Z-abcdef123456",
+        )
+        self.runner = FakeKubectlRunner(self.project)
+        self.http = FakeHttpGetter()
 
-    def tearDown(self) -> None:
-        self.runtime.cleanup()
-
-    def request(self, **overrides: Any) -> KubernetesExecutionRequest:
-        values: dict[str, Any] = {
-            "kubeconfig_path": self.kubeconfig,
-            "manifests": tuple(
-                resolved_manifest(environment)
-                for environment in ("dev", "staging", "production")
-            ),
-            "environment": "staging",
-            "deployment_name": "sample-api",
-            "service_name": "sample-api",
-            "service_port": 80,
-            "health_path": "/health",
-            "readiness_path": "/ready",
-            "artifact": artifact(),
-            "cluster_type": "kind",
-            "cluster_identifier": "devops-stack-fixture",
-            "run_id": "run-20260830",
-            "rollout_timeout_seconds": 5,
-        }
-        values.update(overrides)
-        return KubernetesExecutionRequest(**values)
-
-    def execute(self):
+    def executor(self) -> KubernetesExecutor:
         return KubernetesExecutor(
-            command_runner=self.runner,
-            command_timeout_seconds=5,
-            diagnostic_timeout_seconds=5,
-        ).execute(self.request())
+            self.runner,
+            self.store,
+            kubeconfig=self.kubeconfig,
+            app_name="service",
+            deployment_name="service",
+            service_name="service",
+            service_port=8080,
+            health_path="/health",
+            readiness_path="/ready",
+            http_getter=self.http,
+        )
 
-    def test_executes_full_same_digest_success_and_recovery_flow(self) -> None:
-        result = self.execute()
+    def test_server_side_dry_run_covers_every_environment_without_workload_apply(
+        self,
+    ) -> None:
+        result = self.executor().server_side_dry_run(
+            tuple(
+                environment_manifest(environment)
+                for environment in ("development", "staging", "production")
+            )
+        )
 
         self.assertEqual(
-            tuple(item.environment for item in result.dry_runs),
-            ("dev", "staging", "production"),
+            result.environments,
+            ("development", "staging", "production"),
         )
-        self.assertEqual(result.deployment.expected_digest, DIGEST)
-        self.assertEqual(result.deployment.final_digest, DIGEST)
-        self.assertEqual(result.deployment.ready_replica_count, 2)
-        self.assertEqual(len(result.initial_pods), 2)
-        self.assertEqual(len(result.recovered_pods), 2)
-        self.assertTrue(result.intentional_failure.observed)
-        self.assertTrue(self.runner.undo_attempted)
-        self.assertTrue(self.runner.undone)
-        dry_run_calls = [
-            call
-            for call, _options in self.runner.calls
-            if "--dry-run=server" in call
-        ]
-        self.assertEqual(len(dry_run_calls), 6)
-        for command, options in self.runner.calls:
-            self.assertEqual(command[1:3], ["--kubeconfig", str(self.kubeconfig)])
-            self.assertIs(options["shell"], False)
-            self.assertIs(options["check"], False)
-            self.assertTrue(options["capture_output"])
-        serialized = json.dumps(result.to_dict(), sort_keys=True)
-        self.assertNotIn(str(self.kubeconfig), serialized)
-        self.assertNotIn("diagnostic-secret", serialized)
-        self.assertNotIn("/tmp/private", serialized)
-        self.assertIn("<redacted>", serialized)
-        self.assertIn("<absolute-path>", serialized)
-
-    def test_rejects_pod_running_with_unexpected_digest(self) -> None:
-        self.runner.pod_digest = OTHER_DIGEST
-
-        with self.assertRaises(KubernetesExecutionError) as raised:
-            self.execute()
-
-        self.assertEqual(raised.exception.code, "POD_IMAGE_DIGEST_MISMATCH")
-        self.assertFalse(raised.exception.rollback_attempted)
-        self.assertTrue(raised.exception.diagnostics)
-
-    def test_failed_health_endpoint_stops_before_failure_revision(self) -> None:
-        self.runner.health_failure = True
-
-        with self.assertRaises(KubernetesExecutionError) as raised:
-            self.execute()
-
-        self.assertEqual(raised.exception.code, "HEALTH_PROBE_FAILED")
-        self.assertFalse(self.runner.failure_applied)
-        self.assertFalse(self.runner.undo_attempted)
-
-    def test_restarted_pod_is_not_treated_as_clean_rollout_evidence(self) -> None:
-        self.runner.pod_restart_count = 1
-
-        with self.assertRaises(KubernetesExecutionError) as raised:
-            self.execute()
-
-        self.assertEqual(raised.exception.code, "POD_RESTART_OBSERVED")
-
-    def test_intentional_rollout_must_actually_fail(self) -> None:
-        self.runner.intentional_rollout_succeeds = True
-
-        with self.assertRaises(KubernetesExecutionError) as raised:
-            self.execute()
-
+        self.assertEqual(len(self.runner.calls), 9)
+        for offset in range(0, 9, 3):
+            namespace_dry_run, namespace_apply, workload_dry_run = self.runner.calls[
+                offset : offset + 3
+            ]
+            self.assertIn("--dry-run=server", namespace_dry_run)
+            self.assertNotIn("--dry-run=server", namespace_apply)
+            self.assertTrue(
+                namespace_apply[namespace_apply.index("--filename") + 1].endswith(
+                    "-namespace-bootstrap.yaml"
+                )
+            )
+            self.assertIn("--dry-run=server", workload_dry_run)
+            self.assertTrue(
+                workload_dry_run[
+                    workload_dry_run.index("--filename") + 1
+                ].endswith("-resolved.yaml")
+            )
+        evidence = json.loads(
+            self.store.path("kubernetes/server-side-dry-run.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertTrue(evidence["passed"])
         self.assertEqual(
-            raised.exception.code, "EXPECTED_ROLLOUT_FAILURE_NOT_OBSERVED"
+            [item["environment"] for item in evidence["environments"]],
+            ["development", "staging", "production"],
         )
-        self.assertTrue(raised.exception.rollback_attempted)
-        self.assertTrue(raised.exception.rollback_succeeded)
-        self.assertTrue(self.runner.undone)
 
-    def test_failed_rollout_must_show_expected_readiness_cause(self) -> None:
-        self.runner.include_readiness_diagnostic = False
-
-        with self.assertRaises(KubernetesExecutionError) as raised:
-            self.execute()
-
-        self.assertEqual(
-            raised.exception.code, "EXPECTED_READINESS_FAILURE_NOT_OBSERVED"
+    def test_server_side_dry_run_validates_the_whole_set_before_namespace_apply(
+        self,
+    ) -> None:
+        manifests = (
+            environment_manifest("development", namespace="shared"),
+            environment_manifest("staging", namespace="shared"),
         )
-        self.assertTrue(raised.exception.rollback_succeeded)
 
-    def test_rollback_failure_preserves_redacted_diagnostics(self) -> None:
-        self.runner.rollback_failure = True
+        with self.assertRaisesRegex(ValueError, "namespaces must be unique"):
+            self.executor().server_side_dry_run(manifests)
 
-        with self.assertRaises(KubernetesExecutionError) as raised:
-            self.execute()
-
-        self.assertEqual(raised.exception.code, "ROLLBACK_FAILED")
-        self.assertTrue(raised.exception.rollback_attempted)
-        self.assertFalse(raised.exception.rollback_succeeded)
-        serialized = json.dumps(
-            [item.to_dict() for item in raised.exception.diagnostics], sort_keys=True
-        )
-        self.assertNotIn("diagnostic-secret", serialized)
-        self.assertNotIn(str(self.kubeconfig), serialized)
-
-    def test_malformed_kubectl_json_fails_closed(self) -> None:
-        self.runner.malformed_deployment_json = True
-
-        with self.assertRaises(KubernetesExecutionError) as raised:
-            self.execute()
-
-        self.assertEqual(raised.exception.code, "MALFORMED_KUBECTL_JSON")
-        self.assertEqual(raised.exception.phase, "rollout")
-
-    def test_private_kubeconfig_permissions_are_required_before_commands(self) -> None:
-        os.chmod(self.kubeconfig, 0o644)
-
-        with self.assertRaises(KubernetesExecutionError) as raised:
-            self.execute()
-
-        self.assertEqual(raised.exception.code, "PRIVATE_KUBECONFIG_INVALID")
         self.assertEqual(self.runner.calls, [])
 
-    def test_production_apply_requires_explicit_approval(self) -> None:
-        executor = KubernetesExecutor(command_runner=self.runner)
-        with self.assertRaises(KubernetesExecutionError) as raised:
-            executor.execute(self.request(environment="production"))
-        self.assertEqual(raised.exception.code, "PRODUCTION_APPROVAL_REQUIRED")
-        self.assertEqual(self.runner.calls, [])
-
-    def test_tampered_manifest_is_rejected_by_request(self) -> None:
-        manifests = list(self.request().manifests)
-        manifests[0] = ResolvedKubernetesManifest(
-            environment=manifests[0].environment,
-            namespace=manifests[0].namespace,
-            immutable_image_reference=manifests[0].immutable_image_reference,
-            content=manifests[0].content + "\n",
-            sha256=manifests[0].sha256,
-            resource_ids=manifests[0].resource_ids,
+    def test_executes_apply_attestation_and_loopback_smoke_with_one_digest(self) -> None:
+        result = self.executor().execute(
+            resolved_manifest(),
+            expected_image_reference=REFERENCE,
+            expected_digest=DIGEST,
         )
-        with self.assertRaisesRegex(ValueError, "does not match"):
-            self.request(manifests=tuple(manifests))
+
+        self.assertEqual(result.identity.manifest_image_reference, REFERENCE)
+        self.assertEqual(result.identity.applied_image_reference, REFERENCE)
+        self.assertEqual(result.identity.pod_spec_image_reference, REFERENCE)
+        self.assertEqual(result.identity.runtime_digest, DIGEST)
+        self.assertEqual(result.identity.runtime_image_id, f"containerd://{DIGEST}")
+        self.assertEqual(result.pod_name, "service-abc")
+        self.assertEqual(result.ready_replica_count, 1)
+        self.assertTrue(self.runner.forward_stopped.wait(1))
+        actions = [call[5] for call in self.runner.calls]
+        self.assertEqual(
+            actions[:8],
+            ["apply", "apply", "apply", "apply", "rollout", "get", "get", "get"],
+        )
+        self.assertIn("--dry-run=server", self.runner.calls[0])
+        self.assertIn("namespace-bootstrap.yaml", self.runner.calls[0][-3])
+        self.assertIn("--dry-run=server", self.runner.calls[2])
+        self.assertIn("port-forward", actions)
+        forward_call = next(
+            call for call in self.runner.calls if call[5] == "port-forward"
+        )
+        self.assertIn(":8080", forward_call)
+        self.assertNotIn("45123:8080", forward_call)
+        self.assertEqual([call[2] for call in self.http.calls], ["/health", "/ready"])
+        self.assertEqual(
+            self.store.path("kubernetes/resolved.yaml").read_text(encoding="utf-8"),
+            resolved_manifest().content,
+        )
+        deployment = json.loads(
+            self.store.path("kubernetes/deployment.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(deployment["identity"]["runtimeDigest"], DIGEST)
+        self.assertEqual(deployment["rollbackResult"], "PASSED")
+        self.assertEqual(deployment["finalRevision"], "3")
+        self.assertEqual(
+            deployment["appliedServicePath"], "kubernetes/applied-service.json"
+        )
+        rollback = json.loads(
+            self.store.path("kubernetes/rollback.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(rollback["failureObserved"])
+        self.assertEqual(rollback["finalDigest"], DIGEST)
+        self.assertEqual(result.rollback_path, "kubernetes/rollback.json")
+        failure_revision = yaml.safe_load(
+            self.store.path("kubernetes/rollback-failure.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        failure_container = failure_revision["spec"]["template"]["spec"][
+            "containers"
+        ][0]
+        self.assertEqual(failure_container["image"], REFERENCE)
+        self.assertEqual(
+            failure_container["readinessProbe"]["httpGet"]["path"],
+            "/__devops-stack-intentional-readiness-failure__",
+        )
+        observation = json.loads(
+            self.store.path("kubernetes/rollback-observation.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(observation["command"]["category"], "nonzero")
+        rollback_actions = [call[5:7] for call in self.runner.calls]
+        self.assertIn(("rollout", "undo"), rollback_actions)
+        smoke = self.store.path("kubernetes/smoke.json").read_text(encoding="utf-8")
+        self.assertNotIn("should-redact", smoke)
+        self.assertIn("<redacted>", smoke)
+
+    def test_rejects_mutable_manifest_and_applied_mismatch_before_smoke(self) -> None:
+        mutable = resolved_manifest("127.0.0.1:49153/team/service:latest")
+        with self.assertRaises(KubernetesExecutionError) as mutable_error:
+            self.executor().execute(
+                mutable,
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+        self.assertEqual(mutable_error.exception.stage, "manifest-validation")
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(self.http.calls, [])
+
+        self.runner.applied_reference = OTHER_REFERENCE
+        with self.assertRaises(KubernetesExecutionError) as mismatch:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+        self.assertEqual(mismatch.exception.code, "WORKLOAD_IMAGE_MISMATCH")
+        self.assertEqual(
+            mismatch.exception.identity.applied_image_reference, OTHER_REFERENCE
+        )
+        self.assertFalse(self.runner.forward_started.is_set())
+        self.assertEqual(self.http.calls, [])
+
+    def test_rejects_runtime_digest_mismatch_before_port_forward(self) -> None:
+        self.runner.runtime_image_id = f"containerd://{OTHER_DIGEST}"
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(raised.exception.code, "RUNTIME_DIGEST_MISMATCH")
+        self.assertEqual(raised.exception.identity.runtime_digest, OTHER_DIGEST)
+        self.assertFalse(self.runner.forward_started.is_set())
+        self.assertEqual(self.http.calls, [])
+
+    def test_rollout_failure_collects_bounded_diagnostics(self) -> None:
+        self.runner.rollout_failure = True
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        error = raised.exception
+        self.assertEqual(error.code, "KUBECTL_COMMAND_FAILED")
+        self.assertEqual(error.stage, "rollout")
+        self.assertEqual(
+            set(error.diagnostics_paths),
+            {
+                "diagnostics/rollout-command.txt",
+                "diagnostics/events.json",
+                "diagnostics/pod-logs.txt",
+            },
+        )
+        failure = self.store.path("diagnostics/rollout-command.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("rollout-secret", failure)
+        self.assertIn("<redacted>", failure)
+        self.assertFalse(self.runner.forward_started.is_set())
+
+    def test_http_failure_still_cancels_port_forward(self) -> None:
+        self.http.statuses["/ready"] = 503
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(raised.exception.code, "SMOKE_HTTP_FAILED")
+        self.assertTrue(self.runner.forward_started.is_set())
+        self.assertTrue(self.runner.forward_stopped.wait(1))
+
+    def test_http_transport_error_is_typed_and_cancels_port_forward(self) -> None:
+        self.http.failure_path = "/ready"
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(raised.exception.code, "SMOKE_HTTP_REQUEST_FAILED")
+        self.assertTrue(self.runner.forward_started.is_set())
+        self.assertTrue(self.runner.forward_stopped.wait(1))
+
+    def test_wrong_port_readiness_cannot_accept_a_foreign_loopback_service(self) -> None:
+        self.runner.forward_readiness = (
+            "Forwarding from 127.0.0.1:45123 -> 9090\n"
+        )
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(raised.exception.code, "PORT_FORWARD_READINESS_INVALID")
+        self.assertEqual(self.http.calls, [])
+        self.assertTrue(self.runner.forward_stopped.wait(1))
+
+    def test_malformed_port_forward_readiness_is_rejected(self) -> None:
+        self.runner.forward_readiness = (
+            "Forwarding from localhost:not-a-port -> 8080\n"
+        )
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(raised.exception.code, "PORT_FORWARD_READINESS_INVALID")
+        self.assertEqual(self.http.calls, [])
+
+    def test_port_forward_cancellation_is_typed_and_reaped(self) -> None:
+        token = CancellationToken()
+        token.cancel()
+        self.runner.cancellation_token = token
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(raised.exception.code, "PORT_FORWARD_FAILED")
+        self.assertIsNotNone(raised.exception.process_result)
+        self.assertEqual(
+            raised.exception.process_result.error_category,
+            ProcessErrorCategory.CANCELLED,
+        )
+        self.assertTrue(self.runner.forward_stopped.wait(1))
+
+    def test_port_forward_cleanup_failure_is_not_hidden(self) -> None:
+        self.runner.forward_cleanup_succeeds = False
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(raised.exception.code, "PORT_FORWARD_CLEANUP_FAILED")
+        self.assertTrue(self.runner.forward_stopped.wait(1))
+
+    def test_rollback_requires_observed_failure_before_undo(self) -> None:
+        self.runner.rollback_failure_observed = False
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(raised.exception.code, "ROLLBACK_FAILURE_NOT_OBSERVED")
+        self.assertFalse(self.runner.rollback_undone)
+        observation = json.loads(
+            self.store.path("kubernetes/rollback-observation.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(observation["failureObserved"])
+
+    def test_rollback_undo_and_recovery_failures_are_typed(self) -> None:
+        self.runner.rollback_undo_failure = True
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(raised.exception.code, "ROLLBACK_UNDO_FAILED")
+        self.assertTrue(
+            self.store.path("kubernetes/rollback-observation.json").is_file()
+        )
+
+    def test_rollback_recovery_must_roll_out_and_keep_the_original_digest(self) -> None:
+        self.runner.rollback_recovery_failure = True
+
+        with self.assertRaises(KubernetesExecutionError) as rollout_error:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(rollout_error.exception.code, "ROLLBACK_RECOVERY_FAILED")
+
+    def test_rollback_rejects_a_changed_runtime_digest(self) -> None:
+        self.runner.restored_runtime_image_id = f"containerd://{OTHER_DIGEST}"
+
+        with self.assertRaises(KubernetesExecutionError) as raised:
+            self.executor().execute(
+                resolved_manifest(),
+                expected_image_reference=REFERENCE,
+                expected_digest=DIGEST,
+            )
+
+        self.assertEqual(raised.exception.code, "RUNTIME_DIGEST_MISMATCH")
+        self.assertEqual(raised.exception.stage, "rollback")
+        self.assertEqual(raised.exception.identity.runtime_digest, OTHER_DIGEST)
 
 
 if __name__ == "__main__":
