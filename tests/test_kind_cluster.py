@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import stat
 import subprocess
 import unittest
@@ -18,6 +19,7 @@ from devops_stack_composer.kind_cluster import (
     KindCluster,
     KindClusterCollisionError,
     KindClusterError,
+    KindClusterHandle,
     KindClusterOwnershipError,
     KindVersionError,
 )
@@ -44,6 +46,7 @@ class FakeKindRunner:
         self.create_failure: subprocess.CompletedProcess[str] | None = None
         self.delete_failure: subprocess.CompletedProcess[str] | None = None
         self.copy_round_trip_override: str | None = None
+        self.kubeconfig_failure: subprocess.CompletedProcess[str] | None = None
         self.ready = True
 
     def __call__(
@@ -96,6 +99,21 @@ class FakeKindRunner:
             return self._completed(
                 command,
                 stdout="".join(f"{node}\n" for node in self.nodes[name]),
+            )
+
+        if command[:4] == ["kind", "get", "kubeconfig", "--name"]:
+            if self.kubeconfig_failure is not None:
+                return self.kubeconfig_failure
+            name = command[4]
+            if name not in self.clusters:
+                return self._completed(command, 1, stderr="cluster does not exist\n")
+            return self._completed(
+                command,
+                stdout=(
+                    "apiVersion: v1\n"
+                    "kind: Config\n"
+                    f"current-context: kind-{name}\n"
+                ),
             )
 
         if command[:2] == ["docker", "inspect"]:
@@ -202,9 +220,11 @@ class FakeKindRunner:
 
 class FakeRegistryLifecycle:
     def __init__(self, run_id: str, *, port: int = 49153) -> None:
+        slug = re.sub(r"[^a-z0-9]+", "-", run_id.lower()).strip("-")
+        slug = slug[:20].rstrip("-") or "run"
         self.handle: RegistryHandle | None = RegistryHandle(
             run_id=run_id,
-            name="devops-stack-registry-run-0123456789ab",
+            name=f"devops-stack-registry-{slug}-0123456789ab",
             container_id=REGISTRY_ID,
             host_port=port,
             image=REGISTRY_IMAGE,
@@ -257,6 +277,7 @@ class KindClusterTests(unittest.TestCase):
         self.assertEqual(handle.node_image, KIND_NODE_IMAGE)
         self.assertEqual(handle.context, f"kind-{cluster.name}")
         self.assertEqual(handle.nodes, (f"{cluster.name}-control-plane",))
+        self.assertEqual(handle.node_container_ids, (NODE_ID,))
         for options in runner.call_options:
             self.assertFalse(options["check"])
             self.assertTrue(options["capture_output"])
@@ -401,6 +422,120 @@ class KindClusterTests(unittest.TestCase):
         self.assertFalse(replaced.owned)
         self.assertFalse(replaced.ready)
         self.assertEqual(kubectl_before, kubectl_after)
+        cluster.detach()
+
+    def test_handle_round_trip_detach_and_reopen_verify_before_private_kubeconfig(self) -> None:
+        runner = FakeKindRunner()
+        cluster = self.make_cluster(runner)
+        handle = cluster.create()
+        payload = handle.to_dict()
+        assert cluster.kubeconfig_path is not None
+        first_runtime = cluster.kubeconfig_path.parent
+
+        self.assertEqual(
+            set(payload),
+            {"schemaVersion", "runId", "name", "nodeImage", "nodes"},
+        )
+        self.assertNotIn("kubeconfig", json.dumps(payload).lower())
+        self.assertNotIn("path", json.dumps(payload).lower())
+        self.assertEqual(KindClusterHandle.from_dict(payload), handle)
+        self.assertEqual(cluster.detach(), handle)
+        self.assertFalse(first_runtime.exists())
+        self.assertFalse(
+            any(command[:3] == ["kind", "delete", "cluster"] for command in runner.calls)
+        )
+
+        reopen_call_start = len(runner.calls)
+        reopened = KindCluster.reopen(payload, command_runner=runner)
+
+        calls = runner.calls[reopen_call_start:]
+        kubeconfig_call = ["kind", "get", "kubeconfig", "--name", handle.name]
+        self.assertIn(kubeconfig_call, calls)
+        self.assertLess(calls.index(["docker", "inspect", NODE_ID]), calls.index(kubeconfig_call))
+        self.assertEqual(reopened.handle, handle)
+        assert reopened.kubeconfig_path is not None
+        self.assertEqual(stat.S_IMODE(reopened.kubeconfig_path.stat().st_mode), 0o600)
+        self.assertIn(
+            f"current-context: kind-{handle.name}",
+            reopened.kubeconfig_path.read_text(encoding="utf-8"),
+        )
+        self.assertTrue(reopened.status().owned)
+        self.assertTrue(reopened.destroy())
+
+    def test_handle_parser_rejects_unknown_path_missing_and_invalid_identity_data(self) -> None:
+        runner = FakeKindRunner()
+        cluster = self.make_cluster(runner)
+        handle = cluster.create()
+        payload = handle.to_dict()
+        cluster.detach()
+
+        invalid_payloads: list[object] = [
+            [],
+            {**payload, "kubeconfigPath": "/tmp/foreign"},
+            {key: value for key, value in payload.items() if key != "nodeImage"},
+            {**payload, "schemaVersion": "kind-cluster-ownership-v2"},
+            {**payload, "runId": "-invalid"},
+            {**payload, "name": "foreign-control-plane"},
+            {**payload, "nodeImage": "kindest/node:latest"},
+            {**payload, "nodes": []},
+            {
+                **payload,
+                "nodes": [
+                    {
+                        "name": handle.nodes[0],
+                        "containerId": NODE_ID,
+                        "kubeconfigPath": "/tmp/foreign",
+                    }
+                ],
+            },
+            {
+                **payload,
+                "nodes": [{"name": handle.nodes[0], "containerId": "b" * 63}],
+            },
+        ]
+        for invalid in invalid_payloads:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                KindClusterHandle.from_dict(invalid)  # type: ignore[arg-type]
+
+        reopened = KindCluster.reopen(payload, command_runner=runner)
+        reopened.destroy()
+
+    def test_reopen_refuses_replacement_before_kubeconfig_or_delete(self) -> None:
+        runner = FakeKindRunner()
+        cluster = self.make_cluster(runner)
+        payload = cluster.create().to_dict()
+        cluster.detach()
+        replacement = dict(runner.containers.pop(NODE_ID))
+        replacement["Id"] = "c" * 64
+        runner.containers["c" * 64] = replacement
+        before = len(runner.calls)
+
+        with self.assertRaises(KindClusterOwnershipError):
+            KindCluster.reopen(payload, command_runner=runner)
+
+        calls = runner.calls[before:]
+        self.assertFalse(any(command[:3] == ["kind", "delete", "cluster"] for command in calls))
+        self.assertFalse(any(command[:3] == ["kind", "get", "kubeconfig"] for command in calls))
+
+    def test_reopen_kubeconfig_failure_never_persists_stdout_or_runtime_files(self) -> None:
+        runner = FakeKindRunner()
+        cluster = self.make_cluster(runner)
+        payload = cluster.create().to_dict()
+        cluster.detach()
+        runner.kubeconfig_failure = subprocess.CompletedProcess(
+            ["kind", "get", "kubeconfig"],
+            1,
+            "token=stdout-secret\n",
+            "Authorization: Bearer stderr-secret\nfailed\n",
+        )
+
+        with self.assertRaises(KindClusterError) as raised:
+            KindCluster.reopen(payload, command_runner=runner)
+
+        rendered = str(raised.exception)
+        self.assertIn("<redacted>", rendered)
+        self.assertNotIn("stdout-secret", rendered)
+        self.assertNotIn("stderr-secret", rendered)
 
     def test_configure_registry_uses_official_hosts_alias_network_api_and_configmap(self) -> None:
         runner = FakeKindRunner()
@@ -413,7 +548,7 @@ class KindClusterTests(unittest.TestCase):
         registry_directory = "/etc/containerd/certs.d/localhost:49153"
         hosts_path = f"{registry_directory}/hosts.toml"
         expected_hosts = (
-            '[host."http://devops-stack-registry-run-0123456789ab:5000"]\n'
+            '[host."http://devops-stack-registry-run-2026-08-30-0123456789ab:5000"]\n'
         )
         self.assertIn(
             ["docker", "exec", NODE_ID, "mkdir", "-p", registry_directory],
@@ -437,7 +572,7 @@ class KindClusterTests(unittest.TestCase):
         self.assertEqual(configured.host_endpoint, "localhost:49153")
         self.assertEqual(
             configured.container_endpoint,
-            "http://devops-stack-registry-run-0123456789ab:5000",
+            "http://devops-stack-registry-run-2026-08-30-0123456789ab:5000",
         )
         self.assertEqual(cluster.registry_configuration, configured)
         cluster.destroy()
@@ -512,6 +647,7 @@ class KindClusterTests(unittest.TestCase):
                 for command in runner.calls
             )
         )
+        cluster.detach()
 
     def test_destroy_refuses_replacement_container_with_same_name_and_labels(self) -> None:
         runner = FakeKindRunner()
@@ -531,6 +667,7 @@ class KindClusterTests(unittest.TestCase):
                 for command in runner.calls
             )
         )
+        cluster.detach()
 
     def test_missing_owned_cluster_is_not_deleted_and_credentials_are_removed(self) -> None:
         runner = FakeKindRunner()
@@ -573,6 +710,7 @@ class KindClusterTests(unittest.TestCase):
         self.assertIn("<redacted>", rendered)
         self.assertNotIn("delete-secret", rendered)
         self.assertTrue(runtime.exists())
+        cluster.detach()
 
     def test_context_manager_destroys_owned_cluster_and_removes_runtime_files(self) -> None:
         runner = FakeKindRunner()

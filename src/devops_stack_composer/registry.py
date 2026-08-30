@@ -30,6 +30,7 @@ CONTAINER_NAME_LABEL = "io.devops-stack-composer.container-name"
 
 _MANAGED_BY = "devops-stack-composer"
 _RESOURCE = "ephemeral-registry"
+_HANDLE_SCHEMA_VERSION = "registry-ownership-v1"
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _CONTAINER_ID = re.compile(r"^[a-f0-9]{64}$")
@@ -71,6 +72,68 @@ class RegistryHandle:
     image: str = REGISTRY_IMAGE
     host: str = REGISTRY_HOST
     local_test_only: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.run_id, str) or not _RUN_ID.fullmatch(self.run_id):
+            raise ValueError("registry handle run_id is invalid")
+        if not _registry_name_matches_run(self.name, self.run_id):
+            raise ValueError("registry handle name is not valid for its run")
+        if not isinstance(self.container_id, str) or not _CONTAINER_ID.fullmatch(
+            self.container_id
+        ):
+            raise ValueError("registry handle container_id is invalid")
+        if (
+            not isinstance(self.host_port, int)
+            or isinstance(self.host_port, bool)
+            or self.host_port < 1
+            or self.host_port > 65535
+        ):
+            raise ValueError("registry handle host_port is invalid")
+        if self.image != REGISTRY_IMAGE:
+            raise ValueError("registry handle image does not match the pinned image")
+        if self.host != REGISTRY_HOST or self.local_test_only is not True:
+            raise ValueError("registry handle is not restricted to local test use")
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the complete non-secret ownership record for persistence."""
+
+        return {
+            "schemaVersion": _HANDLE_SCHEMA_VERSION,
+            "runId": self.run_id,
+            "name": self.name,
+            "containerId": self.container_id,
+            "hostPort": self.host_port,
+            "image": self.image,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "RegistryHandle":
+        """Parse a closed ownership record without accepting runtime paths."""
+
+        if not isinstance(value, Mapping):
+            raise ValueError("registry ownership handle must be an object")
+        expected = {
+            "schemaVersion",
+            "runId",
+            "name",
+            "containerId",
+            "hostPort",
+            "image",
+        }
+        if set(value) != expected:
+            raise ValueError("registry ownership handle fields do not match the schema")
+        if value.get("schemaVersion") != _HANDLE_SCHEMA_VERSION:
+            raise ValueError("registry ownership handle schemaVersion is unsupported")
+        try:
+            return cls(
+                run_id=value["runId"],
+                name=value["name"],
+                container_id=value["containerId"],
+                host_port=value["hostPort"],
+                image=value["image"],
+            )
+        except TypeError as exc:
+            raise ValueError("registry ownership handle data is invalid") from exc
 
     @property
     def endpoint(self) -> str:
@@ -115,6 +178,18 @@ def _registry_name(run_id: str) -> str:
     if len(name) > 63 or not _DNS_LABEL.fullmatch(name):  # pragma: no cover - invariant
         raise RegistryError("could not generate a DNS-safe registry container name")
     return name
+
+
+def _registry_name_matches_run(name: object, run_id: str) -> bool:
+    slug = re.sub(r"[^a-z0-9]+", "-", run_id.lower()).strip("-")
+    slug = slug[:20].rstrip("-") or "run"
+    prefix = f"devops-stack-registry-{slug}-"
+    return (
+        isinstance(name, str)
+        and len(name) <= 63
+        and bool(_DNS_LABEL.fullmatch(name))
+        and bool(re.fullmatch(f"{re.escape(prefix)}[a-f0-9]{{12}}", name))
+    )
 
 
 class EphemeralRegistry:
@@ -167,6 +242,54 @@ class EphemeralRegistry:
     @property
     def ownership_labels(self) -> Mapping[str, str]:
         return dict(self._labels)
+
+    @classmethod
+    def reopen(
+        cls,
+        handle: RegistryHandle | Mapping[str, object],
+        *,
+        command_runner: CommandRunner | None = None,
+        http_opener: HttpOpener | None = None,
+        readiness_timeout_seconds: float = 20.0,
+        poll_interval_seconds: float = 0.2,
+        command_timeout_seconds: float = 30.0,
+    ) -> "EphemeralRegistry":
+        """Reopen a persisted registry only after exact ownership verification."""
+
+        if isinstance(handle, Mapping):
+            validated = RegistryHandle.from_dict(handle)
+        elif isinstance(handle, RegistryHandle):
+            validated = RegistryHandle.from_dict(handle.to_dict())
+        else:
+            raise ValueError("registry ownership handle is invalid")
+
+        registry = cls(
+            validated.run_id,
+            command_runner=command_runner,
+            http_opener=http_opener,
+            readiness_timeout_seconds=readiness_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            command_timeout_seconds=command_timeout_seconds,
+        )
+        registry.name = validated.name
+        registry._labels = {
+            MANAGED_BY_LABEL: _MANAGED_BY,
+            RESOURCE_LABEL: _RESOURCE,
+            RUN_ID_LABEL: validated.run_id,
+            CONTAINER_NAME_LABEL: validated.name,
+        }
+        registry._container_id = validated.container_id
+
+        inspected = registry._inspect_required()
+        registry._assert_owned(inspected)
+        if registry._host_port_from(inspected) != validated.host_port:
+            raise RegistryOwnershipError(
+                "registry loopback host-port binding changed after persistence"
+            )
+
+        registry._handle = validated
+        registry._created = True
+        return registry
 
     def start(self) -> RegistryHandle:
         """Start the pinned registry and wait for its loopback `/v2/` endpoint."""
@@ -403,6 +526,17 @@ class EphemeralRegistry:
         container_id = self._container_id_from(inspected)
         if self._container_id and container_id != self._container_id:
             raise RegistryOwnershipError("registry container identity changed during the run")
+        if self._handle is not None:
+            try:
+                host_port = self._host_port_from(inspected)
+            except RegistryError as exc:
+                raise RegistryOwnershipError(
+                    "registry loopback host-port binding could not be verified"
+                ) from exc
+            if host_port != self._handle.host_port:
+                raise RegistryOwnershipError(
+                    "registry loopback host-port binding changed during the run"
+                )
 
     @staticmethod
     def _container_id_from(inspected: Mapping[str, Any]) -> str:

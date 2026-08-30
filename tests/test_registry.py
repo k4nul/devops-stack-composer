@@ -16,6 +16,7 @@ from devops_stack_composer.registry import (
     RUN_ID_LABEL,
     EphemeralRegistry,
     RegistryError,
+    RegistryHandle,
     RegistryOwnershipError,
 )
 
@@ -213,6 +214,110 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(options["check"], False)
             self.assertEqual(options["capture_output"], True)
             self.assertEqual(options["text"], True)
+
+    def test_handle_round_trip_and_reopen_verify_exact_owned_container(self) -> None:
+        runner = FakeDockerRunner()
+        registry = self.make_registry(runner)
+        handle = registry.start()
+        payload = handle.to_dict()
+
+        self.assertEqual(
+            set(payload),
+            {"schemaVersion", "runId", "name", "containerId", "hostPort", "image"},
+        )
+        serialized = json.dumps(payload).lower()
+        self.assertNotIn("path", serialized)
+        self.assertNotIn("credential", serialized)
+        self.assertNotIn("token", serialized)
+        self.assertEqual(RegistryHandle.from_dict(payload), handle)
+
+        before = len(runner.calls)
+        reopened = EphemeralRegistry.reopen(
+            payload,
+            command_runner=runner,
+            http_opener=SequenceOpener(200),
+        )
+
+        self.assertEqual(runner.calls[before:], [["docker", "inspect", registry.name]])
+        self.assertEqual(reopened.handle, handle)
+        self.assertTrue(reopened.status().owned)
+        self.assertTrue(reopened.connect_kind_network("kind"))
+        self.assertTrue(reopened.cleanup())
+
+    def test_handle_parser_rejects_unknown_path_missing_and_invalid_identity_data(self) -> None:
+        runner = FakeDockerRunner()
+        registry = self.make_registry(runner)
+        handle = registry.start()
+        payload = handle.to_dict()
+
+        invalid_payloads: list[object] = [
+            [],
+            {**payload, "dockerConfigPath": "/tmp/foreign"},
+            {key: value for key, value in payload.items() if key != "containerId"},
+            {**payload, "schemaVersion": "registry-ownership-v2"},
+            {**payload, "runId": "-invalid"},
+            {**payload, "name": "foreign-registry"},
+            {**payload, "containerId": "b" * 63},
+            {**payload, "hostPort": True},
+            {**payload, "hostPort": 65536},
+            {**payload, "image": "registry:latest"},
+            {**payload, "host": "0.0.0.0"},
+        ]
+        for invalid in invalid_payloads:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                RegistryHandle.from_dict(invalid)  # type: ignore[arg-type]
+
+        registry.cleanup()
+
+    def test_reopen_refuses_foreign_replacement_or_changed_port_without_removal(self) -> None:
+        for mutation in ("labels", "identity", "port", "image"):
+            with self.subTest(mutation=mutation):
+                runner = FakeDockerRunner()
+                registry = self.make_registry(runner)
+                payload = registry.start().to_dict()
+                assert runner.inspect_data is not None
+                if mutation == "labels":
+                    runner.inspect_data["Config"]["Labels"][RUN_ID_LABEL] = "foreign"
+                elif mutation == "identity":
+                    runner.inspect_data["Id"] = "c" * 64
+                elif mutation == "port":
+                    runner.inspect_data["NetworkSettings"]["Ports"]["5000/tcp"][0][
+                        "HostPort"
+                    ] = "49154"
+                else:
+                    runner.inspect_data["Config"]["Image"] = "registry:latest"
+                before = len(runner.calls)
+
+                with self.assertRaises((RegistryError, RegistryOwnershipError)):
+                    EphemeralRegistry.reopen(
+                        payload,
+                        command_runner=runner,
+                        http_opener=SequenceOpener(200),
+                    )
+
+                self.assertTrue(runner.exists)
+                self.assertFalse(
+                    any(command[:2] == ["docker", "rm"] for command in runner.calls[before:])
+                )
+
+    def test_reopened_cleanup_rechecks_persisted_host_port(self) -> None:
+        runner = FakeDockerRunner()
+        registry = self.make_registry(runner)
+        reopened = EphemeralRegistry.reopen(
+            registry.start().to_dict(),
+            command_runner=runner,
+            http_opener=SequenceOpener(200),
+        )
+        assert runner.inspect_data is not None
+        runner.inspect_data["NetworkSettings"]["Ports"]["5000/tcp"][0]["HostPort"] = (
+            "49154"
+        )
+
+        with self.assertRaisesRegex(RegistryOwnershipError, "host-port binding changed"):
+            reopened.cleanup()
+
+        self.assertTrue(runner.exists)
+        self.assertFalse(any(command[:2] == ["docker", "rm"] for command in runner.calls))
 
     def test_generated_names_are_unique_and_dns_safe(self) -> None:
         with patch(

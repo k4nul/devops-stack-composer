@@ -36,6 +36,7 @@ LOCAL_REGISTRY_CONFIGMAP = "local-registry-hosting"
 LOCAL_REGISTRY_NAMESPACE = "kube-public"
 LOCAL_REGISTRY_HELP = "https://kind.sigs.k8s.io/docs/user/local-registry/"
 
+_HANDLE_SCHEMA_VERSION = "kind-cluster-ownership-v1"
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _CONTAINER_ID = re.compile(r"^[a-f0-9]{64}$")
@@ -83,6 +84,79 @@ class KindClusterHandle:
     context: str
     node_image: str
     nodes: tuple[str, ...]
+    node_container_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.run_id, str) or not _RUN_ID.fullmatch(self.run_id):
+            raise ValueError("kind cluster handle run_id is invalid")
+        if not _cluster_name_matches_run(self.name, self.run_id):
+            raise ValueError("kind cluster handle name is not valid for its run")
+        if self.context != f"kind-{self.name}":
+            raise ValueError("kind cluster handle context does not match its name")
+        if self.node_image != KIND_NODE_IMAGE:
+            raise ValueError("kind cluster handle image does not match the pinned image")
+        expected_node = f"{self.name}-control-plane"
+        if self.nodes != (expected_node,):
+            raise ValueError(
+                "kind cluster handle must contain the exact control-plane node name"
+            )
+        if (
+            not isinstance(self.node_container_ids, tuple)
+            or len(self.node_container_ids) != 1
+            or not isinstance(self.node_container_ids[0], str)
+            or not _CONTAINER_ID.fullmatch(self.node_container_ids[0])
+        ):
+            raise ValueError(
+                "kind cluster handle must contain one immutable node container ID"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the complete non-secret ownership record for persistence."""
+
+        return {
+            "schemaVersion": _HANDLE_SCHEMA_VERSION,
+            "runId": self.run_id,
+            "name": self.name,
+            "nodeImage": self.node_image,
+            "nodes": [
+                {"name": name, "containerId": container_id}
+                for name, container_id in zip(
+                    self.nodes,
+                    self.node_container_ids,
+                    strict=True,
+                )
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "KindClusterHandle":
+        """Parse a closed ownership record without accepting credential paths."""
+
+        if not isinstance(value, Mapping):
+            raise ValueError("kind cluster ownership handle must be an object")
+        expected = {"schemaVersion", "runId", "name", "nodeImage", "nodes"}
+        if set(value) != expected:
+            raise ValueError("kind cluster ownership handle fields do not match the schema")
+        if value.get("schemaVersion") != _HANDLE_SCHEMA_VERSION:
+            raise ValueError("kind cluster ownership handle schemaVersion is unsupported")
+
+        raw_nodes = value.get("nodes")
+        if not isinstance(raw_nodes, list) or len(raw_nodes) != 1:
+            raise ValueError("kind cluster ownership handle nodes are invalid")
+        node = raw_nodes[0]
+        if not isinstance(node, Mapping) or set(node) != {"name", "containerId"}:
+            raise ValueError("kind cluster ownership node fields do not match the schema")
+        try:
+            return cls(
+                run_id=value["runId"],
+                name=value["name"],
+                context=f"kind-{value['name']}",
+                node_image=value["nodeImage"],
+                nodes=(node["name"],),
+                node_container_ids=(node["containerId"],),
+            )
+        except TypeError as exc:
+            raise ValueError("kind cluster ownership handle data is invalid") from exc
 
 
 @dataclass(frozen=True)
@@ -139,6 +213,18 @@ def _cluster_name(run_id: str) -> str:
     if len(name) > 63 or not _DNS_LABEL.fullmatch(name):  # pragma: no cover - invariant
         raise KindClusterError("could not generate a DNS-safe kind cluster name")
     return name
+
+
+def _cluster_name_matches_run(name: object, run_id: str) -> bool:
+    slug = re.sub(r"[^a-z0-9]+", "-", run_id.lower()).strip("-")
+    slug = slug[:10].rstrip("-") or "run"
+    prefix = f"dsc-kind-{slug}-"
+    return (
+        isinstance(name, str)
+        and len(name) <= 63
+        and bool(_DNS_LABEL.fullmatch(name))
+        and bool(re.fullmatch(f"{re.escape(prefix)}[a-f0-9]{{12}}", name))
+    )
 
 
 class KindCluster:
@@ -203,6 +289,57 @@ class KindCluster:
     @property
     def diagnostics(self) -> str:
         return "\n".join(self._diagnostics)[-8000:]
+
+    @classmethod
+    def reopen(
+        cls,
+        handle: KindClusterHandle | Mapping[str, object],
+        *,
+        command_runner: CommandRunner | None = None,
+        command_timeout_seconds: float = 60.0,
+        create_timeout_seconds: float = 300.0,
+    ) -> "KindCluster":
+        """Reopen a cluster after verifying its complete persisted identity."""
+
+        if isinstance(handle, Mapping):
+            validated = KindClusterHandle.from_dict(handle)
+        elif isinstance(handle, KindClusterHandle):
+            validated = KindClusterHandle.from_dict(handle.to_dict())
+        else:
+            raise ValueError("kind cluster ownership handle is invalid")
+
+        cluster = cls(
+            validated.run_id,
+            command_runner=command_runner,
+            command_timeout_seconds=command_timeout_seconds,
+            create_timeout_seconds=create_timeout_seconds,
+        )
+        cluster.name = validated.name
+        cluster._create_attempted = True
+        cluster._owned_nodes = tuple(
+            _NodeIdentity(name, container_id, "control-plane")
+            for name, container_id in zip(
+                validated.nodes,
+                validated.node_container_ids,
+                strict=True,
+            )
+        )
+        cluster._handle = validated
+
+        cluster._verify_kind_version()
+        if cluster.name not in cluster._get_clusters():
+            raise KindClusterOwnershipError(
+                "persisted kind cluster does not exist in the current inventory"
+            )
+        cluster._verify_owned_nodes()
+        try:
+            cluster._regenerate_private_kubeconfig()
+            # Close the verification-to-kubeconfig race before exposing credentials.
+            cluster._verify_owned_nodes()
+        except BaseException:
+            cluster._cleanup_runtime_files()
+            raise
+        return cluster
 
     def __enter__(self) -> "KindCluster":
         return self
@@ -281,6 +418,7 @@ class KindCluster:
                 context=f"kind-{self.name}",
                 node_image=KIND_NODE_IMAGE,
                 nodes=tuple(node.name for node in owned_nodes),
+                node_container_ids=tuple(node.container_id for node in owned_nodes),
             )
             return self._handle
         except BaseException:
@@ -459,6 +597,20 @@ class KindCluster:
             return self.destroy()
         self._cleanup_runtime_files()
         return False
+
+    def detach(self) -> KindClusterHandle | None:
+        """Discard private runtime files without deleting the external cluster.
+
+        Callers that created a cluster for a later process must persist the returned
+        handle before relinquishing it.  This method never modifies Docker or kind.
+        """
+
+        handle = self._handle
+        self._cleanup_runtime_files()
+        self._handle = None
+        self._owned_nodes = ()
+        self._registry_configuration = None
+        return handle
 
     def _verify_kind_version(self) -> None:
         result = self._run(["kind", "version"])
@@ -701,7 +853,7 @@ class KindCluster:
                 "local-registry-hosting ConfigMap verification failed"
             )
 
-    def _allocate_runtime_files(self) -> None:
+    def _allocate_runtime_files(self, *, kubeconfig_content: str = "") -> None:
         if self._runtime_directory is not None:  # pragma: no cover - lifecycle invariant
             raise KindClusterError("kind runtime files already exist")
         runtime = tempfile.TemporaryDirectory(prefix="devops-stack-kind-")
@@ -711,13 +863,36 @@ class KindCluster:
             config_path = directory / "kind-config.yaml"
             kubeconfig_path = directory / "kubeconfig"
             self._write_private_file(config_path, self._kind_config())
-            self._write_private_file(kubeconfig_path, "")
+            self._write_private_file(kubeconfig_path, kubeconfig_content)
         except BaseException:
             runtime.cleanup()
             raise
         self._runtime_directory = runtime
         self._config_path = config_path
         self._kubeconfig_path = kubeconfig_path
+
+    def _regenerate_private_kubeconfig(self) -> None:
+        result = self._run(["kind", "get", "kubeconfig", "--name", self.name])
+        if result.returncode != 0:
+            self._remember_diagnostic(
+                "regenerate private kind kubeconfig",
+                result.stderr or f"exit {result.returncode}",
+            )
+            detail = _sanitize_output(result.stderr, limit=1000)
+            suffix = f": {detail}" if detail else ""
+            raise KindClusterError(
+                f"could not regenerate private kind kubeconfig "
+                f"(exit {result.returncode}){suffix}"
+            )
+        kubeconfig = _text(result.stdout)
+        if not kubeconfig or len(kubeconfig.encode("utf-8")) > 1_000_000 or "\x00" in kubeconfig:
+            raise KindClusterError("kind returned invalid kubeconfig data")
+        self._allocate_runtime_files(kubeconfig_content=kubeconfig)
+        try:
+            self._ensure_private_kubeconfig()
+        except BaseException:
+            self._cleanup_runtime_files()
+            raise
 
     @staticmethod
     def _write_private_file(path: Path, content: str) -> None:
