@@ -1,0 +1,170 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/k4nul/devops-stack-composer/schemas/execution-plan.schema.json",
+  "title": "DevOps Stack execution plan",
+  "description": "A deterministic, pre-execution plan for one validation profile.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runId",
+    "profile",
+    "environment",
+    "artifactIntent",
+    "stages",
+    "productionApplyApproved",
+    "buildPlanHash"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "1.0.0"},
+    "runId": {"$ref": "#/definitions/runId"},
+    "profile": {
+      "type": "string",
+      "enum": ["static", "supply-chain", "kind-e2e", "release"]
+    },
+    "environment": {"$ref": "#/definitions/dnsLabel"},
+    "artifactIntent": {"$ref": "#/definitions/artifactIntent"},
+    "stages": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/definitions/plannedStage"}
+    },
+    "productionApplyApproved": {"type": "boolean"},
+    "buildPlanHash": {"$ref": "#/definitions/sha256Hex"}
+  },
+  "definitions": {
+    "runId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "dnsLabel": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$"
+    },
+    "gitRevision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "registry": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?$"
+    },
+    "repository": {
+      "type": "string",
+      "maxLength": 255,
+      "pattern": "^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?/)?[a-z0-9]+(?:(?:[._]|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|-+)[a-z0-9]+)*)*$"
+    },
+    "tag": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+    },
+    "platform": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+/[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)?$"
+    },
+    "relativePath": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*\\/$)(?!\\.\\.?$)(?!\\.\\.?/)(?!.*(?:/\\.\\.?)(?:/|$))(?!.*//)(?!.*\\\\)(?!.*[\\u0000-\\u001F\\u007F])(?!\\s)(?!.*\\s$).+$"
+    },
+    "relativePathOrDot": {
+      "oneOf": [
+        {"const": "."},
+        {"$ref": "#/definitions/relativePath"}
+      ]
+    },
+    "artifactIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "applicationName",
+        "registry",
+        "repository",
+        "requestedTag",
+        "platforms",
+        "sourceRevision",
+        "buildContext",
+        "dockerfile",
+        "buildArguments",
+        "targetStage",
+        "templateRevision",
+        "normalizedModelHash"
+      ],
+      "properties": {
+        "applicationName": {"$ref": "#/definitions/identifier"},
+        "registry": {"$ref": "#/definitions/registry"},
+        "repository": {"$ref": "#/definitions/repository"},
+        "requestedTag": {"$ref": "#/definitions/tag"},
+        "platforms": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/definitions/platform"}
+        },
+        "sourceRevision": {"$ref": "#/definitions/gitRevision"},
+        "buildContext": {"$ref": "#/definitions/relativePathOrDot"},
+        "dockerfile": {"$ref": "#/definitions/relativePath"},
+        "buildArguments": {
+          "type": "object",
+          "propertyNames": {"minLength": 1},
+          "additionalProperties": {"type": "string"}
+        },
+        "targetStage": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/definitions/identifier"}
+          ]
+        },
+        "templateRevision": {"$ref": "#/definitions/gitRevision"},
+        "normalizedModelHash": {"$ref": "#/definitions/sha256Hex"}
+      }
+    },
+    "plannedStage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stageId", "description", "required"],
+      "properties": {
+        "stageId": {
+          "type": "string",
+          "enum": [
+            "config-schema",
+            "template-lock",
+            "adapter-contracts",
+            "generated-files",
+            "registry-lifecycle",
+            "build-once",
+            "resolve-digest",
+            "sbom",
+            "vulnerability-scan",
+            "provenance",
+            "artifact-contract",
+            "kubernetes-schema",
+            "server-side-dry-run",
+            "deployment",
+            "rollout",
+            "pod-image",
+            "health",
+            "readiness",
+            "rollback",
+            "cleanup",
+            "package",
+            "release-assets",
+            "release-download-verification",
+            "working-tree",
+            "tag-commit"
+          ]
+        },
+        "description": {"type": "string", "minLength": 1},
+        "required": {"const": true}
+      }
+    }
+  }
+}

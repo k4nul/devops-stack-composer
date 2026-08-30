@@ -1,0 +1,386 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/k4nul/devops-stack-composer/schemas/execution-evidence.schema.json",
+  "title": "DevOps Stack execution evidence",
+  "description": "The complete machine-readable evidence record for one execution run.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runId",
+    "projectPath",
+    "configHash",
+    "templateLockHash",
+    "sourceRevision",
+    "startTime",
+    "endTime",
+    "executionProfile",
+    "stageResults",
+    "statusCounts",
+    "artifact",
+    "supplyChainEvidence",
+    "deploymentEvidence",
+    "finalStatus",
+    "failureReason",
+    "toolVersions"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "1.0.0"},
+    "runId": {"$ref": "#/definitions/runId"},
+    "projectPath": {"$ref": "#/definitions/relativePathOrDot"},
+    "configHash": {"$ref": "#/definitions/sha256Hex"},
+    "templateLockHash": {"$ref": "#/definitions/sha256Hex"},
+    "sourceRevision": {"$ref": "#/definitions/gitRevision"},
+    "startTime": {"$ref": "#/definitions/timestamp"},
+    "endTime": {"$ref": "#/definitions/timestamp"},
+    "executionProfile": {"$ref": "#/definitions/identifier"},
+    "stageResults": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/definitions/stageResult"}
+    },
+    "statusCounts": {"$ref": "#/definitions/statusCounts"},
+    "artifact": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/definitions/resolvedArtifact"}
+      ]
+    },
+    "supplyChainEvidence": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/definitions/supplyChainEvidence"}
+      ]
+    },
+    "deploymentEvidence": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/definitions/deploymentEvidence"}
+      ]
+    },
+    "finalStatus": {"$ref": "#/definitions/status"},
+    "failureReason": {"$ref": "#/definitions/nullableNonemptyString"},
+    "toolVersions": {
+      "type": "object",
+      "propertyNames": {"minLength": 1},
+      "additionalProperties": {"type": "string"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "finalStatus": {
+            "enum": ["FAILED", "BLOCKED_MISSING_REQUIRED_TOOL"]
+          }
+        },
+        "required": ["finalStatus"]
+      },
+      "then": {
+        "properties": {
+          "failureReason": {"$ref": "#/definitions/nonemptyString"}
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "runId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "gitRevision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ociDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "registry": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?$"
+    },
+    "repository": {
+      "type": "string",
+      "maxLength": 255,
+      "pattern": "^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?/)?[a-z0-9]+(?:(?:[._]|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|-+)[a-z0-9]+)*)*$"
+    },
+    "tag": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+    },
+    "immutableImageReference": {
+      "type": "string",
+      "pattern": "^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?/)?[a-z0-9]+(?:(?:[._]|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|-+)[a-z0-9]+)*)*@sha256:[0-9a-f]{64}$"
+    },
+    "digestPinnedImageReference": {
+      "type": "string",
+      "pattern": "^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?/)?[a-z0-9]+(?:(?:[._]|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|-+)[a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$"
+    },
+    "ociSubject": {
+      "oneOf": [
+        {"$ref": "#/definitions/ociDigest"},
+        {"$ref": "#/definitions/digestPinnedImageReference"}
+      ]
+    },
+    "runtimeImageId": {
+      "oneOf": [
+        {"$ref": "#/definitions/ociSubject"},
+        {
+          "type": "string",
+          "pattern": "^(?:containerd|cri-o|docker|docker-pullable)://(?:sha256:[0-9a-f]{64}|(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?/)?[a-z0-9]+(?:(?:[._]|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|-+)[a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64})$"
+        }
+      ]
+    },
+    "relativePath": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*\\/$)(?!\\.\\.?$)(?!\\.\\.?/)(?!.*(?:/\\.\\.?)(?:/|$))(?!.*//)(?!.*\\\\)(?!.*[\\u0000-\\u001F\\u007F])(?!\\s)(?!.*\\s$).+$"
+    },
+    "relativePathOrDot": {
+      "oneOf": [
+        {"const": "."},
+        {"$ref": "#/definitions/relativePath"}
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{6})?Z$"
+    },
+    "nonemptyString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!\\s)(?!.*\\s$)(?!.*[\\u0000-\\u001F\\u007F]).+$"
+    },
+    "nullableNonemptyString": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/definitions/nonemptyString"}
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "PASSED",
+        "FAILED",
+        "SKIPPED_MISSING_OPTIONAL_TOOL",
+        "BLOCKED_MISSING_REQUIRED_TOOL",
+        "NOT_APPLICABLE"
+      ]
+    },
+    "statusCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "PASSED",
+        "FAILED",
+        "SKIPPED_MISSING_OPTIONAL_TOOL",
+        "BLOCKED_MISSING_REQUIRED_TOOL",
+        "NOT_APPLICABLE"
+      ],
+      "properties": {
+        "PASSED": {"type": "integer", "minimum": 0},
+        "FAILED": {"type": "integer", "minimum": 0},
+        "SKIPPED_MISSING_OPTIONAL_TOOL": {"type": "integer", "minimum": 0},
+        "BLOCKED_MISSING_REQUIRED_TOOL": {"type": "integer", "minimum": 0},
+        "NOT_APPLICABLE": {"type": "integer", "minimum": 0}
+      }
+    },
+    "stageResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stageId",
+        "description",
+        "status",
+        "startTime",
+        "endTime",
+        "command",
+        "tool",
+        "sanitizedOutput",
+        "evidencePaths",
+        "failureReason",
+        "remediation"
+      ],
+      "properties": {
+        "stageId": {"$ref": "#/definitions/identifier"},
+        "description": {"$ref": "#/definitions/nonemptyString"},
+        "status": {"$ref": "#/definitions/status"},
+        "startTime": {"$ref": "#/definitions/timestamp"},
+        "endTime": {"$ref": "#/definitions/timestamp"},
+        "command": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/nonemptyString"}
+        },
+        "tool": {"$ref": "#/definitions/nullableNonemptyString"},
+        "sanitizedOutput": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "pattern": "^[^\\u0000]*$"}
+          ]
+        },
+        "evidencePaths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/definitions/relativePath"}
+        },
+        "failureReason": {"$ref": "#/definitions/nullableNonemptyString"},
+        "remediation": {"$ref": "#/definitions/nullableNonemptyString"}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": ["FAILED", "BLOCKED_MISSING_REQUIRED_TOOL"]
+              }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "failureReason": {"$ref": "#/definitions/nonemptyString"}
+            }
+          }
+        }
+      ]
+    },
+    "resolvedArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "immutableImageReference",
+        "repository",
+        "tag",
+        "manifestDigest",
+        "platformDigest",
+        "mediaType",
+        "architecture",
+        "operatingSystem",
+        "imageSize",
+        "configDigest",
+        "sourceRevision",
+        "buildPlanHash",
+        "createdByToolVersion",
+        "registryEndpoint",
+        "buildInvocationCount"
+      ],
+      "properties": {
+        "immutableImageReference": {"$ref": "#/definitions/immutableImageReference"},
+        "repository": {"$ref": "#/definitions/repository"},
+        "tag": {"$ref": "#/definitions/tag"},
+        "manifestDigest": {"$ref": "#/definitions/ociDigest"},
+        "platformDigest": {"$ref": "#/definitions/ociDigest"},
+        "mediaType": {"$ref": "#/definitions/nonemptyString"},
+        "architecture": {"$ref": "#/definitions/nonemptyString"},
+        "operatingSystem": {"$ref": "#/definitions/nonemptyString"},
+        "imageSize": {"type": "integer", "minimum": 0},
+        "configDigest": {"$ref": "#/definitions/ociDigest"},
+        "sourceRevision": {"$ref": "#/definitions/gitRevision"},
+        "buildPlanHash": {"$ref": "#/definitions/sha256Hex"},
+        "createdByToolVersion": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[+.-][A-Za-z0-9.-]+)?$"
+        },
+        "registryEndpoint": {"$ref": "#/definitions/registry"},
+        "buildInvocationCount": {"type": "integer", "minimum": 1}
+      }
+    },
+    "supplyChainEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifactDigest",
+        "sbomPath",
+        "sbomFormat",
+        "sbomHash",
+        "sbomGenerator",
+        "vulnerabilityReportPath",
+        "vulnerabilityReportHash",
+        "scannerName",
+        "scannerVersion",
+        "scannerDatabaseMetadata",
+        "policyResult",
+        "provenancePath",
+        "provenanceHash",
+        "provenanceType",
+        "attestationSubject",
+        "verificationStatus",
+        "evidenceGenerationTime"
+      ],
+      "properties": {
+        "artifactDigest": {"$ref": "#/definitions/ociDigest"},
+        "sbomPath": {"$ref": "#/definitions/relativePath"},
+        "sbomFormat": {"$ref": "#/definitions/nonemptyString"},
+        "sbomHash": {"$ref": "#/definitions/sha256Hex"},
+        "sbomGenerator": {"$ref": "#/definitions/nonemptyString"},
+        "vulnerabilityReportPath": {"$ref": "#/definitions/relativePath"},
+        "vulnerabilityReportHash": {"$ref": "#/definitions/sha256Hex"},
+        "scannerName": {"$ref": "#/definitions/nonemptyString"},
+        "scannerVersion": {"$ref": "#/definitions/nonemptyString"},
+        "scannerDatabaseMetadata": {"type": "object"},
+        "policyResult": {"type": "object"},
+        "provenancePath": {"$ref": "#/definitions/relativePath"},
+        "provenanceHash": {"$ref": "#/definitions/sha256Hex"},
+        "provenanceType": {"$ref": "#/definitions/nonemptyString"},
+        "attestationSubject": {"$ref": "#/definitions/ociSubject"},
+        "verificationStatus": {"$ref": "#/definitions/nonemptyString"},
+        "evidenceGenerationTime": {"$ref": "#/definitions/timestamp"}
+      }
+    },
+    "deploymentEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "environment",
+        "namespace",
+        "clusterType",
+        "clusterIdentifier",
+        "manifestHash",
+        "deployedImageReference",
+        "expectedDigest",
+        "actualPodImageId",
+        "rolloutStatus",
+        "readyReplicaCount",
+        "healthEndpointResult",
+        "readinessEndpointResult",
+        "rollbackAttempted",
+        "rollbackResult",
+        "finalRevision",
+        "finalDigest",
+        "diagnosticsPaths"
+      ],
+      "properties": {
+        "environment": {"$ref": "#/definitions/identifier"},
+        "namespace": {"$ref": "#/definitions/identifier"},
+        "clusterType": {"$ref": "#/definitions/identifier"},
+        "clusterIdentifier": {"$ref": "#/definitions/nonemptyString"},
+        "manifestHash": {"$ref": "#/definitions/sha256Hex"},
+        "deployedImageReference": {"$ref": "#/definitions/digestPinnedImageReference"},
+        "expectedDigest": {"$ref": "#/definitions/ociDigest"},
+        "actualPodImageId": {"$ref": "#/definitions/runtimeImageId"},
+        "rolloutStatus": {"$ref": "#/definitions/nonemptyString"},
+        "readyReplicaCount": {"type": "integer", "minimum": 0},
+        "healthEndpointResult": {"type": "object"},
+        "readinessEndpointResult": {"type": "object"},
+        "rollbackAttempted": {"type": "boolean"},
+        "rollbackResult": {"$ref": "#/definitions/nonemptyString"},
+        "finalRevision": {"$ref": "#/definitions/nonemptyString"},
+        "finalDigest": {"$ref": "#/definitions/ociDigest"},
+        "diagnosticsPaths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/definitions/relativePath"}
+        }
+      }
+    }
+  }
+}

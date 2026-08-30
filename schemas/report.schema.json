@@ -1,0 +1,9 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/k4nul/devops-stack-composer/schemas/report.schema.json",
+  "title": "DevOps Stack durable execution report",
+  "description": "A durable report containing the complete evidence record for one execution run.",
+  "allOf": [
+    {"$ref": "execution-evidence.schema.json"}
+  ]
+}
