@@ -92,12 +92,23 @@ class FakeRunner:
         self.attestation_failure_name: str | None = None
         self.head_commit = SOURCE_REVISION
         self.tag_commit = SOURCE_REVISION
+        self.write_gh_state = False
+        self.gh_state_path: Path | None = None
 
     def run(self, argv, *, cwd=None, environment=None, timeout=None):
         command = tuple(argv)
         self.commands.append(command)
         self.environments.append(dict(environment or {}))
         stdout = ""
+        if command[0] == "gh" and self.write_gh_state:
+            state_root = Path(
+                (environment or {}).get(
+                    "XDG_STATE_HOME", Path(cwd) / ".local" / "state"
+                )
+            )
+            self.gh_state_path = state_root / "gh" / "device-id"
+            self.gh_state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.gh_state_path.write_text("device-id", encoding="utf-8")
         if command[:3] == ("gh", "release", "download"):
             target = Path(command[command.index("--dir") + 1])
             for source in self.release.iterdir():
@@ -185,6 +196,18 @@ class ReleaseValidationTests(unittest.TestCase):
         parent = self.project / ".devops-stack" / "release-downloads"
         self.assertEqual(tuple(parent.iterdir()), ())
 
+    def test_github_cli_state_is_temporary_and_cannot_dirty_the_worktree(self) -> None:
+        self.runner.write_gh_state = True
+
+        validate_published_release(self.request, self.runner)
+
+        parent = self.project / ".devops-stack" / "release-downloads"
+        self.assertIsNotNone(self.runner.gh_state_path)
+        self.assertTrue(self.runner.gh_state_path.is_relative_to(parent))
+        self.assertFalse(self.runner.gh_state_path.exists())
+        self.assertFalse((self.project / ".local").exists())
+        self.assertEqual(tuple(parent.iterdir()), ())
+
     def test_dirty_worktree_fails_without_echoing_file_names(self) -> None:
         self.runner.dirty = True
 
@@ -236,9 +259,20 @@ class ReleaseValidationTests(unittest.TestCase):
                 if command[:3] == ("gh", "release", "download")
             )
         )
+        download_environment = self.runner.environments[download_index]
+        self.assertEqual(download_environment["GH_TOKEN"], "release-token")
         self.assertEqual(
-            self.runner.environments[download_index],
-            {"GH_TOKEN": "release-token"},
+            set(download_environment),
+            {"GH_CONFIG_DIR", "GH_TOKEN", "XDG_STATE_HOME"},
+        )
+        temporary_parent = self.project / ".devops-stack" / "release-downloads"
+        self.assertTrue(
+            Path(download_environment["GH_CONFIG_DIR"]).is_relative_to(temporary_parent)
+        )
+        self.assertTrue(
+            Path(download_environment["XDG_STATE_HOME"]).is_relative_to(
+                temporary_parent
+            )
         )
         github_indexes = {
             index
@@ -248,7 +282,8 @@ class ReleaseValidationTests(unittest.TestCase):
         }
         self.assertTrue(
             all(
-                environment == {"GH_TOKEN": "release-token"}
+                environment.get("GH_TOKEN") == "release-token"
+                and set(environment) == {"GH_CONFIG_DIR", "GH_TOKEN", "XDG_STATE_HOME"}
                 if index in github_indexes
                 else environment == {}
                 for index, environment in enumerate(self.runner.environments)

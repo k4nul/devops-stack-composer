@@ -270,9 +270,7 @@ def validate_published_release(
         raise TypeError("request must be a ReleaseGateRequest")
     project = project_root(request.project)
     local = _verify_local(request)
-    github_environment = (
-        {"GH_TOKEN": os.environ["GH_TOKEN"]} if os.environ.get("GH_TOKEN") else None
-    )
+    github_token = os.environ.get("GH_TOKEN")
     completed: list[ReleaseGateStage] = [
         ReleaseGateStage(
             "package",
@@ -311,7 +309,22 @@ def validate_published_release(
     with tempfile.TemporaryDirectory(
         prefix=f"v{request.version}-", dir=download_parent
     ) as temporary:
-        downloaded_directory = Path(temporary)
+        session_directory = Path(temporary)
+        downloaded_directory = session_directory / "assets"
+        github_config_directory = session_directory / "gh-config"
+        github_state_directory = session_directory / "xdg-state"
+        for directory in (
+            downloaded_directory,
+            github_config_directory,
+            github_state_directory,
+        ):
+            directory.mkdir(mode=0o700)
+        github_environment = {
+            "GH_CONFIG_DIR": str(github_config_directory),
+            "XDG_STATE_HOME": str(github_state_directory),
+        }
+        if github_token:
+            github_environment["GH_TOKEN"] = github_token
         relative = downloaded_directory.relative_to(project).as_posix()
         command = (
             "gh",
