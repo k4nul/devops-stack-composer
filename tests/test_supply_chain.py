@@ -147,14 +147,24 @@ class FixtureRunner:
     ) -> subprocess.CompletedProcess[str]:
         value = tuple(command)
         self.calls.append((value, dict(kwargs)))
-        if value == ("syft", REFERENCE, "-o", "spdx-json@2.3"):
+        output_path: Path | None = None
+        if (
+            value[:3] == ("syft", REFERENCE, "-o")
+            and len(value) == 4
+            and value[3].startswith("spdx-json@2.3=")
+        ):
             output = self.sbom
-        elif value == ("trivy", "image", "--format", "json", REFERENCE):
+            output_path = Path(value[3].split("=", 1)[1])
+        elif value[:4] == ("trivy", "image", "--format", "json"):
             output = self.scan
+            output_path = Path(value[value.index("--output") + 1])
         elif value == ("trivy", "version", "--format", "json"):
             output = self.version
         else:
             raise AssertionError(f"unexpected command: {value}")
+        if output_path is not None:
+            output_path.write_text(json.dumps(output), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "bounded tool log", "")
         return subprocess.CompletedProcess(command, 0, json.dumps(output), "")
 
 
@@ -166,12 +176,18 @@ class InsecureFixtureRunner(FixtureRunner):
         self.calls.append((value, dict(kwargs)))
         if value[0] == "syft":
             output = self.sbom
+            output_path = Path(value[3].split("=", 1)[1])
         elif value[:3] == ("trivy", "image", "--insecure"):
             output = self.scan
+            output_path = Path(value[value.index("--output") + 1])
         elif value == ("trivy", "version", "--format", "json"):
             output = self.version
+            output_path = None
         else:
             raise AssertionError(f"unexpected command: {value}")
+        if output_path is not None:
+            output_path.write_text(json.dumps(output), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "bounded tool log", "")
         return subprocess.CompletedProcess(command, 0, json.dumps(output), "")
 
 
@@ -209,14 +225,15 @@ class SupplyChainTests(unittest.TestCase):
     def test_generates_digest_bound_evidence_without_building(self) -> None:
         runner, evidence = self.generate()
 
-        self.assertEqual(
-            [call[0] for call in runner.calls],
-            [
-                ("syft", REFERENCE, "-o", "spdx-json@2.3"),
-                ("trivy", "image", "--format", "json", REFERENCE),
-                ("trivy", "version", "--format", "json"),
-            ],
-        )
+        syft, scan, version = [call[0] for call in runner.calls]
+        self.assertEqual(syft[:3], ("syft", REFERENCE, "-o"))
+        self.assertTrue(syft[3].startswith("spdx-json@2.3="))
+        self.assertEqual(scan[:4], ("trivy", "image", "--format", "json"))
+        self.assertEqual(scan[-1], REFERENCE)
+        self.assertIn("--output", scan)
+        self.assertEqual(version, ("trivy", "version", "--format", "json"))
+        self.assertFalse(Path(syft[3].split("=", 1)[1]).exists())
+        self.assertFalse(Path(scan[scan.index("--output") + 1]).exists())
         for command, options in runner.calls:
             self.assertFalse(options["shell"], command)
             self.assertTrue(options["capture_output"], command)

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -56,6 +59,7 @@ _RFC3339 = re.compile(
     r"(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$"
 )
 _SYFT_CREATOR = re.compile(r"^Tool: syft-(\S+)$")
+_MAX_TOOL_JSON_BYTES = 64 * 1024 * 1024
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 Clock = Callable[[], datetime]
@@ -876,6 +880,101 @@ class SupplyChainGenerator:
             code=code,
         )
 
+    def _run_json_file(
+        self,
+        command_builder: Callable[[Path], Sequence[str]],
+        *,
+        cwd: Path,
+        timeout_seconds: int,
+        source: str,
+        code: str,
+        environment: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Run a JSON-producing tool without buffering its report in process output."""
+
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".supply-chain-",
+                dir=cwd,
+            ) as temporary:
+                output_path = Path(temporary) / "report.json"
+                command = tuple(command_builder(output_path))
+                if not command:
+                    raise SupplyChainError(
+                        "SUPPLY_CHAIN_TOOL_FAILED",
+                        "supply-chain command must not be empty",
+                    )
+                options: dict[str, Any] = {
+                    "cwd": cwd,
+                    "capture_output": True,
+                    "text": True,
+                    "check": False,
+                    "shell": False,
+                    "timeout": timeout_seconds,
+                }
+                if environment is not None:
+                    options["env"] = dict(environment)
+                try:
+                    completed = self._command_runner(list(command), **options)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    raise SupplyChainError(
+                        "SUPPLY_CHAIN_TOOL_FAILED",
+                        f"{command[0]} could not be executed ({type(exc).__name__})",
+                    ) from exc
+                returncode = getattr(completed, "returncode", None)
+                if isinstance(returncode, bool) or not isinstance(returncode, int):
+                    raise SupplyChainError(
+                        "SUPPLY_CHAIN_TOOL_FAILED",
+                        f"{command[0]} returned an invalid status",
+                    )
+                if returncode != 0:
+                    raise SupplyChainError(
+                        "SUPPLY_CHAIN_TOOL_FAILED",
+                        f"{command[0]} exited with status {returncode}",
+                    )
+                payload = self._read_tool_json(output_path, source=source, code=code)
+                return _json_object(payload, source=source, code=code)
+        except SupplyChainError:
+            raise
+        except OSError as exc:
+            raise SupplyChainError(
+                "SUPPLY_CHAIN_TOOL_FAILED",
+                "could not create or remove the private tool output directory",
+            ) from exc
+
+    @staticmethod
+    def _read_tool_json(path: Path, *, source: str, code: str) -> bytes:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise SupplyChainError(code, f"{source} file is missing") from exc
+        try:
+            with os.fdopen(descriptor, "rb") as stream:
+                metadata = os.fstat(stream.fileno())
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise SupplyChainError(code, f"{source} is not a regular file")
+                if metadata.st_size > _MAX_TOOL_JSON_BYTES:
+                    raise SupplyChainError(
+                        code,
+                        f"{source} exceeds the {_MAX_TOOL_JSON_BYTES}-byte limit",
+                    )
+                payload = stream.read(_MAX_TOOL_JSON_BYTES + 1)
+        except SupplyChainError:
+            raise
+        except OSError as exc:
+            raise SupplyChainError(code, f"{source} could not be read") from exc
+        if len(payload) > _MAX_TOOL_JSON_BYTES:
+            raise SupplyChainError(
+                code,
+                f"{source} exceeds the {_MAX_TOOL_JSON_BYTES}-byte limit",
+            )
+        return payload
+
     def generate(
         self,
         *,
@@ -946,8 +1045,13 @@ class SupplyChainGenerator:
         annotator = f"Tool: {tool_name}-{artifact.created_by_tool_version}"
 
         immutable_reference = reference.immutable_reference
-        sbom_document = self._run_json(
-            ("syft", immutable_reference, "-o", SYFT_OUTPUT_FORMAT),
+        sbom_document = self._run_json_file(
+            lambda output: (
+                "syft",
+                immutable_reference,
+                "-o",
+                f"{SYFT_OUTPUT_FORMAT}={output}",
+            ),
             cwd=root,
             timeout_seconds=timeout_seconds,
             source="Syft SPDX output",
@@ -971,13 +1075,15 @@ class SupplyChainGenerator:
         )
         validate_spdx_document(sbom_document, immutable_reference)
 
-        vulnerability_report = self._run_json(
-            (
+        vulnerability_report = self._run_json_file(
+            lambda output: (
                 "trivy",
                 "image",
                 *(("--insecure",) if insecure_local_registry else ()),
                 "--format",
                 "json",
+                "--output",
+                str(output),
                 immutable_reference,
             ),
             cwd=root,
