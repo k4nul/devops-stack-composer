@@ -321,6 +321,7 @@ def validate_published_release(
             directory.mkdir(mode=0o700)
         github_environment = {
             "GH_CONFIG_DIR": str(github_config_directory),
+            "GH_TELEMETRY": "disabled",
             "XDG_STATE_HOME": str(github_state_directory),
         }
         if github_token:

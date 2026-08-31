@@ -18,6 +18,7 @@ from devops_stack_composer.execution import (
     ExecutionError,
     ExecutionOptions,
     ExecutionOrchestrator,
+    _default_tool_version,
     vulnerability_policy_from_model,
 )
 from devops_stack_composer.execution_bundle import verify_execution_bundle
@@ -511,6 +512,25 @@ class ExecutionTests(unittest.TestCase):
         self.assertIn("evidence: execution-plan.json", str(error))
         self.assertIn("devops-stack execute --project .", error.reproduction_command)
         self.assertIn("reproduce:", str(error))
+
+    def test_gh_version_probe_disables_worktree_dirtying_telemetry(self) -> None:
+        calls = []
+
+        def command_runner(command, **options):
+            calls.append((command, options))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="gh version 2.95.0 (2026-08-20)\n",
+                stderr="",
+            )
+
+        self.assertEqual(
+            _default_tool_version("gh", ROOT, command_runner),
+            "2.95.0",
+        )
+        self.assertEqual(calls[0][0], ["gh", "--version"])
+        self.assertEqual(calls[0][1]["env"], {"GH_TELEMETRY": "disabled"})
 
     def test_static_profile_closes_a_verifiable_run_without_external_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

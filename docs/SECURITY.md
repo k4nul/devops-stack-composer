@@ -69,6 +69,9 @@ environment, project-contained working directories, per-command and overall
 deadlines, cooperative cancellation, process-group termination, bounded output, and
 structured errors. During cumulative release execution, `GH_TOKEN` is passed only to
 the GitHub CLI download and attestation commands and is included in output redaction.
+GitHub CLI telemetry is disabled for both version discovery and authenticated release
+commands, while its configuration and state directories are private temporary paths;
+even a tool version probe therefore cannot create user state inside the worktree.
 
 The release workflow does not define `GH_TOKEN` at job scope. It maps the token only
 onto individual trusted steps that perform draft, attestation, publication, or public

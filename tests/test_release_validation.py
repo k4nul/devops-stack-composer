@@ -263,8 +263,9 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertEqual(download_environment["GH_TOKEN"], "release-token")
         self.assertEqual(
             set(download_environment),
-            {"GH_CONFIG_DIR", "GH_TOKEN", "XDG_STATE_HOME"},
+            {"GH_CONFIG_DIR", "GH_TELEMETRY", "GH_TOKEN", "XDG_STATE_HOME"},
         )
+        self.assertEqual(download_environment["GH_TELEMETRY"], "disabled")
         temporary_parent = self.project / ".devops-stack" / "release-downloads"
         self.assertTrue(
             Path(download_environment["GH_CONFIG_DIR"]).is_relative_to(temporary_parent)
@@ -283,7 +284,9 @@ class ReleaseValidationTests(unittest.TestCase):
         self.assertTrue(
             all(
                 environment.get("GH_TOKEN") == "release-token"
-                and set(environment) == {"GH_CONFIG_DIR", "GH_TOKEN", "XDG_STATE_HOME"}
+                and environment.get("GH_TELEMETRY") == "disabled"
+                and set(environment)
+                == {"GH_CONFIG_DIR", "GH_TELEMETRY", "GH_TOKEN", "XDG_STATE_HOME"}
                 if index in github_indexes
                 else environment == {}
                 for index, environment in enumerate(self.runner.environments)

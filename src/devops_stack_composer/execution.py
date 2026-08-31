@@ -124,6 +124,7 @@ _EXECUTION_ENVIRONMENT_KEYS = frozenset(
     (
         *DEFAULT_ALLOWED_ENVIRONMENT_KEYS,
         "GH_CONFIG_DIR",
+        "GH_TELEMETRY",
         "GH_TOKEN",
         "SYFT_REGISTRY_INSECURE_USE_HTTP",
         "XDG_STATE_HOME",
@@ -399,14 +400,22 @@ def _default_tool_version(
     command = commands.get(tool)
     if command is None:
         return None
+    options: dict[str, Any] = {
+        "cwd": project,
+        "capture_output": True,
+        "text": True,
+        "check": False,
+        "timeout": 30,
+    }
+    if tool == "gh":
+        # gh 2.95 creates a telemetry device ID during even `gh --version`.
+        # The safe runner intentionally omits HOME, which otherwise makes that
+        # state path relative to (and dirty) the release worktree.
+        options["env"] = {"GH_TELEMETRY": "disabled"}
     try:
         result = command_runner(
             list(command),
-            cwd=project,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
+            **options,
         )
     except (OSError, subprocess.SubprocessError):
         return None
