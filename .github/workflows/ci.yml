@@ -50,11 +50,14 @@ jobs:
         run: |
           ruff format --check \
             scripts/check-doc-links.py \
+            scripts/verify-release-distributions.py \
             src/devops_stack_composer/release_assets.py \
             src/devops_stack_composer/release_validation.py \
             tests/test_release_assets.py \
             tests/test_release_validation.py
-          ruff check scripts/check-doc-links.py
+          ruff check \
+            scripts/check-doc-links.py \
+            scripts/verify-release-distributions.py
           ruff check src tests --select F
           python -m compileall -q src tests examples/python-service
           bash -n scripts/install-actionlint.sh
@@ -70,6 +73,7 @@ jobs:
           mypy \
             --follow-imports=skip \
             --ignore-missing-imports \
+            scripts/verify-release-distributions.py \
             src/devops_stack_composer/release_assets.py \
             src/devops_stack_composer/release_validation.py
 
