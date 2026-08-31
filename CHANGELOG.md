@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.5 - 2026-08-31
+
+- Disable GitHub CLI telemetry for constrained version and release commands so
+  pinned `gh` 2.95 cannot create a device identifier inside a HOME-less worktree.
+- Keep authenticated GitHub CLI configuration and state in private temporary paths,
+  with executable coverage for both the version probe and release commands.
+- Advance from the unpublished v0.2.4 candidate without moving its tag or publishing
+  its failed draft after the strict clean-worktree gate detected the telemetry file.
+
 ## 0.2.4 - 2026-08-31
 
 - Correct the evidence-layout contract to distinguish lightweight execution records

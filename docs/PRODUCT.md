@@ -78,7 +78,7 @@ It does not claim Docker cache wiring because the locked Docker template has no
 official cache input. Standalone Groovy parsing, when installed, is not equivalent to
 controller-backed Jenkins plugin validation.
 
-The project is currently version `0.2.4` and classified as alpha. Review generated
+The project is currently version `0.2.5` and classified as alpha. Review generated
 artifacts and validate them in the same toolchain used for deployment.
 
 ## Independence and licensing
