@@ -1,8 +1,8 @@
 # Release process
 
 Version 0.2 uses a tag-driven GitHub release with a closed asset set, real kind
-evidence, GitHub artifact attestations, a fresh-download comparison, and a cumulative
-post-publication release run.
+evidence, GitHub artifact attestations, cumulative validation while the release is
+still a draft, and a fresh post-publication download and installation check.
 
 ## Preconditions
 
@@ -11,7 +11,9 @@ post-publication release run.
 - `pyproject.toml`, `devops_stack_composer.__version__`, and `CHANGELOG.md` name the
   same semantic version.
 - Docker and the checksum-pinned execution tools can complete `kind-e2e`.
-- The release tag and GitHub release do not already exist.
+- The release tag does not already exist before it is pushed. A GitHub release for
+  that tag must either be absent or be an unpublished, non-prerelease draft whose
+  existing assets are an exact subset of the newly built closed set.
 - No credential, `.env`, local management file, runtime cache, or evidence directory
   is tracked.
 
@@ -72,21 +74,43 @@ git push origin v0.2.1
 `.github/workflows/release.yml` then performs the release independently:
 
 1. proves tag, checkout, package version, source commit, and clean worktree equality;
-2. runs every unit/integration test and a fresh real `kind-e2e` execution;
-3. builds and inspects wheel and source distribution;
+2. checks that hosted Docker and Buildx are inside reviewed version ranges, records
+   their exact versions, runs every unit/integration test, and completes a fresh real
+   `kind-e2e` execution;
+3. builds and inspects one wheel and one source distribution;
 4. creates package SBOM, file provenance, and the closed asset set;
-5. re-verifies the nested example evidence and every checksum offline;
-6. gives each release file a GitHub/Sigstore build-provenance attestation;
-7. creates the GitHub Release and uploads the exact files;
-8. downloads all files into a fresh directory and compares their bytes;
-9. verifies every attestation against this repository, `.github/workflows/release.yml`,
+5. re-verifies the nested example evidence and every checksum offline, then installs
+   and verifies both locally built distributions in separate temporary environments;
+6. creates an empty GitHub draft when none exists, or verifies every asset already in
+   an existing draft as an exact byte-identical subset of the closed set;
+7. attests every release file and uploads only missing draft assets without clobbering
+   or deleting an existing asset;
+8. downloads the complete draft into a fresh directory, compares every byte, and
+   verifies every attestation against this repository, `.github/workflows/release.yml`,
    the tag ref, and the exact source commit;
-10. repeats Docker/kind execution under the `release` profile and records the
-    post-publication gates.
+9. repeats Docker/kind execution under the cumulative `release` profile while the
+   release is still private and records fresh offline evidence verification;
+10. on another runner, freshly downloads the draft and installs both distributions
+    without using a package cache;
+11. immediately before publication, downloads and compares the candidate again,
+    re-verifies every attestation, and proves that the live server-side tag resolves
+    to the exact workflow commit;
+12. publishes only that unchanged draft, then uses a fresh post-publication runner to
+    download and compare the public files, re-verify attestations, install both
+    distributions without a package cache, and reconfirm the live tag commit.
 
-The workflow uses minimal permissions per job. Only the publication job receives
-`contents: write`; only attestation and trusted-publishing jobs receive an OIDC token.
-Every third-party or GitHub action is pinned to an immutable commit SHA.
+All gates that authorize publication, including cumulative execution and a complete
+draft-distribution installation check, therefore finish before the draft becomes
+public. The final job independently repeats the distribution check over the bytes
+that are actually public; it is not a substitute for a pre-publication check.
+
+The workflow uses minimal permissions per job. The draft-staging and publication jobs
+receive `contents: write`; only draft staging receives `attestations: write` and an
+OIDC token. `GH_TOKEN` is never job-wide: it is mapped only onto individual trusted
+steps that invoke GitHub CLI operations, while checkout disables persisted
+credentials and distribution installation receives no GitHub token. Every third-party
+or GitHub action is pinned to an immutable commit SHA, and the workflow installs a
+checksum-pinned GitHub CLI.
 
 ## Published asset set
 
@@ -115,20 +139,26 @@ gh attestation verify PATH \
 
 ## PyPI publication
 
-Python publication is deliberately disabled until the owner configures a PyPI
-trusted publisher for this repository, the `release.yml` workflow, and the `pypi`
-environment. Once configured, set the repository Actions variable
-`PUBLISH_TO_PYPI=true`. The isolated final job downloads the already verified set,
-selects only its wheel and source distribution, and publishes with OIDC; it never
-receives a long-lived PyPI token.
-
-Absence of that external account configuration does not weaken or block the GitHub
-Release. It remains a clearly reported optional publication channel.
+Version 0.2 does not publish to PyPI. The release workflow has no PyPI job, credential,
+environment, or enablement variable; the GitHub Release is its only publication
+target. Adding PyPI publication requires a separately reviewed workflow change after
+the owner configures and verifies a trusted publisher. It must use OIDC rather than a
+long-lived PyPI token.
 
 ## Failure and retry policy
 
 Do not move or overwrite a published tag, replace assets under the same version, use
-force-push, or mark a failed workflow successful manually. Fix the cause on `main`,
-increment the version, and create a new release. If publication fails before a GitHub
-Release is created, the unmodified tag workflow may be rerun after an external outage;
-if assets may have become visible, inspect them before any retry.
+force-push, or mark a failed workflow successful manually. Fix a release defect on
+`main`, increment the version, and create a new release.
+
+If draft creation or upload is interrupted, rerun the failed jobs without changing the
+tag or source. The staging job downloads every existing draft asset, requires the
+draft to contain only a byte-identical subset of the current closed set, and uploads
+only missing names without `--clobber`. An unexpected name or changed byte stops the
+run; the workflow never repairs that condition by overwriting or deleting evidence.
+
+If a job loses contact immediately after publication, a failed-job retry accepts the
+already-public release only after repeating the exact byte, attestation, release-state,
+and live-tag checks. A post-publication verification failure must not be hidden or
+used as permission to replace public assets. Preserve its diagnostics, investigate,
+and rerun only the unchanged failed verification when appropriate.

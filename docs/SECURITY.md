@@ -67,8 +67,15 @@ Docker, kind, kubectl, Syft, Trivy, Git, and GitHub CLI commands use argument ar
 through the safe process runner. The runner has an executable allowlist, a reduced
 environment, project-contained working directories, per-command and overall
 deadlines, cooperative cancellation, process-group termination, bounded output, and
-structured errors. `GH_TOKEN`, when present for post-publication checks, is supplied
-only to GitHub CLI calls and included in output redaction.
+structured errors. During cumulative release execution, `GH_TOKEN` is passed only to
+the GitHub CLI download and attestation commands and is included in output redaction.
+
+The release workflow does not define `GH_TOKEN` at job scope. It maps the token only
+onto individual trusted steps that perform draft, attestation, publication, or public
+verification operations. Checkout disables persisted credentials. The isolated wheel
+and source-distribution installation steps receive no GitHub token, remove
+token-bearing environment variables before running package code, and disable the
+package cache.
 
 The loopback registry is HTTP and unauthenticated by design. It is suitable only for
 the isolated local test cluster and is removed by default. Do not expose its port,
@@ -125,10 +132,17 @@ checksums establish internal integrity but not creator identity.
 
 Release assembly reads regular files only, bounds archive members and uncompressed
 size, rejects links and traversal, validates package metadata and schemas, and
-re-verifies embedded run evidence in a private temporary directory. After GitHub
-publication, each downloaded file must match the local closed set and pass a
-GitHub/Sigstore attestation constrained to this repository, the release workflow,
-tag ref, and source commit. See [the threat model](THREAT_MODEL.md) for residual risk.
+re-verifies embedded run evidence in a private temporary directory. Draft staging
+accepts only an empty draft or a byte-identical subset of the closed set, uploads only
+missing assets without clobbering, and verifies the completed draft before proceeding.
+
+The cumulative `release` execution and isolated installation of both distributions
+finish while the release is still a draft. Immediately before publication, every
+candidate byte and GitHub/Sigstore attestation is checked again and the live GitHub
+tag must resolve to the validated source commit. A fresh post-publication runner then
+downloads the public files, repeats byte and attestation verification, installs both
+distributions without a package cache, and reconfirms the live tag. See
+[the threat model](THREAT_MODEL.md) for residual risk.
 
 ## Reporting a vulnerability
 

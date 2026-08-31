@@ -25,7 +25,7 @@ is not a sandbox for untrusted application source or unreviewed template commits
 | Artifact identity | One build invocation, registry-resolved digest, digest-only workload references, rendered/applied/runtime comparison. |
 | Evidence | Strict schemas, stable JSON, byte/file bounds, redaction, closed SHA-256 inventory, cross-file subject linkage, explicit incomplete/failure state. |
 | Release archives | Regular-file-only inputs, canonical top-level names, compressed/uncompressed limits, duplicate/path/link rejection, metadata and nested evidence validation. |
-| Publication | Exact tag/HEAD/source equality, clean worktree, closed local set, fresh download equality, GitHub/Sigstore attestation verification constrained to repository, workflow, tag ref, and source commit. |
+| Publication | Exact tag/HEAD/source equality, clean worktree, resumable no-clobber draft staging, complete pre-publication execution and installation gates, closed-set download equality, constrained GitHub/Sigstore attestations, and live server-side tag checks before and after publication. |
 
 ## Attacks explicitly covered
 
@@ -46,8 +46,18 @@ is not a sandbox for untrusted application source or unreviewed template commits
   success-bit edits are detected.
 - Wheels and tarballs are inspected without extracting into the project; nested
   release evidence is extracted only after path, type, count, and size checks.
-- GitHub download arguments use a validated `OWNER/REPO` value. `GH_TOKEN` is scoped
-  only to GitHub CLI verification calls and is never serialized.
+- An interrupted draft upload can resume only when every existing name and byte is an
+  exact subset of the newly built closed set. Missing files are uploaded without
+  clobbering; unexpected or changed assets stop publication.
+- The cumulative release profile and isolated installation of both distributions
+  finish before the draft becomes public. Publication rechecks the candidate bytes,
+  attestations, release state, and live server-side tag commit.
+- A fresh post-publication runner downloads and installs the public distributions,
+  repeats closed-set and attestation checks, and reconfirms the live tag commit.
+- GitHub download arguments use a validated `OWNER/REPO` value. The workflow maps
+  `GH_TOKEN` only onto individual trusted GitHub-operation steps, checkout does not
+  persist it, package installation receives no token, and the token is never
+  serialized.
 
 ## Residual risks
 
@@ -64,8 +74,12 @@ is not a sandbox for untrusted application source or unreviewed template commits
   The database metadata is recorded, but a clean scan is not a permanent guarantee.
 - A workflow with permission to change the release workflow can create valid future
   attestations. Branch protection and repository access control remain owner duties.
-- TOCTOU is reduced through immutable IDs, digest references, and containment rechecks
-  but cannot be eliminated against a hostile local administrator.
+- GitHub release and tag updates are separate remote operations. Live-tag and
+  fresh-download checks narrow that race, but cannot prevent an independently
+  authorized repository writer from changing remote state between checks. Tag
+  protection, release immutability, and repository access control remain owner duties.
+- Other TOCTOU is reduced through immutable IDs, digest references, and containment
+  rechecks but cannot be eliminated against a hostile local administrator.
 
 ## Security review rule
 
