@@ -347,6 +347,8 @@ jobs:
         run: |
           owner=${GITHUB_REPOSITORY%%/*}
           repository=${GITHUB_REPOSITORY#*/}
+          # GraphQL variables below are literal identifiers, not shell expansions.
+          # shellcheck disable=SC2016
           gh api graphql \
             -f owner="$owner" \
             -f name="$repository" \
