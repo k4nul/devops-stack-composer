@@ -26,6 +26,18 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Restore the pinned actionlint archive
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/actionlint-archive
+          key: actionlint-${{ runner.os }}-amd64-v1.7.12-v1
+
+      - name: Install checksum-pinned actionlint
+        run: |
+          scripts/install-actionlint.sh \
+            "$RUNNER_TEMP/actionlint" \
+            "$RUNNER_TEMP/actionlint-archive"
+
       - name: Install static analysis tools
         run: |
           python -m pip install --upgrade pip
@@ -37,13 +49,21 @@ jobs:
       - name: Check formatting and Python syntax
         run: |
           ruff format --check \
+            scripts/check-doc-links.py \
             src/devops_stack_composer/release_assets.py \
             src/devops_stack_composer/release_validation.py \
             tests/test_release_assets.py \
             tests/test_release_validation.py
+          ruff check scripts/check-doc-links.py
           ruff check src tests --select F
           python -m compileall -q src tests examples/python-service
+          bash -n scripts/install-actionlint.sh
           bash -n scripts/install-kind-e2e-tools.sh
+
+      - name: Validate workflows and local documentation links
+        run: |
+          "$RUNNER_TEMP/actionlint/actionlint" -color
+          python scripts/check-doc-links.py
 
       - name: Type-check the v0.2 release boundary
         run: |
@@ -210,7 +230,7 @@ jobs:
   unit:
     name: Unit tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -228,7 +248,7 @@ jobs:
       - name: Install package
         run: |
           python -m pip install --upgrade pip
-          python -m pip install .
+          python -m pip install . build==1.6.0 twine==7.0.0
           python -m pip check
 
       - name: Verify installed CLI and package data
@@ -251,6 +271,64 @@ jobs:
 
       - name: Run unit tests against installed package
         run: python -m unittest discover -s tests -v
+
+      - name: Build and isolated-install wheel and source distribution
+        run: |
+          python -m build --outdir "$RUNNER_TEMP/dist"
+          python -m twine check "$RUNNER_TEMP"/dist/*.whl "$RUNNER_TEMP"/dist/*.tar.gz
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          from devops_stack_composer import __version__
+
+          artifacts = sorted((Path(os.environ["RUNNER_TEMP"]) / "dist").iterdir())
+          assert len(artifacts) == 2, artifacts
+          assert sum(path.name.endswith(".whl") for path in artifacts) == 1, artifacts
+          assert sum(path.name.endswith(".tar.gz") for path in artifacts) == 1, artifacts
+          for artifact in artifacts:
+              with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
+                  root = Path(directory)
+                  environment = root / "venv"
+                  subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
+                  python = environment / "bin" / "python"
+                  subprocess.run(
+                      [str(python), "-m", "pip", "install", str(artifact)],
+                      check=True,
+                      cwd=root,
+                  )
+                  version = subprocess.run(
+                      [
+                          str(environment / "bin" / "devops-stack"),
+                          "--version",
+                      ],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                      cwd=root,
+                  )
+                  assert version.stdout.strip() == f"devops-stack {__version__}", version.stdout
+                  subprocess.run(
+                      [
+                          str(python),
+                          "-c",
+                          (
+                              "import json; "
+                              "from jsonschema import Draft7Validator; "
+                              "from devops_stack_composer.resources import schema_path; "
+                              "[Draft7Validator.check_schema(json.loads(schema_path(name).read_text())) "
+                              "for name in ('devops-stack.schema.json', "
+                              "'execution-report.schema.json', "
+                              "'execution-evidence.schema.json')]"
+                          ),
+                      ],
+                      check=True,
+                      cwd=root,
+                  )
+          PY
 
   locked-template-e2e:
     name: Locked-template end-to-end
@@ -517,6 +595,10 @@ jobs:
           assert value["write"] is True, value
           assert value["validation"]["passed"] is True, value["validation"]
           assert value["manifest"] == "generated/.devops-stack-manifest.json", value
+          manifest = json.loads(
+              (Path(os.environ["APP_ROOT"]) / value["manifest"]).read_text()
+          )
+          assert len(manifest["files"]) >= 32, len(manifest["files"])
           PY
 
       - name: Prove deterministic rerender and preview immutability
@@ -752,3 +834,25 @@ jobs:
           ).stdout
           assert composer_status == "", composer_status
           PY
+
+      - name: Upload locked-template diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: locked-template-diagnostics-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/*.json
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/*.sha256
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Clean Docker build cache and report disk usage
+        if: ${{ always() }}
+        run: |
+          docker rm --force \
+            "devops-stack-e2e-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            >/dev/null 2>&1 || true
+          docker buildx prune --all --force
+          docker system prune --all --force --volumes
+          docker system df
