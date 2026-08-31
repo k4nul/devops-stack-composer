@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from devops_stack_composer.execution import (
     ExecutionError,
     ExecutionOptions,
     ExecutionOrchestrator,
+    _EXECUTION_ENVIRONMENT_KEYS,
     _default_tool_version,
     vulnerability_policy_from_model,
 )
@@ -36,6 +38,8 @@ from devops_stack_composer.kubernetes_execution import (
 )
 from devops_stack_composer.kubernetes_runtime import ResolvedKubernetesManifest
 from devops_stack_composer.locks import TemplateLock
+from devops_stack_composer.process_compat import SafeSubprocessAdapter
+from devops_stack_composer.process_runner import SafeProcessRunner
 from devops_stack_composer.release_validation import (
     ReleaseGateError,
     ReleaseGateStage,
@@ -513,24 +517,37 @@ class ExecutionTests(unittest.TestCase):
         self.assertIn("devops-stack execute --project .", error.reproduction_command)
         self.assertIn("reproduce:", str(error))
 
+    @unittest.skipUnless(os.name == "posix", "fixture uses a POSIX executable")
     def test_gh_version_probe_disables_worktree_dirtying_telemetry(self) -> None:
-        calls = []
-
-        def command_runner(command, **options):
-            calls.append((command, options))
-            return subprocess.CompletedProcess(
-                command,
-                0,
-                stdout="gh version 2.95.0 (2026-08-20)\n",
-                stderr="",
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            tools = project / "tools"
+            tools.mkdir()
+            executable = tools / "gh"
+            executable.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                'if [ "${GH_TELEMETRY:-}" != "disabled" ]; then\n'
+                "  mkdir -p .local/state/gh\n"
+                "  : > .local/state/gh/device-id\n"
+                "fi\n"
+                'printf "%s\\n" "gh version 2.95.0 (fixture)"\n',
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            runner = SafeProcessRunner(
+                project,
+                allowed_executables={"gh"},
+                allowed_environment_keys=_EXECUTION_ENVIRONMENT_KEYS,
+                inherited_environment_keys={"PATH"},
+                base_environment={"PATH": f"{tools}{os.pathsep}/usr/bin:/bin"},
             )
 
-        self.assertEqual(
-            _default_tool_version("gh", ROOT, command_runner),
-            "2.95.0",
-        )
-        self.assertEqual(calls[0][0], ["gh", "--version"])
-        self.assertEqual(calls[0][1]["env"], {"GH_TELEMETRY": "disabled"})
+            self.assertEqual(
+                _default_tool_version("gh", project, SafeSubprocessAdapter(runner)),
+                "2.95.0",
+            )
+            self.assertFalse((project / ".local").exists())
 
     def test_static_profile_closes_a_verifiable_run_without_external_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
