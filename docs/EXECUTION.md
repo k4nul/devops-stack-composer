@@ -1,10 +1,12 @@
 # Execution-backed validation
 
 Version 0.2 adds an opt-in execution path alongside deterministic composition. It
-builds the selected application image once, pushes it only to a run-owned loopback
-registry, resolves the registry manifest digest, deploys that immutable reference to
-a run-owned kind cluster, exercises the service, and closes a checksummed evidence
-bundle.
+builds the selected application image once, resolves the registry manifest digest,
+binds every later subject to that immutable reference, and closes a checksummed
+evidence bundle. The `kind-e2e` and `release` profiles push only to a run-owned
+loopback registry and deploy to a run-owned kind cluster. `supply-chain` may instead
+use an explicitly configured existing registry; authentication remains delegated to
+the operator's Docker credential helper.
 
 Generation remains side-effect free by default. `execute` is the explicit boundary
 that may create Docker and Kubernetes resources.
@@ -17,12 +19,36 @@ profiles before it.
 | Profile | Required proof |
 | --- | --- |
 | `static` | Configuration, template lock, adapter contracts, and generated-file plan. |
-| `supply-chain` | Static proof plus owned registry, one build/push, canonical digest, SBOM, vulnerability policy, file provenance, and artifact contract. |
+| `supply-chain` | Static proof plus configured registry, one build/push, canonical digest, SBOM, vulnerability policy, file provenance, and artifact contract. |
 | `kind-e2e` | Supply-chain proof plus Kubernetes schemas, server-side dry-run, apply, rollout, pod image, health, readiness, rollback, and cleanup. |
 | `release` | A complete kind run plus package and closed asset verification, fresh GitHub download, GitHub artifact attestations, clean worktree, and exact tag/HEAD/source commit equality. |
 
 A missing required executable blocks the selected profile. It is never converted to
 a passing static check.
+
+## Operator command map
+
+The v0.2 command surface is intentionally explicit:
+
+| Command | Purpose |
+| --- | --- |
+| `devops-stack doctor --profile PROFILE` | Classify installed tools against one cumulative profile. |
+| `devops-stack execution plan` | Print the validated logical stages without allocating resources. |
+| `devops-stack execute` | Cross the side-effect boundary; `--dry-run` is an equivalent plan-only entry point. |
+| `devops-stack execution show` | Freshly verify and show one completed run. |
+| `devops-stack artifact inspect` | Summarize immutable artifact identity and the recorded SBOM, scan, provenance, and deployment environment. |
+| `devops-stack artifact verify` | Offline-verify a run, or generated Jenkins evidence supplied with `--artifact` and its optional evidence-file arguments. |
+| `devops-stack evidence verify` | Verify the closed inventory and same-digest semantics of a canonical run. |
+| `devops-stack report --run RUN_ID` | Read the stored human or JSON run report after fresh offline verification. |
+| `devops-stack execution cleanup` | Recover after interruption by removing only exact sealed resource IDs. |
+| `devops-stack cluster kind create`, `status`, or `destroy` | Explicitly manage the low-level run-owned kind/registry lifecycle; normal executions manage it automatically. |
+| `devops-stack release materials`, `assemble`, or `verify` | Create package evidence, close the release asset set around a successful kind run, and verify it offline. |
+
+Run-scoped readers accept `--output` when the evidence root differs from
+`.devops-stack/runs`. `execute --keep-resources` and
+`--keep-environment-on-failure` are debugging options: retained cleanup is
+`NOT_APPLICABLE`, so the required cleanup gate does not pass. Full release assembly
+arguments are in [Release](RELEASE.md).
 
 ## Host requirements
 
@@ -148,9 +174,18 @@ credential store.
 ## Limits
 
 - The runtime is local-only and supports one Linux architecture per execution.
-- The registry is unauthenticated because it is bound to loopback and exists only for
-  the isolated run.
+- The ephemeral registry used by `kind-e2e` and `release` is unauthenticated because
+  it is bound to loopback and exists only for the isolated run. An explicitly selected
+  existing registry is supported only by the supply-chain path and receives no
+  implicit credential.
 - The generated file provenance is checksummed file evidence, not a signature.
   Published release files receive separate GitHub/Sigstore artifact attestations.
+- Local evidence reports `authenticity: NOT_ESTABLISHED`; checksums establish internal
+  integrity, not who created the run.
+- A `production` environment run is still isolated local kind validation, not a
+  production-cluster deployment or certification.
+- Generated Jenkins syntax and contracts are validated statically; no Jenkins
+  controller, plugin matrix, credential binding, apply, approval, or rollback is run
+  by this repository's v0.2 tests.
 - The composer does not select an external registry, cloud cluster, production
   account, or credential implicitly.

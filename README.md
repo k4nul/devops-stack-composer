@@ -21,8 +21,8 @@ The current release is `v0.2.1` and the configuration API remains
 - opt-in build-once supply-chain and real Docker/registry/kind execution profiles;
 - immutable digest propagation through rendered, applied, and running workloads;
 - closed, tamper-evident execution and release evidence with safe recovery cleanup;
-- explicit `PASSED`, `FAILED`, `SKIPPED_MISSING_OPTIONAL_TOOL`, and
-  `BLOCKED_MISSING_REQUIRED_TOOL` evidence states.
+- explicit `PASSED`, `FAILED`, `SKIPPED_MISSING_OPTIONAL_TOOL`,
+  `BLOCKED_MISSING_REQUIRED_TOOL`, and `NOT_APPLICABLE` evidence states.
 
 ## Requirements and installation
 
@@ -69,15 +69,16 @@ require `--force` to replace existing report files.
 
 An optional local image build is also side-effecting, so `generate --build-image`
 requires `--write`. Docker's local load cannot retain registry attestations; that mode
-disables Buildx SBOM/provenance attestations while the Jenkins push path retains the
-configured settings and performs its documented local Syft/Trivy checks first.
+disables Buildx SBOM/provenance attestations. The generated Jenkins path instead
+builds and pushes exactly once, resolves the registry digest, and runs Syft, Trivy,
+and deployment against that immutable subject.
 
 The written tree includes:
 
 ```text
 generated/
 ├── docker/       # Dockerfile, ignore rules, build wrapper, metadata
-├── jenkins/      # Jenkinsfile, Job DSL, per-environment intent
+├── jenkins/      # Jenkinsfile, Job DSL, digest contract, environment intent
 ├── k8s/          # base plus dev, staging, and production overlays
 └── .devops-stack-manifest.json
 ```
@@ -94,52 +95,149 @@ devops-stack validate --project examples/python-service \
   --build-image --image-tag local-smoke
 ```
 
-No command pushes an image during local validation. Registry publication remains an
-authenticated Jenkins responsibility. Composer-managed credential and Secret fields
-contain references only; user-supplied commands and annotations are trusted verbatim
-and must never contain secret values.
+Static `generate` and `validate` never push an image. With the included configuration,
+the explicit `execute` boundary pushes only to a run-owned loopback registry; an
+explicit `supply-chain` configuration may instead select an existing registry. The
+generated Jenkins pipeline owns authenticated external publication. Composer-managed
+credential and Secret fields contain references only; user-supplied commands and
+annotations are trusted verbatim and must never contain secret values.
 
-## Execution-backed validation
+## Complete v0.2 operator flow
 
-Preview the complete execution plan without creating resources, then opt in to the
-isolated local run:
+Run the following sequence from a clean checkout. Record the `runId` returned by each
+`execute` command as `SUPPLY_RUN_ID` or `KIND_RUN_ID` for the later read-only steps.
+Execution plans can be previewed first with the same arguments under
+`devops-stack execution plan` or with `execute --dry-run`.
 
-```sh
-devops-stack execution plan \
-  --project examples/python-service \
-  --environment staging \
-  --profile kind-e2e \
-  --image-tag local-e2e
+1. Install the CLI in an isolated environment.
 
-devops-stack execute \
-  --project examples/python-service \
-  --environment staging \
-  --profile kind-e2e \
-  --image-tag local-e2e \
-  --json
-```
+   ```sh
+   python3 -m venv .venv
+   . .venv/bin/activate
+   python3 -m pip install -e .
+   ```
 
-The real path builds once, pushes only to a run-owned loopback registry, resolves one
-canonical digest, deploys that digest to a run-owned kind cluster, verifies rollout,
-HTTP health/readiness, rollback, and the running Pod `imageID`, closes the evidence,
-then removes only resources whose immutable ownership was recorded for that run.
+2. Preview and write the deterministic static artifacts.
 
-Inspect or independently verify a completed run:
+   ```sh
+   devops-stack generate --project examples/python-service
+   devops-stack generate --project examples/python-service --write
+   ```
 
-```sh
-devops-stack execution show --project examples/python-service --run RUN_ID --json
-devops-stack artifact verify --project examples/python-service --run RUN_ID --json
-```
+3. Validate the written tree.
+
+   ```sh
+   devops-stack validate --project examples/python-service
+   ```
+
+4. Check every tool required by the supply-chain profile.
+
+   ```sh
+   devops-stack doctor \
+     --project examples/python-service \
+     --profile supply-chain \
+     --json
+   ```
+
+5. Run the build-once supply-chain profile.
+
+   ```sh
+   devops-stack execute \
+     --project examples/python-service \
+     --environment staging \
+     --profile supply-chain \
+     --image-tag local-supply-chain \
+     --json
+   ```
+
+6. Inspect the artifact record and canonical registry digest.
+
+   ```sh
+   devops-stack artifact inspect \
+     --project examples/python-service \
+     --run SUPPLY_RUN_ID \
+     --json
+   ```
+
+   The inspection must show a lowercase `sha256:` digest for the recorded repository;
+   the next step independently enforces the one-build and subject-linkage contracts.
+
+7. Re-evaluate the SBOM and complete Trivy JSON report against the configured
+   vulnerability policy, and verify every subject linkage.
+
+   ```sh
+   devops-stack artifact verify \
+     --project examples/python-service \
+     --run SUPPLY_RUN_ID \
+     --json
+   ```
+
+8. Run the real registry-and-kind profile.
+
+   ```sh
+   devops-stack doctor \
+     --project examples/python-service \
+     --profile kind-e2e \
+     --json
+   devops-stack execute \
+     --project examples/python-service \
+     --environment staging \
+     --profile kind-e2e \
+     --image-tag local-e2e \
+     --json
+   ```
+
+9. Inspect the automatic rollback stage and independently verify the closed run.
+   Rollback is part of `kind-e2e`; there is no separate rollback mutation command.
+
+   ```sh
+   sed -n '/## Kubernetes evidence/,/## Artifact identity/p' \
+     examples/python-service/.devops-stack/runs/KIND_RUN_ID/report.md
+   devops-stack evidence verify \
+     --project examples/python-service \
+     --run KIND_RUN_ID \
+     --json
+   ```
+
+   The report must record a successful rollback result, and the offline verifier must
+   pass the profile's required rollback stage.
+
+10. Read the run report after fresh offline verification.
+
+    ```sh
+    devops-stack report \
+      --project examples/python-service \
+      --run KIND_RUN_ID
+    ```
+
+11. After assembling release assets as documented in the release guide, verify the
+    closed asset directory independently.
+
+    ```sh
+    devops-stack release verify \
+      --project . \
+      --directory dist/release-v0.2.1 \
+      --version 0.2.1 \
+      --commit "$(git rev-parse HEAD)" \
+      --json
+    ```
+
+The real kind path builds once, pushes only to a run-owned loopback registry,
+resolves one canonical digest, deploys that digest to a run-owned kind cluster,
+verifies rollout, HTTP health/readiness, rollback, and the running Pod `imageID`,
+closes the evidence, then removes only resources whose immutable ownership was
+recorded for that run. This local workflow never selects an external registry or
+cloud cluster.
 
 See [Execution](docs/EXECUTION.md) and [Evidence](docs/EVIDENCE.md) for profiles,
-tool versions, cleanup recovery, and the same-digest proof. This local workflow never
-selects an external registry or cloud cluster.
+tool versions, cleanup recovery, and the same-digest proof.
 
 ## Documentation
 
 - [Product and operating model](docs/PRODUCT.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Configuration reference](docs/CONFIGURATION.md)
+- [Migrating from v0.1](docs/MIGRATING_FROM_V0_1.md)
 - [Template resolution and locks](docs/TEMPLATE_INTEGRATION.md)
 - [Validation evidence](docs/VALIDATION.md)
 - [Execution-backed validation](docs/EXECUTION.md)
@@ -149,6 +247,7 @@ selects an external registry or cloud cluster.
 - [Release process](docs/RELEASE.md)
 - [Examples](docs/EXAMPLES.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Roadmap](docs/ROADMAP.md)
 
 Adapter-specific behavior is documented in
 [Docker](docs/DOCKER_ADAPTER.md), [Jenkins](docs/JENKINS_ADAPTER.md), and

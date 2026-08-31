@@ -83,9 +83,9 @@ finds modified, missing, or untracked entries.
 | --- | --- |
 | Architectures | Passed through `PLATFORMS`. Local load is single-platform; push supports multiple platforms. |
 | OCI labels | Wired through official metadata inputs and emitted in generated Dockerfiles. |
-| SBOM | Boolean enablement is wired upstream for push. Local load disables Buildx attestations; Jenkins uses Syft for its local SBOM. The requested format is recorded, but is not configurable through the upstream input. |
+| SBOM | Boolean enablement is wired upstream for push. Local load disables Buildx attestations; after its single push Jenkins uses Syft against the resolved registry digest. The requested format is recorded, but is not configurable through the upstream input. |
 | Provenance | Enabled/disabled and `min`/`max` mode are wired upstream for push; local load cannot retain registry attestations. |
-| Scan | Not an upstream Docker capability; the Jenkins adapter uses Trivy before push. |
+| Scan | Not an upstream Docker capability; after its single push the Jenkins adapter uses Trivy against the resolved registry digest. |
 | Cache | Unsupported by the locked template. Any enablement or from/to entry is a `FAILED` capability check. |
 | Reproducibility | Requested intent and deterministic metadata are recorded; bit-for-bit image identity is not claimed. |
 

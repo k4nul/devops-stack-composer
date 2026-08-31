@@ -20,7 +20,7 @@ is not a sandbox for untrusted application source or unreviewed template commits
 | Project filesystem | Resolved project root, symlink rejection, containment recheck, atomic writes, closed evidence inventories. |
 | Child processes | Executable allowlist, argument arrays, project-contained working directories, environment allowlist, timeout/deadline, cancellation, process-group termination, bounded output, redaction. |
 | Template input | Full Git commit pins, interface markers, isolated staging, archive traversal/link rejection, executable validation seams. |
-| Registry | Loopback binding, random name and port, immutable container ID, run labels, readiness deadline, exact ownership before reuse or deletion. |
+| Owned local registry | Loopback binding, random name and port, immutable container ID, run labels, readiness deadline, exact ownership before reuse or deletion. |
 | kind cluster | Random run-bound name, pinned node image digest, private kubeconfig, exact node IDs/roles, no default-context mutation, ownership check before cleanup. |
 | Artifact identity | One build invocation, registry-resolved digest, digest-only workload references, rendered/applied/runtime comparison. |
 | Evidence | Strict schemas, stable JSON, byte/file bounds, redaction, closed SHA-256 inventory, cross-file subject linkage, explicit incomplete/failure state. |

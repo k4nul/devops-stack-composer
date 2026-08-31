@@ -9,8 +9,9 @@ The canonical root contains, among other bounded material files:
 
 | File | Purpose |
 | --- | --- |
-| `run.json` | Final profile, stage outcomes, failure stage, source identity, and artifact digest. |
-| `plan.json` / `policy.json` | Immutable intended stages and required profile gates. |
+| `execution-plan.json` / `plan.json` | Operator-facing and compatibility copies of the immutable intended stages. |
+| `policy.json` | Required stages and capabilities for the selected profile. |
+| `execution-evidence.json` / `report.json` / `run.json` | Canonical, operator-facing, and compatibility copies of the final profile, stage outcomes, failure stage, source identity, and artifact digest. |
 | `state.json` | Ordered durable state transitions. |
 | `artifact.json` / `artifacts.json` | Build-once count, canonical digest, immutable image reference, and service mapping. |
 | `commands.json` | Redacted, bounded process summaries. |
@@ -21,12 +22,17 @@ The canonical root contains, among other bounded material files:
 | `resources.json` | Exact registry and kind ownership plus cleanup status. |
 | `verification.json` | Independent bundle-verifier result. |
 | `SHA256SUMS` / `checksums.json` | Closed inventory and content digests. |
-| `summary.md` | Human-readable result generated from the same run data. |
+| `report.md` / `summary.md` | Operator-facing report and compatibility summary, each regenerated from the verified records. |
 
 Kubernetes manifests and observations are under `kubernetes/`; bounded tool output is
 under `logs/`. All stored paths are relative to the run root. Symlinks, special files,
 path traversal, unknown files, missing files, duplicate names, and checksum changes
 fail verification.
+
+The operator-facing aliases are required, checksummed material rather than optional
+convenience files. Verification requires the JSON aliases and their compatibility
+records to describe the same plan or run; both Markdown views must match the verified
+outcome.
 
 ## Same-digest proof
 

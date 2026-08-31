@@ -22,6 +22,9 @@ policies: {}
 
 Every top-level field shown above is required. For a complete working document, use
 [`examples/python-service/devops-stack.yaml`](../examples/python-service/devops-stack.yaml).
+Version 0.2 also accepts the optional, complete blocks `execution`, `registry`,
+`kubernetes`, and `validation`. Omitting all four preserves the v0.1 static workflow;
+see [Migrating from v0.1](MIGRATING_FROM_V0_1.md).
 
 ## Metadata and application
 
@@ -152,13 +155,97 @@ and keys to exist. It does not generate Secret resources. A key cannot be duplic
 across references or also appear in the plain environment mapping for the same
 environment.
 
+## v0.2 profiles and runtime blocks
+
+Profiles are strict and cumulative: `static`, `supply-chain`, `kind-e2e`, and
+`release`. `validation.profile` selects the configured policy. When `execution` is
+omitted, it also supplies the default execution profile. When both blocks are
+present, their profiles must match; `execution.profile: local-kind` is accepted only
+as an alias for `kind-e2e`. A CLI `--profile` can select another profile for one plan,
+doctor, or execution without changing the file.
+
+The current example uses the complete opt-in shape:
+
+```yaml
+validation:
+  profile: kind-e2e
+execution:
+  profile: kind-e2e
+  workDirectory: .devops-stack/runs
+  cleanup: always
+  retainFailureEvidence: true
+registry:
+  mode: ephemeral-local
+  host: auto
+  repository: k4nul/devops-stack-composer-example
+  insecureLocalhostOnly: true
+kubernetes:
+  e2e:
+    provider: kind
+    environment: staging
+    serverSideDryRunEnvironments: [dev, staging, production]
+    rolloutTimeoutSeconds: 180
+    healthPath: /health
+    readinessPath: /ready
+    rollbackTest: true
+    cleanup: always
+```
+
+Each block is all-or-nothing when present:
+
+| Block | Contract |
+| --- | --- |
+| `execution` | `workDirectory` is project-relative. Only `cleanup: always` and `retainFailureEvidence: true` are accepted. |
+| `registry` | `ephemeral-local` requires `host: auto` and `insecureLocalhostOnly: true`; `existing` requires a concrete host. `repository` must equal `image.repository` for execution. |
+| `kubernetes.e2e` | Provider is `kind`; environment is `dev`, `staging`, or `production`; server-side dry-run must cover all three; timeout is at least five seconds; probe paths begin with `/`; rollback and cleanup are mandatory. |
+| `validation` | Contains only the canonical profile. |
+
+`kind-e2e` and `release` require `registry.mode: ephemeral-local`; they never select
+an existing or cloud registry. The `production` environment remains a local kind
+validation target and additionally requires the operator's
+`--approve-production`; it is not authorization for a production cluster.
+
 ## Supply chain and security
 
-`supplyChain.sbom` selects `spdx-json` or `cyclonedx-json`; the locked Docker template
-can enable SBOM generation but cannot configure that format itself. Jenkins uses the
-selected format with Syft for its local pre-push SBOM. Provenance can be enabled in
-`min` or `max` mode. Image scanning can fail at `critical`, `high`, or `medium`, or use
-`never` to report findings without failing Trivy.
+The v0.2 supply-chain policy is explicit and digest-oriented:
+
+```yaml
+supplyChain:
+  sbom:
+    required: true
+    format: spdx-json
+  provenance:
+    required: true
+    mode: max
+  vulnerability:
+    required: true
+    severities: [CRITICAL, HIGH]
+    ignoreUnfixed: true
+    maximumAllowed: 0
+    allowlist: []
+  verification:
+    requireSingleDigest: true
+    requireDigestPinnedDeployment: true
+```
+
+`sbom.format` is `spdx-json` or `cyclonedx-json`. Jenkins and local execution run Syft
+against the resolved registry digest. Provenance mode is `min` or `max`; the generated
+Jenkins provenance is still explicitly unsigned, unattached file evidence. The
+composer evaluates the complete Trivy JSON report: only configured severities count,
+`ignoreUnfixed` excludes findings without a fix, and `maximumAllowed` is the maximum
+remaining count.
+
+An allowlist entry requires `id`, `package`, `reason`, `owner`, and ISO date
+`expiresAt`. It matches that vulnerability/package pair only, and an expired entry
+fails policy rather than silently extending the exception.
+
+The v0.1 fields remain accepted for compatibility: `sbom.enabled`,
+`provenance.enabled`, and `scan.enabled` with `scan.failOn` set to `critical`, `high`,
+`medium`, or `never`. Normalization maps `enabled` to `required`; omitted
+`verification` flags default to false. Use the v0.2 shape for explicit thresholds,
+exceptions, and digest requirements. The locked Docker template can enable upstream
+SBOM/provenance attestations on push but cannot select the requested SBOM format;
+Syft supplies that file-format contract.
 
 `security` controls non-root execution, positive runtime UID, read-only root
 filesystem, privilege escalation, `RuntimeDefault` seccomp, and the ServiceAccount

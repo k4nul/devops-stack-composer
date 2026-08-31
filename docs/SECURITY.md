@@ -54,8 +54,11 @@ but adapter compatibility and security review remain human/test gates.
 
 ## Local execution resources
 
-`execute` never selects an external registry or cluster. It creates a random-named
-registry bound to `127.0.0.1` and a random-named kind cluster using pinned images.
+`kind-e2e` and `release` never select an external registry or cluster. They create a
+random-named registry bound to `127.0.0.1` and a random-named kind cluster using
+pinned images. `supply-chain` may use an explicitly configured existing registry;
+authentication is delegated to the operator's Docker credential helper and is never
+inferred from configuration.
 Ownership records include immutable Docker container IDs, run ID labels, node names,
 roles, and image identity. Reuse and cleanup require the entire record to match;
 prefixes and names alone are not deletion authority.

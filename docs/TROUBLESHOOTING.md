@@ -101,13 +101,14 @@ architecture. It also refuses to run when cache capability or existing-Dockerfil
 validation failed. Check Docker and Buildx with `doctor`, then use a value such as
 `local-smoke`.
 
-## Multi-platform supply-chain check failed
+## Multi-platform execution profile is rejected
 
-The generated Jenkins pipeline runs Syft/Trivy before publication, which needs a
-locally loaded image. Docker cannot load a multi-platform manifest as one local image.
-For the current adapter, choose one architecture when SBOM or scan is enabled, or
-disable those local checks after a deliberate policy review. Final multi-platform
-push remains available when local pre-push checks are not requested.
+Static generation and the generated Jenkins build/push path can express multiple
+platforms. The v0.2 local `supply-chain`, `kind-e2e`, and `release` executor profiles
+accept exactly one configured platform, because their run evidence relates one build
+subject to one local deployment. Configure one architecture, such as `linux/amd64`,
+for the local execution run. Do not disable SBOM, vulnerability, or digest policy to
+work around this limit; multi-platform local execution is a later-version candidate.
 
 ## Existing Dockerfile runtime is unverified
 

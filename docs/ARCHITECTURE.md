@@ -85,7 +85,8 @@ deployment values are deep-merged with each environment override in the fixed or
 `dev`, `staging`, `production`. The model supplies all adapters with the same image,
 port, probe, security, environment, and routing facts. Dynamic tag strategies are
 represented during generation by `__IMAGE_TAG__` plus a Jenkins-time expression;
-Jenkins must resolve a concrete tag before any load, push, or deployment.
+Jenkins resolves a concrete tag as build intent before its single push, then resolves
+the registry digest before supply-chain evidence or deployment.
 
 Each adapter returns an immutable `AdapterResult` containing its name and version,
 the resolved template commit, generated artifacts, a canonical contract, and typed
@@ -121,9 +122,10 @@ versions, on-disk bytes and modes, and freshly rendered content with the manifes
 The generated Jenkins pipeline owns delivery sequencing, not Jenkins controller
 configuration. JCasC, plugins, agents, authorization, seed-job wiring, and credential
 values remain external. During deployment the pipeline copies a Kubernetes overlay
-to a temporary directory, replaces the placeholder image with its concrete immutable
-tag, renders it with Kustomize, applies it, waits for rollout, and only attempts
-rollback when apply actually started a Deployment rollout.
+to a temporary directory, replaces the placeholder image with its immutable
+`repository@sha256:...` reference, renders it with Kustomize, applies it, waits for
+rollout, and only attempts rollback when apply actually started a Deployment
+rollout.
 
 ## Execution-time boundary
 

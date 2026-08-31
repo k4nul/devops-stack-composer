@@ -57,10 +57,11 @@ devops-stack report --project examples/python-service
 ```
 
 The supplied config deliberately keeps Docker cache disabled because the locked
-template has no cache input. It selects one `linux/amd64` architecture so enabled
-Syft/Trivy pre-push checks have a valid local-image route in the generated Jenkins
-pipeline. Staging and production refer to an external `python-service-secrets` Secret
-key named `API_TOKEN`; no value or Secret resource is generated.
+template has no cache input. It selects one `linux/amd64` architecture because the
+v0.2 local executor accepts exactly one platform. The generated Jenkins pipeline may
+publish multiple platforms and binds Syft and Trivy to the resolved registry digest.
+Only production refers to an external `python-service-secrets` Secret key named
+`API_TOKEN`; no value or Secret resource is generated.
 
 After a successful write, inspect:
 

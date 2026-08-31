@@ -46,8 +46,9 @@ The current adapters generate:
 - a Dockerfile or isolated copy of an existing Dockerfile, a Dockerfile-specific
   ignore file, the official template's 15-key environment contract, a build wrapper,
   and capability metadata;
-- a Declarative Jenkinsfile, multibranch Job DSL, an ownership-boundary README, and
-  one pipeline environment record for each of `dev`, `staging`, and `production`;
+- a Declarative Jenkinsfile, multibranch Job DSL, an ownership-boundary README, a
+  static build-once/digest artifact contract, and one pipeline environment record for
+  each of `dev`, `staging`, and `production`;
 - a Kustomize base, three environment overlays, Namespace resources, and a sanitized
   platform-integration context record;
 - `generated/.devops-stack-manifest.json`, containing hashes, modes, provenance,
@@ -65,11 +66,14 @@ template commits, strict schema and semantic validation, safe project-contained
 writes, and explicit status reporting. `PASSED` is never substituted for an
 unavailable validator: optional gaps are `SKIPPED_MISSING_OPTIONAL_TOOL`, while
 missing required tooling is `BLOCKED_MISSING_REQUIRED_TOOL` and fails the run.
+`NOT_APPLICABLE` records a stage that did not run and cannot satisfy a required
+execution gate.
 
 The composer is not a Jenkins controller, a production Kubernetes cluster manager,
-an external registry, or a secrets manager. Its v0.2 executor manages only a
-short-lived loopback registry and an ownership-sealed local kind cluster. It does not
-create credentials or Kubernetes Secret values.
+or a secrets manager. Its v0.2 kind and release paths manage only a short-lived
+loopback registry and an ownership-sealed local kind cluster. The supply-chain path
+can use an explicitly configured existing registry, but never selects one or supplies
+credentials implicitly. It does not create credentials or Kubernetes Secret values.
 It does not claim Docker cache wiring because the locked Docker template has no
 official cache input. Standalone Groovy parsing, when installed, is not equivalent to
 controller-backed Jenkins plugin validation.

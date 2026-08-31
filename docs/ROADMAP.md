@@ -4,34 +4,44 @@ DevOps Stack Composer `0.2.1` is an alpha integration with a deliberately small 
 contract: one schema version, three pinned adapters, three environments, Kustomize
 output, Jenkins-owned delivery, and an explicit local execution/evidence path.
 
-## Near-term priorities
+## v0.3 candidates
 
-1. Add a reproducible controller-backed Jenkins Declarative and Job DSL validation
-   fixture so plugin semantics can move from an explicit skip to executable evidence.
-2. Configure and verify PyPI trusted publishing after the owner establishes the
-   external publisher/environment; keep GitHub Release evidence independent.
-3. Coordinate an official cache interface in `docker-build-template`, then add cache
-   projection only after upstream validation and end-to-end tests exist.
-4. Design a pre-publication multi-architecture SBOM and scan path that validates each
-   platform without weakening the current no-push-before-scan ordering.
-5. Add signed template provenance or an allowlisted verification policy on top of full
-   commit pins, marker checks, and license checks.
-6. Expand release and installation validation across supported Python versions and
-   add a second production-shaped example with a distinct runtime/build layout.
+These are candidates, not commitments, and none changes the v0.2 contract:
 
-## Candidate improvements
+1. Jenkins Test Harness validation.
+2. A documented Jenkins controller/plugin compatibility matrix.
+3. Execution of the generated Jenkins pipeline on a real controller.
+4. Full Jenkins-to-registry-to-kind end-to-end validation.
+5. Runtime validation of generated Job DSL.
+6. Runtime validation of Jenkins credential binding and redaction.
+7. Actual Jenkins execution of production approval and deployment rollback paths.
+8. Multi-service composition and evidence.
+9. First-class monorepo discovery, selection, and ownership.
+10. Explicit cloud-registry integration with credential and cleanup boundaries.
 
-- configurable report destinations and a stable report schema compatibility policy;
-- richer diff mapping for existing project-native Kubernetes and pipeline layouts;
-- optional live cluster dry-run and admission-policy checks with explicit credentials
-  and no default cluster mutation;
-- registry-backed verification of generated SBOM and provenance attestations;
-- adapter compatibility metadata for reviewed template commit ranges;
-- a structured inspection-confidence override workflow for monorepos;
-- environment sets beyond the fixed `dev`, `staging`, and `production` contract in a
-  future API version;
-- upstream-supported Helm composition if it can preserve the same artifact and
-  contract evidence as Kustomize.
+## Upstream Docker template candidates
+
+Cache support remains blocked until `docker-build-template` provides all of:
+
+- an official `cache-from`/`cache-to` input contract;
+- versioned cache capability metadata;
+- validation of cache sources and destinations; and
+- cache provenance that can be related to the build result.
+
+Composer support would follow only after those upstream interfaces and their
+end-to-end evidence exist. No cache flags are inferred in v0.2.
+
+## Other later candidates
+
+- configure and verify PyPI trusted publishing after the owner establishes the
+  external publisher and environment;
+- add signed template provenance or an allowlisted verification policy on top of
+  full commit pins, marker checks, and license checks;
+- expand release and installation validation across supported Python versions;
+- support environment sets beyond `dev`, `staging`, and `production` only in a future
+  API version; and
+- consider upstream-supported Helm composition only if it preserves the current
+  artifact and evidence contracts.
 
 ## Non-goals without a design change
 

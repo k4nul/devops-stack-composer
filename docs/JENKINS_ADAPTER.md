@@ -10,6 +10,7 @@ Jenkins controller configuration and credential values outside the repository.
 | `jenkins/Jenkinsfile` | Declarative build, test, supply-chain, publication, and deployment workflow. |
 | `jenkins/job-dsl.groovy` | SCM-backed multibranch job definition. |
 | `jenkins/README.md` | Generated ownership boundary and branch routing. |
+| `jenkins/artifact-contract.json` | Static build-once, digest, evidence, and deployment contract. |
 | `jenkins/environments/{dev,staging,production}.json` | Resolved routing, image expression, namespace, replicas, overlay, and approval facts. |
 
 The Job DSL expects seed bindings `SCM_REPOSITORY_URL`, optional
@@ -30,11 +31,13 @@ The generated stages are ordered as follows:
 3. run the application build command;
 4. run the application test command;
 5. validate the container build plan without pushing;
-6. optionally load a single-platform image for local SBOM or scan work;
-7. run the supply-chain stage;
-8. authenticate and publish the image;
-9. deploy the branch-routed environment, with the production approval stage before
-   production when configured.
+6. authenticate, build, and push through the official wrapper exactly once;
+7. resolve the tag manifest bytes to a canonical digest, re-resolve that digest, and
+   reject a tag that moved during resolution;
+8. generate SBOM, vulnerability, provenance, and artifact-verification evidence for
+   the immutable digest;
+9. deploy that digest to the branch-routed environment, with the production approval
+   stage before production when configured.
 
 Branch conditions use the GLOB patterns declared for each environment. A semantic
 validator rejects one pattern mapped to multiple environments.
@@ -42,26 +45,26 @@ validator rejects one pattern mapped to multiple environments.
 For `branch-sha`, the pipeline sanitizes and bounds the branch slug and appends the
 12-character Git SHA. `git-sha` uses that SHA, `semver` requires a non-empty
 `VERSION` parameter, and `fixed` uses the declared value. Every strategy is checked
-against Docker tag syntax before load, push, or deployment.
+against Docker tag syntax before the one build/push begins.
 
 ## Supply chain and publication
 
-When enabled, the pipeline uses Syft to write
-`out/supply-chain/sbom.json` and archives it, then uses Trivy at the configured
-severity threshold. These checks occur before registry publication. `failOn: never`
-runs Trivy with exit code zero while retaining all severities.
+The pipeline invokes `generated/docker/build.sh --push` exactly once. It then reads
+the tag's raw registry manifest, hashes those bytes, verifies the resulting digest
+reference, and rechecks the tag before defining
+`IMAGE_REF=IMAGE_REPOSITORY@sha256:<digest>`. Downstream stages cannot invoke another
+build or reinterpret the mutable tag.
 
-The locked Docker template's load and push modes are separate Buildx executions.
-Consequently, this release proves the local pre-push build was scanned but does not
-claim that its digest is identical to the bytes rebuilt by the official push wrapper.
-Digest-bound promotion or post-push digest verification is a documented next step.
+When enabled, Syft writes `out/supply-chain/sbom.json` from `IMAGE_REF`, and Trivy
+writes the complete JSON vulnerability report from that same digest. The v0.2
+artifact verifier applies configured severities, unfixed handling, maximum count,
+and unexpired allowlist entries to the complete report. The legacy `scan.failOn`
+shape remains supported. Multi-platform publication is allowed on this Jenkins
+digest path because no local Docker load is required.
 
-Local SBOM or scan commands need a loadable image and therefore exactly one selected
-architecture. Requesting either with multiple architectures is a `FAILED` capability
-check and blocks final publication. Provenance is delegated to the Docker build
-wrapper and official template's push path. The preceding local `--load` disables
-Buildx SBOM/provenance attestations because Docker cannot attach them to a locally
-loaded image; Syft and Trivy still inspect that local image before publication.
+The official push retains configured upstream SBOM/provenance settings. Jenkins also
+writes a digest-subject provenance file, but that file truthfully records itself as
+unsigned, unattached, and not cryptographically verified.
 
 Registry publication wraps `docker login --password-stdin` in Jenkins
 `withCredentials`. Only the configured credential ID is generated. A temporary
@@ -70,9 +73,10 @@ Registry publication wraps `docker login --password-stdin` in Jenkins
 ## Deployment and rollback
 
 For the routed environment, Jenkins copies its Kustomize overlay to a temporary
-directory, sets the concrete image with `kustomize edit set image`, renders it, checks
-that no `__IMAGE_TAG__` remains, and applies the result with `kubectl`. It then waits
-up to five minutes for Deployment rollout status.
+directory, sets the immutable `repository@sha256:...` image with
+`kustomize edit set image`, renders it, checks that no `__IMAGE_TAG__` or mutable tag
+remains, and applies the result with `kubectl`. It then waits up to five minutes for
+Deployment rollout status.
 
 On failure, rollback is attempted only when `kubectl apply` reported that the target
 Deployment was created or configured. This avoids undoing an earlier healthy revision

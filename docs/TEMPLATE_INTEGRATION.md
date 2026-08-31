@@ -54,8 +54,9 @@ application context plus generated Docker assets for
 metadata, SBOM enablement, and provenance mode use official inputs.
 
 The upstream template has no official cache from/to seam and no scan command. Cache
-requests therefore fail instead of being silently ignored, and local image scanning
-is owned by the generated Jenkins pipeline.
+requests therefore fail instead of being silently ignored. The generated Jenkins
+pipeline owns Trivy scanning after its single push and binds the report to the
+resolved registry digest.
 
 ### Jenkins pipeline template
 

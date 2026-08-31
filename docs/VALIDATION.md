@@ -14,10 +14,13 @@ Every check has exactly one status:
 | `FAILED` | The check executed, or could be evaluated internally, and found an error. | Fails the report. |
 | `SKIPPED_MISSING_OPTIONAL_TOOL` | An optional executable was unavailable, or an optional downstream check had no renderer. | Does not by itself fail the report. |
 | `BLOCKED_MISSING_REQUIRED_TOOL` | Required evidence could not be produced because its tool was unavailable. | Fails the report. |
+| `NOT_APPLICABLE` | The named check or stage did not apply or could not run after an earlier terminal result; retained-resource cleanup also uses this status. It is never proof that the action ran. | Does not by itself fail a general validation report, but any required execution stage must be `PASSED`. |
 
 Overall `passed` is true only when no check is `FAILED` or
 `BLOCKED_MISSING_REQUIRED_TOOL`. Skips remain visible in human output, JSON, the
-manifest summary, and reports; they are never upgraded to passes.
+manifest summary, and reports; they are never upgraded to passes. Execution-profile
+policy is stricter: every required stage must be `PASSED`, so
+`NOT_APPLICABLE` cannot satisfy a required gate or hide the first failure.
 
 ## Cumulative execution profiles
 
