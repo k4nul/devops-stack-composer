@@ -104,12 +104,14 @@ draft-distribution installation check, therefore finish before the draft becomes
 public. The final job independently repeats the distribution check over the bytes
 that are actually public; it is not a substitute for a pre-publication check.
 
-The workflow uses minimal permissions per job. The draft-staging and publication jobs
-receive `contents: write`; only draft staging receives `attestations: write` and an
-OIDC token. `GH_TOKEN` is never job-wide: it is mapped only onto individual trusted
-steps that invoke GitHub CLI operations, while checkout disables persisted
-credentials and distribution installation receives no GitHub token. Every third-party
-or GitHub action is pinned to an immutable commit SHA, and the workflow installs a
+The workflow uses minimal permissions per job. Draft staging, cumulative draft
+validation, draft distribution verification, and publication receive
+`contents: write` because GitHub exposes draft releases only to identities with
+push-equivalent access. Only draft staging receives `attestations: write` and an OIDC
+token. `GH_TOKEN` is never job-wide: it is mapped only onto individual trusted steps
+that invoke GitHub CLI operations, while checkout disables persisted credentials and
+distribution installation receives no GitHub token. Every third-party or GitHub
+action is pinned to an immutable commit SHA, and the workflow installs a
 checksum-pinned GitHub CLI.
 
 ## Published asset set
@@ -150,6 +152,11 @@ long-lived PyPI token.
 Do not move or overwrite a published tag, replace assets under the same version, use
 force-push, or mark a failed workflow successful manually. Fix a release defect on
 `main`, increment the version, and create a new release.
+
+A workflow-code or permission defect in a tagged run is not repaired by rerunning it:
+GitHub keeps the original ref, commit, workflow, and job permissions. Preserve its
+tag and unpublished draft for audit, fix `main`, and advance to a new version rather
+than publishing the failed draft manually.
 
 If draft creation or upload is interrupted, rerun the failed jobs without changing the
 tag or source. The staging job downloads every existing draft asset, requires the

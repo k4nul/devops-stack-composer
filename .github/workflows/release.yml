@@ -607,7 +607,8 @@ jobs:
     permissions:
       actions: read
       attestations: read
-      contents: read
+      # GitHub exposes draft releases only to tokens with push-equivalent access.
+      contents: write
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       RELEASE_VERSION: ${{ needs.build-release.outputs.version }}
@@ -804,7 +805,8 @@ jobs:
     permissions:
       actions: read
       attestations: read
-      contents: read
+      # GitHub exposes draft releases only to tokens with push-equivalent access.
+      contents: write
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       RELEASE_VERSION: ${{ needs.build-release.outputs.version }}

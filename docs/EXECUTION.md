@@ -148,12 +148,13 @@ permission to guess.
 
 ## Release profile
 
-`release` is intentionally post-publication. It needs a locally assembled asset set
-and a GitHub release at the same `vVERSION` tag. It repeats the real Docker/kind run,
-downloads every published asset into a private temporary directory, checks exact
-bytes, verifies each GitHub artifact attestation against this repository's release
-workflow and tag commit, then proves that the checkout is clean and tagged at the
-same source commit.
+`release` is a GitHub-release gate. It needs a locally assembled asset set and an
+unpublished draft or public GitHub release at the same `vVERSION` tag. It repeats the
+real Docker/kind run, downloads every release asset into a private temporary
+directory, checks exact bytes, verifies each GitHub artifact attestation against this
+repository's release workflow and tag commit, then proves that the checkout is clean
+and tagged at the same source commit. The tag-driven workflow runs this profile while
+the release is still a draft.
 
 ```sh
 GH_TOKEN="$(gh auth token)" devops-stack execute \
