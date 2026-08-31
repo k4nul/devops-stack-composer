@@ -9,9 +9,9 @@ The canonical root contains, among other bounded material files:
 
 | File | Purpose |
 | --- | --- |
-| `execution-plan.json` / `plan.json` | Operator-facing and compatibility copies of the immutable intended stages. |
+| `execution-plan.json` | Operator-facing copy of the immutable intended stages. Canonical bundles also contain the matching `plan.json` compatibility record. |
 | `policy.json` | Required stages and capabilities for the selected profile. |
-| `execution-evidence.json` / `report.json` / `run.json` | Canonical, operator-facing, and compatibility copies of the final profile, stage outcomes, failure stage, source identity, and artifact digest. |
+| `report.json` | Operator-facing final profile, stage outcomes, failure stage, source identity, and artifact digest. Canonical bundles also contain the matching `run.json` compatibility record; lightweight profiles use `execution-evidence.json` instead. |
 | `state.json` | Ordered durable state transitions. |
 | `artifact.json` / `artifacts.json` | Build-once count, canonical digest, immutable image reference, and service mapping. |
 | `commands.json` | Redacted, bounded process summaries. |
@@ -22,17 +22,20 @@ The canonical root contains, among other bounded material files:
 | `resources.json` | Exact registry and kind ownership plus cleanup status. |
 | `verification.json` | Independent bundle-verifier result. |
 | `SHA256SUMS` / `checksums.json` | Closed inventory and content digests. |
-| `report.md` / `summary.md` | Operator-facing report and compatibility summary, each regenerated from the verified records. |
+| `report.md` | Operator-facing report regenerated from verified records. Canonical bundles also contain the matching `summary.md` compatibility view. |
 
 Kubernetes manifests and observations are under `kubernetes/`; bounded tool output is
 under `logs/`. All stored paths are relative to the run root. Symlinks, special files,
 path traversal, unknown files, missing files, duplicate names, and checksum changes
 fail verification.
 
-The operator-facing aliases are required, checksummed material rather than optional
-convenience files. Verification requires the JSON aliases and their compatibility
-records to describe the same plan or run; both Markdown views must match the verified
-outcome.
+The `kind-e2e` and `release` profiles produce canonical closed bundles. They require
+matching `execution-plan.json` / `plan.json` and `report.json` / `run.json` records,
+plus both Markdown views. The lighter `static` and `supply-chain` profiles instead
+write `execution-plan.json`, matching `execution-evidence.json` / `report.json`
+records, and `report.md`. Every file for the selected layout is required checksummed
+material rather than an optional convenience file, and closed-bundle verification
+rejects files from the other layout as undeclared.
 
 New execution records use evidence schema `1.1.0`. That version requires the source
 repository, exact Docker/Jenkins/Kubernetes template commits, profile tool versions,
