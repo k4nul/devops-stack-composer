@@ -214,13 +214,22 @@ _JENKINS_STAGE_LINE = re.compile(
 _JENKINS_SHELL_LITERAL = re.compile(
     r"(?m)^[ \t]*sh[ \t]+('(?:\\.|[^'\\])*')[ \t]*$"
 )
+_GENERATED_NODE_IMAGE = (
+    "node:22-alpine@sha256:"
+    "c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32"
+)
+_GENERATED_PYTHON_IMAGE = (
+    "python:3.12-slim@sha256:"
+    "09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217"
+)
+
 _GENERATED_IMAGE_PAIRS = {
-    "nodejs": ("node:22-alpine", "node:22-alpine"),
-    "python": ("python:3.12-slim", "python:3.12-slim"),
+    "nodejs": (_GENERATED_NODE_IMAGE, _GENERATED_NODE_IMAGE),
+    "python": (_GENERATED_PYTHON_IMAGE, _GENERATED_PYTHON_IMAGE),
     "java": ("eclipse-temurin:21-jdk-jammy", "eclipse-temurin:21-jre-jammy"),
     "go": ("golang:1.23-alpine", "alpine:3.20"),
     "rust": ("rust:1.83-alpine", "alpine:3.20"),
-    "static": ("node:22-alpine", "python:3.12-slim"),
+    "static": (_GENERATED_NODE_IMAGE, _GENERATED_PYTHON_IMAGE),
 }
 
 

@@ -31,6 +31,14 @@ VALIDATION_COMMITS = {
     "jenkins": "e" * 40,
     "kubernetes": "c" * 40,
 }
+NODE_IMAGE = (
+    "node:22-alpine@sha256:"
+    "c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32"
+)
+PYTHON_IMAGE = (
+    "python:3.12-slim@sha256:"
+    "09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217"
+)
 
 
 def artifacts_for(adapter: str, model) -> tuple[GeneratedArtifact, ...]:
@@ -105,15 +113,15 @@ def artifacts_for(adapter: str, model) -> tuple[GeneratedArtifact, ...]:
             },
         }
         image_pairs = {
-            "nodejs": ("node:22-alpine", "node:22-alpine"),
-            "python": ("python:3.12-slim", "python:3.12-slim"),
+            "nodejs": (NODE_IMAGE, NODE_IMAGE),
+            "python": (PYTHON_IMAGE, PYTHON_IMAGE),
             "java": (
                 "eclipse-temurin:21-jdk-jammy",
                 "eclipse-temurin:21-jre-jammy",
             ),
             "go": ("golang:1.23-alpine", "alpine:3.20"),
             "rust": ("rust:1.83-alpine", "alpine:3.20"),
-            "static": ("node:22-alpine", "python:3.12-slim"),
+            "static": (NODE_IMAGE, PYTHON_IMAGE),
         }
         builder_image, runtime_image = image_pairs[model.application_type]
         dockerfile_lines = []
@@ -646,6 +654,22 @@ class CrossProjectValidationTests(unittest.TestCase):
         self.assertTrue(report.passed)
         self.assertTrue(all(check.status == ValidationStatus.PASSED for check in report.checks))
 
+    def test_digest_pinned_defaults_pass_generated_dockerfile_validation(self) -> None:
+        for application_type in ("nodejs", "python", "static"):
+            with self.subTest(application_type=application_type):
+                raw = copy.deepcopy(self.raw)
+                raw["application"]["type"] = application_type
+                model = normalize_config(raw)
+
+                report = validate_cross_project_contract(model, matching_results(model))
+
+                check = next(
+                    item
+                    for item in report.checks
+                    if item.check == "contract.docker.artifacts"
+                )
+                self.assertEqual(check.status, ValidationStatus.PASSED)
+
     def test_image_mismatch_fails_with_exact_path(self) -> None:
         wrong = copy.deepcopy(self.model.contract())
         wrong["imageRepository"] = "someone/other-image"
@@ -1109,7 +1133,7 @@ class CrossProjectValidationTests(unittest.TestCase):
             GeneratedArtifact(
                 artifact.path,
                 artifact.content.replace(
-                    "ARG BUILDER_IMAGE=python:3.12-slim",
+                    f"ARG BUILDER_IMAGE={PYTHON_IMAGE}",
                     "ARG BUILDER_IMAGE=attacker.invalid/pwn:latest",
                 ),
                 artifact.mode,

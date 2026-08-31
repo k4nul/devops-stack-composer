@@ -113,13 +113,22 @@ _DOCKER_ENV_ALLOWLIST = (
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+_NODE_IMAGE = (
+    "node:22-alpine@sha256:"
+    "c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32"
+)
+_PYTHON_IMAGE = (
+    "python:3.12-slim@sha256:"
+    "09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217"
+)
+
 _IMAGE_PAIRS = {
-    "nodejs": ("node:22-alpine", "node:22-alpine"),
-    "python": ("python:3.12-slim", "python:3.12-slim"),
+    "nodejs": (_NODE_IMAGE, _NODE_IMAGE),
+    "python": (_PYTHON_IMAGE, _PYTHON_IMAGE),
     "java": ("eclipse-temurin:21-jdk-jammy", "eclipse-temurin:21-jre-jammy"),
     "go": ("golang:1.23-alpine", "alpine:3.20"),
     "rust": ("rust:1.83-alpine", "alpine:3.20"),
-    "static": ("node:22-alpine", "python:3.12-slim"),
+    "static": (_NODE_IMAGE, _PYTHON_IMAGE),
 }
 
 _SAFE_IMAGE_TAG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")

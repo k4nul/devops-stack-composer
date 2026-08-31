@@ -29,6 +29,14 @@ from devops_stack_composer.sources import SourceResolution
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_FIXTURE = ROOT / "tests" / "fixtures" / "configs" / "valid.yaml"
 SOURCE_FIXTURE = ROOT / "tests" / "fixtures" / "templates" / "docker"
+NODE_IMAGE = (
+    "node:22-alpine@sha256:"
+    "c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32"
+)
+PYTHON_IMAGE = (
+    "python:3.12-slim@sha256:"
+    "09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217"
+)
 
 
 def source_resolution(
@@ -205,9 +213,9 @@ class DockerBuildAdapterTests(unittest.TestCase):
 
     def test_generated_dockerfiles_cover_every_declared_application_type(self) -> None:
         cases = {
-            "nodejs": ("node:22-alpine", "npm run build", "node server.js", "dist"),
+            "nodejs": (NODE_IMAGE, "npm run build", "node server.js", "dist"),
             "python": (
-                "python:3.12-slim",
+                PYTHON_IMAGE,
                 "python -m compileall app",
                 "python app/server.py",
                 "app",
@@ -225,7 +233,7 @@ class DockerBuildAdapterTests(unittest.TestCase):
                 "./target/release/app",
                 "target/release/app",
             ),
-            "static": ("node:22-alpine", "npm run build", "python -m http.server 8080", "dist"),
+            "static": (NODE_IMAGE, "npm run build", "python -m http.server 8080", "dist"),
         }
 
         for application_type, (builder, build_command, run_command, artifact) in cases.items():
@@ -264,6 +272,26 @@ class DockerBuildAdapterTests(unittest.TestCase):
         self.assertIn("COPY --from=build /usr/local /usr/local", python_dockerfile)
         self.assertIn("COPY --from=build --chown=10001:10001 /workspace /app", python_dockerfile)
 
+    def test_default_node_and_python_images_are_manifest_digest_pinned(self) -> None:
+        expected = {
+            "nodejs": (NODE_IMAGE, NODE_IMAGE),
+            "python": (PYTHON_IMAGE, PYTHON_IMAGE),
+            "static": (NODE_IMAGE, PYTHON_IMAGE),
+        }
+
+        for application_type, (builder_image, runtime_image) in expected.items():
+            with self.subTest(application_type=application_type):
+                raw = copy.deepcopy(raw_config())
+                raw["application"]["type"] = application_type
+                dockerfile = self.adapter.render(normalize_config(raw)).artifact(
+                    "docker/Dockerfile"
+                ).content
+
+                self.assertRegex(builder_image, r"^[^@]+@sha256:[0-9a-f]{64}$")
+                self.assertRegex(runtime_image, r"^[^@]+@sha256:[0-9a-f]{64}$")
+                self.assertIn(f"ARG BUILDER_IMAGE={builder_image}", dockerfile)
+                self.assertIn(f"ARG RUNTIME_IMAGE={runtime_image}", dockerfile)
+
     def test_single_stage_setting_does_not_claim_or_emit_a_builder_stage(self) -> None:
         raw = raw_config()
         raw["build"]["multiStage"] = False
@@ -274,7 +302,7 @@ class DockerBuildAdapterTests(unittest.TestCase):
         metadata = json.loads(result.artifact("docker/metadata.json").content)
 
         self.assertNotIn("AS build", dockerfile)
-        self.assertIn("ARG RUNTIME_IMAGE=python:3.12-slim", dockerfile)
+        self.assertIn(f"ARG RUNTIME_IMAGE={PYTHON_IMAGE}", dockerfile)
         self.assertIn("COPY --chown=10001:10001 . /app", dockerfile)
         self.assertFalse(metadata["build"]["multiStage"])
 
