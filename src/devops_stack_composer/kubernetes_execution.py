@@ -46,6 +46,7 @@ _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _APP_LABEL = "app.kubernetes.io/name"
 _MAX_HTTP_BODY_BYTES = 4096
 _MAX_DIAGNOSTIC_BYTES = 16_384
+_MAX_ROLLBACK_OBSERVATIONS = 32
 
 
 class KubernetesExecutionRunner(Protocol):
@@ -131,6 +132,12 @@ class KubernetesExecutionResult:
     health: HttpSmokeResult
     readiness: HttpSmokeResult
     evidence_paths: tuple[str, ...] = ()
+    initial_health: HttpSmokeResult | None = None
+    initial_readiness: HttpSmokeResult | None = None
+    rollback_failure_cause: str | None = None
+    rollback_failure_cause_verified: bool = False
+    rollback_observation_path: str | None = None
+    post_rollback_smoke_path: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -152,6 +159,30 @@ class KubernetesExecutionResult:
             "identity": self.identity.to_dict(),
             "health": self.health.to_dict(),
             "readiness": self.readiness.to_dict(),
+            "initialHealth": (
+                self.initial_health.to_dict()
+                if self.initial_health is not None
+                else None
+            ),
+            "initialReadiness": (
+                self.initial_readiness.to_dict()
+                if self.initial_readiness is not None
+                else None
+            ),
+            "rollbackFailureCause": self.rollback_failure_cause,
+            "rollbackFailureCauseVerified": self.rollback_failure_cause_verified,
+            "rollbackObservationPath": self.rollback_observation_path,
+            "postRollbackHealth": (
+                self.health.to_dict()
+                if self.post_rollback_smoke_path is not None
+                else None
+            ),
+            "postRollbackReadiness": (
+                self.readiness.to_dict()
+                if self.post_rollback_smoke_path is not None
+                else None
+            ),
+            "postRollbackSmokePath": self.post_rollback_smoke_path,
             "evidencePaths": list(self.evidence_paths),
             "passed": True,
         }
@@ -224,6 +255,26 @@ class _ValidatedManifest:
     documents: tuple[Mapping[str, object], ...]
     namespace_document: Mapping[str, object]
     service_target_port: int
+
+
+@dataclass(frozen=True)
+class _ReadinessFailureObservation:
+    verified: bool
+    pod_names: tuple[str, ...]
+    pods_path: str
+    events_path: str
+
+
+@dataclass(frozen=True)
+class _RollbackResult:
+    identity: KubernetesArtifactIdentity
+    final_revision: str
+    rollback_path: str
+    observation_path: str
+    failure_cause: str
+    post_rollback_health: HttpSmokeResult
+    post_rollback_readiness: HttpSmokeResult
+    post_rollback_smoke_path: str
 
 
 def _loopback_http_get(
@@ -661,12 +712,12 @@ class KubernetesExecutor:
             )
 
             stage = "smoke"
-            health, readiness = self._smoke(
+            initial_health, initial_readiness = self._smoke(
                 manifest.namespace,
                 identity,
                 target_port=applied_target_port,
             )
-            for probe in (health, readiness):
+            for probe in (initial_health, initial_readiness):
                 if probe.status_code != 200:
                     raise KubernetesExecutionError(
                         "SMOKE_HTTP_FAILED",
@@ -678,23 +729,28 @@ class KubernetesExecutor:
                 "kubernetes/smoke.json",
                 {
                     "schemaVersion": "1.0.0",
-                    "health": health.to_dict(),
-                    "readiness": readiness.to_dict(),
+                    "phase": "pre-rollback",
+                    "expectedDigest": identity.expected_digest,
+                    "health": initial_health.to_dict(),
+                    "readiness": initial_readiness.to_dict(),
+                    "passed": True,
                 },
             )
             self._notify_progress(
                 "smoked",
                 {
-                    "healthStatus": health.status_code,
-                    "readinessStatus": readiness.status_code,
+                    "healthStatus": initial_health.status_code,
+                    "readinessStatus": initial_readiness.status_code,
                 },
             )
 
             stage = "rollback"
-            identity, final_revision, rollback_path = self._rollback(
+            rollback = self._rollback(
                 manifest,
                 identity,
+                target_port=applied_target_port,
             )
+            identity = rollback.identity
 
             result = KubernetesExecutionResult(
                 identity=identity,
@@ -711,16 +767,27 @@ class KubernetesExecutor:
                     self.store.root
                 ).as_posix(),
                 runtime_pods_path=pods_path.relative_to(self.store.root).as_posix(),
-                rollback_path=rollback_path,
-                final_revision=final_revision,
-                health=health,
-                readiness=readiness,
+                rollback_path=rollback.rollback_path,
+                final_revision=rollback.final_revision,
+                health=rollback.post_rollback_health,
+                readiness=rollback.post_rollback_readiness,
+                initial_health=initial_health,
+                initial_readiness=initial_readiness,
+                rollback_failure_cause=rollback.failure_cause,
+                rollback_failure_cause_verified=True,
+                rollback_observation_path=rollback.observation_path,
+                post_rollback_smoke_path=rollback.post_rollback_smoke_path,
             )
             stage = "persist-result"
             self.store.write_json("kubernetes/deployment.json", result.to_dict())
             self._notify_progress(
                 "evidence_collected",
-                {"rollbackPath": rollback_path, "finalDigest": identity.runtime_digest},
+                {
+                    "rollbackPath": rollback.rollback_path,
+                    "rollbackObservationPath": rollback.observation_path,
+                    "postRollbackSmokePath": rollback.post_rollback_smoke_path,
+                    "finalDigest": identity.runtime_digest,
+                },
             )
             return replace(result, evidence_paths=self._evidence_paths())
         except KubernetesExecutionError as exc:
@@ -1238,7 +1305,9 @@ class KubernetesExecutor:
         self,
         manifest: ResolvedKubernetesManifest,
         identity: KubernetesArtifactIdentity,
-    ) -> tuple[KubernetesArtifactIdentity, str, str]:
+        *,
+        target_port: int,
+    ) -> _RollbackResult:
         try:
             failure_content = render_intentional_readiness_failure(
                 manifest,
@@ -1267,7 +1336,11 @@ class KubernetesExecutor:
             stage="rollback",
         )
         self._require_exact_reference(failure_reference, identity, "rollback")
-        failure_path = self.store.write_text(
+        injected_readiness_path = self._deployment_readiness_path(
+            failure_document,
+            identity=identity,
+        )
+        failure_manifest_path = self.store.write_text(
             "kubernetes/rollback-failure.yaml",
             failure_content,
         )
@@ -1278,7 +1351,7 @@ class KubernetesExecutor:
                 "--server-side",
                 "--field-manager=devops-stack-composer",
                 "--filename",
-                str(failure_path),
+                str(failure_manifest_path),
                 "--output",
                 "name",
             )
@@ -1309,6 +1382,8 @@ class KubernetesExecutor:
                 self._persist_rollback_observation(
                     failure_rollout,
                     observed=False,
+                    cause_verified=False,
+                    injected_readiness_path=injected_readiness_path,
                 )
                 raise KubernetesExecutionError(
                     "ROLLBACK_FAILURE_OBSERVATION_FAILED",
@@ -1321,6 +1396,8 @@ class KubernetesExecutor:
             self._persist_rollback_observation(
                 unexpected_success,
                 observed=False,
+                cause_verified=False,
+                injected_readiness_path=injected_readiness_path,
             )
             raise KubernetesExecutionError(
                 "ROLLBACK_FAILURE_NOT_OBSERVED",
@@ -1330,10 +1407,58 @@ class KubernetesExecutor:
                 process_result=unexpected_success,
             )
 
+        try:
+            failure_cause = self._observe_readiness_failure(
+                manifest.namespace,
+                identity,
+                injected_readiness_path=injected_readiness_path,
+            )
+        except (KubernetesExecutionError, ProcessExecutionError) as exc:
+            observation_path = self._persist_rollback_observation(
+                failure_rollout,
+                observed=True,
+                cause_verified=False,
+                injected_readiness_path=injected_readiness_path,
+            )
+            process_result = (
+                exc.result
+                if isinstance(exc, ProcessExecutionError)
+                else exc.process_result
+            )
+            raise KubernetesExecutionError(
+                "ROLLBACK_FAILURE_CAUSE_OBSERVATION_FAILED",
+                "rollback",
+                "the intentional rollout failed, but its readiness-probe cause "
+                "could not be inspected",
+                identity=identity,
+                process_result=process_result,
+                diagnostics_paths=(observation_path,),
+            ) from exc
+
         observation_path = self._persist_rollback_observation(
             failure_rollout,
             observed=True,
+            cause_verified=failure_cause.verified,
+            injected_readiness_path=injected_readiness_path,
+            pod_names=failure_cause.pod_names,
+            pods_path=failure_cause.pods_path,
+            events_path=failure_cause.events_path,
         )
+        cause_evidence_paths = (
+            observation_path,
+            failure_cause.pods_path,
+            failure_cause.events_path,
+        )
+        if not failure_cause.verified:
+            raise KubernetesExecutionError(
+                "ROLLBACK_FAILURE_CAUSE_NOT_OBSERVED",
+                "rollback",
+                "rollout failure was not backed by a matching unready pod and "
+                "Readiness probe failed event for the injected path",
+                identity=identity,
+                process_result=failure_rollout,
+                diagnostics_paths=cause_evidence_paths,
+            )
         try:
             undo_result = self._kubectl(
                 "rollout",
@@ -1349,7 +1474,7 @@ class KubernetesExecutor:
                 f"kubectl rollout undo failed: {exc.category.value}",
                 identity=identity,
                 process_result=exc.result,
-                diagnostics_paths=(observation_path,),
+                diagnostics_paths=cause_evidence_paths,
             ) from exc
         try:
             restored_rollout = self._kubectl(
@@ -1369,7 +1494,7 @@ class KubernetesExecutor:
                 f"restored revision did not roll out: {exc.category.value}",
                 identity=identity,
                 process_result=exc.result,
-                diagnostics_paths=(observation_path,),
+                diagnostics_paths=cause_evidence_paths,
             ) from exc
 
         deployment_result = self._kubectl(
@@ -1429,7 +1554,75 @@ class KubernetesExecutor:
                 "rollback",
                 "restored pod does not run the original immutable digest",
                 identity=restored_identity,
-                diagnostics_paths=(observation_path,),
+                diagnostics_paths=cause_evidence_paths,
+            )
+
+        post_smoke_relative = "kubernetes/post-rollback-smoke.json"
+        try:
+            post_health, post_readiness = self._smoke(
+                manifest.namespace,
+                restored_identity,
+                target_port=target_port,
+                stage="rollback",
+            )
+        except KubernetesExecutionError as exc:
+            post_smoke_path = self.store.write_json(
+                post_smoke_relative,
+                {
+                    "schemaVersion": "1.0.0",
+                    "phase": "post-rollback",
+                    "expectedDigest": identity.expected_digest,
+                    "finalDigest": runtime_digest,
+                    "finalRevision": final_revision,
+                    "health": None,
+                    "readiness": None,
+                    "errorCode": exc.code,
+                    "passed": False,
+                },
+            )
+            post_smoke_evidence = post_smoke_path.relative_to(
+                self.store.root
+            ).as_posix()
+            exc.diagnostics_paths = tuple(
+                dict.fromkeys(
+                    (*exc.diagnostics_paths, *cause_evidence_paths, post_smoke_evidence)
+                )
+            )
+            raise
+
+        post_smoke_passed = all(
+            probe.status_code == 200 for probe in (post_health, post_readiness)
+        )
+        post_smoke_path = self.store.write_json(
+            post_smoke_relative,
+            {
+                "schemaVersion": "1.0.0",
+                "phase": "post-rollback",
+                "expectedDigest": identity.expected_digest,
+                "finalDigest": runtime_digest,
+                "finalRevision": final_revision,
+                "health": post_health.to_dict(),
+                "readiness": post_readiness.to_dict(),
+                "passed": post_smoke_passed,
+            },
+        )
+        post_smoke_evidence = post_smoke_path.relative_to(self.store.root).as_posix()
+        if not post_smoke_passed:
+            failed_probe = next(
+                probe
+                for probe in (post_health, post_readiness)
+                if probe.status_code != 200
+            )
+            raise KubernetesExecutionError(
+                "ROLLBACK_SMOKE_HTTP_FAILED",
+                "rollback",
+                f"post-rollback {failed_probe.path} returned HTTP "
+                f"{failed_probe.status_code}",
+                identity=restored_identity,
+                diagnostics_paths=(
+                    *cause_evidence_paths,
+                    post_smoke_evidence,
+                ),
             )
 
         rollback_path = self.store.write_json(
@@ -1438,25 +1631,260 @@ class KubernetesExecutor:
                 "schemaVersion": "1.0.0",
                 "attempted": True,
                 "failureObserved": True,
-                "failureManifestPath": failure_path.relative_to(
+                "failureCause": "readiness-probe",
+                "failureCauseVerified": True,
+                "injectedReadinessPath": injected_readiness_path,
+                "failingPods": list(failure_cause.pod_names),
+                "failureManifestPath": failure_manifest_path.relative_to(
                     self.store.root
                 ).as_posix(),
                 "failureObservationPath": observation_path,
+                "failurePodsPath": failure_cause.pods_path,
+                "failureEventsPath": failure_cause.events_path,
                 "undo": self._process_summary(undo_result),
                 "restoredRollout": self._process_summary(restored_rollout),
                 "restoredDeploymentPath": deployment_path.relative_to(
                     self.store.root
                 ).as_posix(),
                 "restoredPodsPath": pods_path.relative_to(self.store.root).as_posix(),
+                "postRollbackSmokePath": post_smoke_evidence,
+                "postRollbackHealth": post_health.to_dict(),
+                "postRollbackReadiness": post_readiness.to_dict(),
                 "finalRevision": final_revision,
                 "finalDigest": runtime_digest,
                 "passed": True,
             },
         )
-        return (
-            restored_identity,
-            final_revision,
-            rollback_path.relative_to(self.store.root).as_posix(),
+        return _RollbackResult(
+            identity=restored_identity,
+            final_revision=final_revision,
+            rollback_path=rollback_path.relative_to(self.store.root).as_posix(),
+            observation_path=observation_path,
+            failure_cause="readiness-probe",
+            post_rollback_health=post_health,
+            post_rollback_readiness=post_readiness,
+            post_rollback_smoke_path=post_smoke_evidence,
+        )
+
+    def _deployment_readiness_path(
+        self,
+        deployment: Mapping[str, object],
+        *,
+        identity: KubernetesArtifactIdentity,
+    ) -> str:
+        spec = deployment.get("spec")
+        template = spec.get("template") if isinstance(spec, Mapping) else None
+        pod_spec = template.get("spec") if isinstance(template, Mapping) else None
+        containers = (
+            pod_spec.get("containers") if isinstance(pod_spec, Mapping) else None
+        )
+        matches = [
+            container
+            for container in containers or ()
+            if isinstance(container, Mapping) and container.get("name") == self.app_name
+        ]
+        if len(matches) != 1:
+            raise KubernetesExecutionError(
+                "ROLLBACK_MANIFEST_INVALID",
+                "rollback",
+                "intentional failure Deployment must contain one application container",
+                identity=identity,
+            )
+        readiness = matches[0].get("readinessProbe")
+        http_get = readiness.get("httpGet") if isinstance(readiness, Mapping) else None
+        path = http_get.get("path") if isinstance(http_get, Mapping) else None
+        if (
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or path == self.readiness_path
+        ):
+            raise KubernetesExecutionError(
+                "ROLLBACK_MANIFEST_INVALID",
+                "rollback",
+                "intentional failure Deployment must inject a distinct HTTP readiness path",
+                identity=identity,
+            )
+        return path
+
+    def _observe_readiness_failure(
+        self,
+        namespace: str,
+        identity: KubernetesArtifactIdentity,
+        *,
+        injected_readiness_path: str,
+    ) -> _ReadinessFailureObservation:
+        pods_result = self._kubectl(
+            "get",
+            "pods",
+            "--namespace",
+            namespace,
+            "--selector",
+            f"{_APP_LABEL}={self.app_name}",
+            "--output",
+            "json",
+        )
+        pods = self._json_object(pods_result, "rollback", identity)
+        events_result = self._kubectl(
+            "get",
+            "events",
+            "--namespace",
+            namespace,
+            "--sort-by=.lastTimestamp",
+            "--output",
+            "json",
+        )
+        events = self._json_object(events_result, "rollback", identity)
+        pod_items = pods.get("items")
+        event_items = events.get("items")
+        if not isinstance(pod_items, list) or not isinstance(event_items, list):
+            raise KubernetesExecutionError(
+                "ROLLBACK_FAILURE_CAUSE_EVIDENCE_INVALID",
+                "rollback",
+                "rollback failure pod and event inventories must be arrays",
+                identity=identity,
+            )
+
+        candidates: dict[tuple[str, str], dict[str, object]] = {}
+        pod_summaries: list[dict[str, object]] = []
+        for item in pod_items:
+            if not isinstance(item, Mapping):
+                continue
+            metadata = item.get("metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            name = metadata.get("name")
+            uid = metadata.get("uid")
+            labels = metadata.get("labels")
+            if (
+                metadata.get("namespace") != namespace
+                or metadata.get("deletionTimestamp") is not None
+                or not isinstance(labels, Mapping)
+                or labels.get(_APP_LABEL) != self.app_name
+                or not isinstance(name, str)
+                or not name
+                or not isinstance(uid, str)
+                or not uid
+            ):
+                continue
+            spec = item.get("spec")
+            containers = spec.get("containers") if isinstance(spec, Mapping) else None
+            app_containers = [
+                container
+                for container in containers or ()
+                if isinstance(container, Mapping)
+                and container.get("name") == self.app_name
+            ]
+            if len(app_containers) != 1:
+                continue
+            container = app_containers[0]
+            readiness = container.get("readinessProbe")
+            http_get = (
+                readiness.get("httpGet") if isinstance(readiness, Mapping) else None
+            )
+            path = http_get.get("path") if isinstance(http_get, Mapping) else None
+            if path != injected_readiness_path:
+                continue
+            image = container.get("image")
+            if not isinstance(image, str):
+                continue
+            self._require_exact_reference(image, identity, "rollback")
+
+            status = item.get("status")
+            status = status if isinstance(status, Mapping) else {}
+            conditions = status.get("conditions")
+            pod_ready_false = any(
+                isinstance(condition, Mapping)
+                and condition.get("type") == "Ready"
+                and condition.get("status") == "False"
+                for condition in conditions or ()
+            )
+            statuses = status.get("containerStatuses")
+            app_statuses = [
+                container_status
+                for container_status in statuses or ()
+                if isinstance(container_status, Mapping)
+                and container_status.get("name") == self.app_name
+            ]
+            container_ready_false = (
+                len(app_statuses) == 1 and app_statuses[0].get("ready") is False
+            )
+            summary = {
+                "name": name,
+                "uid": uid,
+                "image": image,
+                "injectedReadinessPath": path,
+                "podReadyFalse": pod_ready_false,
+                "containerReadyFalse": container_ready_false,
+            }
+            if len(pod_summaries) < _MAX_ROLLBACK_OBSERVATIONS:
+                pod_summaries.append(summary)
+            if pod_ready_false and container_ready_false:
+                candidates[(name, uid)] = summary
+
+        matched_pods: set[str] = set()
+        event_summaries: list[dict[str, object]] = []
+        for item in event_items:
+            if not isinstance(item, Mapping):
+                continue
+            involved = item.get("involvedObject")
+            involved = involved if isinstance(involved, Mapping) else {}
+            name = involved.get("name")
+            uid = involved.get("uid")
+            message = item.get("message")
+            if (
+                item.get("reason") != "Unhealthy"
+                or involved.get("kind") != "Pod"
+                or involved.get("namespace") != namespace
+                or not isinstance(name, str)
+                or not isinstance(uid, str)
+                or not uid
+                or not isinstance(message, str)
+                or re.search(r"\breadiness probe failed\b", message, re.IGNORECASE)
+                is None
+            ):
+                continue
+            matching_key = (name, uid) if (name, uid) in candidates else None
+            if matching_key is None:
+                continue
+            matched_pods.add(name)
+            if len(event_summaries) < _MAX_ROLLBACK_OBSERVATIONS:
+                safe_message = self._bounded_redacted_text(message, 4096)
+                event_summaries.append(
+                    {
+                        "reason": "Unhealthy",
+                        "involvedPod": name,
+                        "involvedPodUid": uid,
+                        "readinessProbeFailure": True,
+                        "message": safe_message,
+                        "messageSha256": hashlib.sha256(message.encode()).hexdigest(),
+                    }
+                )
+
+        verified = bool(matched_pods)
+        pods_path = self.store.write_json(
+            "kubernetes/rollback-failure-pods.json",
+            {
+                "schemaVersion": "1.0.0",
+                "command": self._process_summary(pods_result),
+                "injectedReadinessPath": injected_readiness_path,
+                "candidates": pod_summaries,
+                "matchedPods": sorted(matched_pods),
+            },
+        )
+        events_path = self.store.write_json(
+            "kubernetes/rollback-failure-events.json",
+            {
+                "schemaVersion": "1.0.0",
+                "command": self._process_summary(events_result),
+                "expectedReason": "Unhealthy",
+                "expectedMessage": "Readiness probe failed",
+                "matchingEvents": event_summaries,
+            },
+        )
+        return _ReadinessFailureObservation(
+            verified=verified,
+            pod_names=tuple(sorted(matched_pods)),
+            pods_path=pods_path.relative_to(self.store.root).as_posix(),
+            events_path=events_path.relative_to(self.store.root).as_posix(),
         )
 
     def _persist_rollback_observation(
@@ -1464,6 +1892,11 @@ class KubernetesExecutor:
         result: ProcessResult,
         *,
         observed: bool,
+        cause_verified: bool,
+        injected_readiness_path: str,
+        pod_names: Sequence[str] = (),
+        pods_path: str | None = None,
+        events_path: str | None = None,
     ) -> str:
         content = "\n".join(value for value in (result.stdout, result.stderr) if value)
         content = redact_process_output(content or "<empty>")
@@ -1481,6 +1914,12 @@ class KubernetesExecutor:
             {
                 "schemaVersion": "1.0.0",
                 "failureObserved": observed,
+                "expectedFailureCause": "readiness-probe",
+                "expectedFailureCauseVerified": cause_verified,
+                "injectedReadinessPath": injected_readiness_path,
+                "failingPods": list(pod_names),
+                "failurePodsPath": pods_path,
+                "failureEventsPath": events_path,
                 "command": self._process_summary(result),
                 "outputPath": output_path.relative_to(self.store.root).as_posix(),
             },
@@ -1555,6 +1994,7 @@ class KubernetesExecutor:
         identity: KubernetesArtifactIdentity,
         *,
         target_port: int,
+        stage: str = "smoke",
     ) -> tuple[HttpSmokeResult, HttpSmokeResult]:
         parent_token = getattr(self.runner, "cancellation_token", None)
         if parent_token is not None and not isinstance(parent_token, CancellationToken):
@@ -1578,7 +2018,7 @@ class KubernetesExecutor:
         except ProcessExecutionError as exc:
             raise KubernetesExecutionError(
                 "PORT_FORWARD_START_FAILED",
-                "smoke",
+                stage,
                 f"kubectl port-forward could not start: {exc.category.value}",
                 identity=identity,
                 process_result=exc.result,
@@ -1586,7 +2026,7 @@ class KubernetesExecutor:
         except Exception as exc:
             raise KubernetesExecutionError(
                 "PORT_FORWARD_START_FAILED",
-                "smoke",
+                stage,
                 "the managed kubectl port-forward could not start",
                 identity=identity,
             ) from exc
@@ -1603,21 +2043,21 @@ class KubernetesExecutor:
                 if "Forwarding from" in stdout or "Forwarding from" in stderr:
                     raise KubernetesExecutionError(
                         "PORT_FORWARD_READINESS_INVALID",
-                        "smoke",
+                        stage,
                         "kubectl reported a forwarding endpoint that did not match "
                         "the requested loopback service port",
                         identity=identity,
                     ) from exc
                 raise KubernetesExecutionError(
                     "PORT_FORWARD_TIMEOUT",
-                    "smoke",
+                    stage,
                     "kubectl did not report its selected loopback port before the deadline",
                     identity=identity,
                 ) from exc
             except ProcessExecutionError as exc:
                 raise KubernetesExecutionError(
                     "PORT_FORWARD_FAILED",
-                    "smoke",
+                    stage,
                     f"kubectl port-forward failed with {exc.category.value}",
                     identity=identity,
                     process_result=exc.result,
@@ -1625,7 +2065,7 @@ class KubernetesExecutor:
             except RuntimeError as exc:
                 raise KubernetesExecutionError(
                     "PORT_FORWARD_STOPPED",
-                    "smoke",
+                    stage,
                     "kubectl port-forward exited before reporting readiness",
                     identity=identity,
                 ) from exc
@@ -1633,7 +2073,7 @@ class KubernetesExecutor:
             if local_port > 65535:
                 raise KubernetesExecutionError(
                     "PORT_FORWARD_READINESS_INVALID",
-                    "smoke",
+                    stage,
                     "kubectl reported an invalid selected loopback port",
                     identity=identity,
                 )
@@ -1657,14 +2097,14 @@ class KubernetesExecutor:
             except Exception as exc:
                 raise KubernetesExecutionError(
                     "SMOKE_HTTP_REQUEST_FAILED",
-                    "smoke",
+                    stage,
                     "a loopback HTTP smoke request failed or returned invalid evidence",
                     identity=identity,
                 ) from exc
             if not managed.is_running:
                 raise KubernetesExecutionError(
                     "PORT_FORWARD_STOPPED",
-                    "smoke",
+                    stage,
                     "kubectl port-forward stopped during smoke execution",
                     identity=identity,
                 )
@@ -1673,7 +2113,7 @@ class KubernetesExecutor:
             if not managed.close(timeout=self.port_forward_cleanup_timeout):
                 cleanup_failure = KubernetesExecutionError(
                     "PORT_FORWARD_CLEANUP_FAILED",
-                    "smoke",
+                    stage,
                     "kubectl port-forward was not terminated and reaped before the deadline",
                     identity=identity,
                 )
@@ -1800,6 +2240,51 @@ class KubernetesExecutor:
                 ),
             ),
             (
+                "diagnostics/deployment-describe.txt",
+                (
+                    "describe",
+                    "deployment",
+                    self.deployment_name,
+                    "--namespace",
+                    self._active_namespace,
+                ),
+            ),
+            (
+                "diagnostics/replicasets.json",
+                (
+                    "get",
+                    "replicasets",
+                    "--namespace",
+                    self._active_namespace,
+                    "--selector",
+                    f"{_APP_LABEL}={self.app_name}",
+                    "--output",
+                    "json",
+                ),
+            ),
+            (
+                "diagnostics/replicasets-describe.txt",
+                (
+                    "describe",
+                    "replicasets",
+                    "--namespace",
+                    self._active_namespace,
+                    "--selector",
+                    f"{_APP_LABEL}={self.app_name}",
+                ),
+            ),
+            (
+                "diagnostics/pods-describe.txt",
+                (
+                    "describe",
+                    "pods",
+                    "--namespace",
+                    self._active_namespace,
+                    "--selector",
+                    f"{_APP_LABEL}={self.app_name}",
+                ),
+            ),
+            (
                 "diagnostics/pod-logs.txt",
                 (
                     "logs",
@@ -1810,6 +2295,29 @@ class KubernetesExecutor:
                     "--all-containers=true",
                     "--tail=200",
                     "--prefix=true",
+                ),
+            ),
+            (
+                "diagnostics/rollout-history.txt",
+                (
+                    "rollout",
+                    "history",
+                    f"deployment/{self.deployment_name}",
+                    "--namespace",
+                    self._active_namespace,
+                ),
+            ),
+            (
+                "diagnostics/final-manifests.yaml",
+                (
+                    "get",
+                    "deployment,replicaset,pod,service",
+                    "--namespace",
+                    self._active_namespace,
+                    "--selector",
+                    f"{_APP_LABEL}={self.app_name}",
+                    "--output",
+                    "yaml",
                 ),
             ),
         )
@@ -1849,17 +2357,22 @@ class KubernetesExecutor:
         return (path,) if path is not None else ()
 
     def _write_bounded_text(self, relative: str, content: str) -> str | None:
-        value = redact_process_output(content)
-        encoded = value.encode("utf-8")
-        if len(encoded) > _MAX_DIAGNOSTIC_BYTES:
-            marker = "\n...[output truncated]"
-            available = _MAX_DIAGNOSTIC_BYTES - len(marker.encode())
-            value = encoded[:available].decode("utf-8", errors="ignore") + marker
+        value = self._bounded_redacted_text(content, _MAX_DIAGNOSTIC_BYTES)
         try:
             path = self.store.write_text(relative, value.rstrip() + "\n")
         except (DevOpsStackError, OSError):
             return None
         return path.relative_to(self.store.root).as_posix()
+
+    @staticmethod
+    def _bounded_redacted_text(content: str, maximum_bytes: int) -> str:
+        value = redact_process_output(content).replace("\x00", "")
+        encoded = value.encode("utf-8")
+        if len(encoded) <= maximum_bytes:
+            return value
+        marker = "\n...[output truncated]"
+        available = maximum_bytes - len(marker.encode())
+        return encoded[:available].decode("utf-8", errors="ignore") + marker
 
     @staticmethod
     def _private_kubeconfig(path: Path) -> tuple[Path, str]:
