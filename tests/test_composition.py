@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -28,6 +29,42 @@ from devops_stack_composer.validation import ValidationStatus
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_FIXTURE = ROOT / "tests" / "fixtures" / "configs" / "valid.yaml"
 DOCKER_TEMPLATE_FIXTURE = ROOT / "tests" / "fixtures" / "templates" / "docker"
+V01_CONFIG_SHA256 = "b762d4b970c3a285c59b03b0ee37445f807105cef5e45e25b0f385d5c8b1a976"
+V02_ARTIFACT_PATHS_FOR_V01_CONFIG = (
+    "docker/Dockerfile",
+    "docker/Dockerfile.dockerignore",
+    "docker/build.sh",
+    "docker/image.env",
+    "docker/metadata.json",
+    "jenkins/Jenkinsfile",
+    "jenkins/README.md",
+    "jenkins/artifact-contract.json",
+    "jenkins/environments/dev.json",
+    "jenkins/environments/production.json",
+    "jenkins/environments/staging.json",
+    "jenkins/job-dsl.groovy",
+    "k8s/base/configmap.yaml",
+    "k8s/base/deployment.yaml",
+    "k8s/base/kustomization.yaml",
+    "k8s/base/service.yaml",
+    "k8s/base/serviceaccount.yaml",
+    "k8s/overlays/dev/configmap.yaml",
+    "k8s/overlays/dev/deployment.yaml",
+    "k8s/overlays/dev/kustomization.yaml",
+    "k8s/overlays/dev/namespace.yaml",
+    "k8s/overlays/dev/service.yaml",
+    "k8s/overlays/production/configmap.yaml",
+    "k8s/overlays/production/deployment.yaml",
+    "k8s/overlays/production/kustomization.yaml",
+    "k8s/overlays/production/namespace.yaml",
+    "k8s/overlays/production/service.yaml",
+    "k8s/overlays/staging/configmap.yaml",
+    "k8s/overlays/staging/deployment.yaml",
+    "k8s/overlays/staging/kustomization.yaml",
+    "k8s/overlays/staging/namespace.yaml",
+    "k8s/overlays/staging/service.yaml",
+    "k8s/platform-context.json",
+)
 
 
 def _run_git(*arguments: str, environment: dict[str, str] | None = None) -> str:
@@ -85,7 +122,11 @@ def _fixture_repository(root: Path, key: str) -> str:
 
 
 class OfflineCompositionTests(unittest.TestCase):
-    def test_three_adapter_composition_is_deterministic_and_manifest_clean(self) -> None:
+    def test_frozen_v01_config_composes_deterministically_and_manifest_clean(self) -> None:
+        self.assertEqual(
+            hashlib.sha256(CONFIG_FIXTURE.read_bytes()).hexdigest(),
+            V01_CONFIG_SHA256,
+        )
         with tempfile.TemporaryDirectory(prefix="composition-e2e-") as directory:
             temporary = Path(directory)
             project = temporary / "project"
@@ -215,7 +256,15 @@ class OfflineCompositionTests(unittest.TestCase):
 
             self.assertEqual(first.artifacts, second.artifacts)
             artifact_paths = tuple(artifact.path for artifact in first.artifacts)
-            self.assertEqual(artifact_paths, tuple(sorted(artifact_paths)))
+            self.assertEqual(artifact_paths, V02_ARTIFACT_PATHS_FOR_V01_CONFIG)
+            self.assertEqual(first.loaded_config.model.execution["profile"], "static")
+            self.assertEqual(first.loaded_config.model.validation_profile, "static")
+            self.assertEqual(first.loaded_config.model.registry["mode"], "existing")
+            self.assertFalse(
+                first.loaded_config.model.supply_chain["verification"][
+                    "requireDigestPinnedDeployment"
+                ]
+            )
             self.assertEqual(
                 {path.split("/", 1)[0] for path in artifact_paths},
                 {"docker", "jenkins", "k8s"},
