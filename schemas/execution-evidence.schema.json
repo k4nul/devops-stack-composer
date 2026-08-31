@@ -25,12 +25,27 @@
     "toolVersions"
   ],
   "properties": {
-    "schemaVersion": {"const": "1.0.0"},
+    "schemaVersion": {"enum": ["1.0.0", "1.1.0"]},
     "runId": {"$ref": "#/definitions/runId"},
     "projectPath": {"$ref": "#/definitions/relativePathOrDot"},
     "configHash": {"$ref": "#/definitions/sha256Hex"},
     "templateLockHash": {"$ref": "#/definitions/sha256Hex"},
     "sourceRevision": {"$ref": "#/definitions/gitRevision"},
+    "sourceRepository": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 1
+    },
+    "templateRevisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["docker", "jenkins", "kubernetes"],
+      "properties": {
+        "docker": {"$ref": "#/definitions/gitRevision"},
+        "jenkins": {"$ref": "#/definitions/gitRevision"},
+        "kubernetes": {"$ref": "#/definitions/gitRevision"}
+      }
+    },
     "startTime": {"$ref": "#/definitions/timestamp"},
     "endTime": {"$ref": "#/definitions/timestamp"},
     "executionProfile": {"$ref": "#/definitions/identifier"},
@@ -64,9 +79,184 @@
       "type": "object",
       "propertyNames": {"minLength": 1},
       "additionalProperties": {"type": "string"}
+    },
+    "evidenceChecksums": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"$ref": "#/definitions/relativePath"},
+      "additionalProperties": {"$ref": "#/definitions/sha256Hex"}
+    },
+    "evidenceChecksumPaths": {
+      "type": "array",
+      "oneOf": [
+        {
+          "items": [{"const": "SHA256SUMS"}],
+          "minItems": 1,
+          "maxItems": 1,
+          "additionalItems": false
+        },
+        {
+          "items": [
+            {"const": "SHA256SUMS"},
+            {"const": "checksums.json"}
+          ],
+          "minItems": 2,
+          "maxItems": 2,
+          "additionalItems": false
+        }
+      ]
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/definitions/nonemptyString"}
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {"schemaVersion": {"const": "1.1.0"}},
+        "required": ["schemaVersion"]
+      },
+      "then": {
+        "required": [
+          "sourceRepository",
+          "templateRevisions",
+          "evidenceChecksums",
+          "evidenceChecksumPaths",
+          "limitations"
+        ],
+        "properties": {
+          "executionProfile": {
+            "enum": ["static", "supply-chain", "kind-e2e", "release"]
+          },
+          "stageResults": {
+            "items": {
+              "allOf": [
+                {"$ref": "#/definitions/stageResult"},
+                {
+                  "anyOf": [
+                    {
+                      "properties": {"command": {"minItems": 1}},
+                      "required": ["command"]
+                    },
+                    {
+                      "properties": {
+                        "tool": {"$ref": "#/definitions/nonemptyString"}
+                      },
+                      "required": ["tool"]
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          "toolVersions": {
+            "minProperties": 1,
+            "additionalProperties": {"$ref": "#/definitions/nonemptyString"}
+          }
+        }
+      },
+      "else": {
+        "not": {
+          "anyOf": [
+            {"required": ["sourceRepository"]},
+            {"required": ["templateRevisions"]},
+            {"required": ["evidenceChecksums"]},
+            {"required": ["evidenceChecksumPaths"]},
+            {"required": ["limitations"]}
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schemaVersion": {"const": "1.1.0"},
+          "executionProfile": {"const": "static"}
+        },
+        "required": ["schemaVersion", "executionProfile"]
+      },
+      "then": {
+        "properties": {
+          "toolVersions": {"required": ["devops-stack-composer"]}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schemaVersion": {"const": "1.1.0"},
+          "executionProfile": {"const": "supply-chain"}
+        },
+        "required": ["schemaVersion", "executionProfile"]
+      },
+      "then": {
+        "properties": {
+          "toolVersions": {
+            "required": [
+              "devops-stack-composer",
+              "docker",
+              "docker-buildx",
+              "syft",
+              "trivy"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schemaVersion": {"const": "1.1.0"},
+          "executionProfile": {"const": "kind-e2e"}
+        },
+        "required": ["schemaVersion", "executionProfile"]
+      },
+      "then": {
+        "properties": {
+          "toolVersions": {
+            "required": [
+              "devops-stack-composer",
+              "docker",
+              "docker-buildx",
+              "syft",
+              "trivy",
+              "kind",
+              "kubectl",
+              "kubeconform"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schemaVersion": {"const": "1.1.0"},
+          "executionProfile": {"const": "release"}
+        },
+        "required": ["schemaVersion", "executionProfile"]
+      },
+      "then": {
+        "properties": {
+          "toolVersions": {
+            "required": [
+              "devops-stack-composer",
+              "docker",
+              "docker-buildx",
+              "syft",
+              "trivy",
+              "kind",
+              "kubectl",
+              "kubeconform",
+              "gh"
+            ]
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {

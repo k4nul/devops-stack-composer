@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import re
 import shutil
 import subprocess
 import time
@@ -9,6 +13,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from devops_stack_composer import __version__
 from devops_stack_composer.build_once import (
@@ -31,7 +36,9 @@ from devops_stack_composer.evidence_validation import (
 from devops_stack_composer.execution_models import (
     ArtifactIntent,
     DeploymentEvidence,
+    EXECUTION_EVIDENCE_SCHEMA_VERSION,
     ExecutionRun,
+    LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
     ResolvedArtifact,
     StageResult,
     StageStatus,
@@ -89,10 +96,12 @@ from devops_stack_composer.supply_chain import SupplyChainGenerator
 
 Clock = Callable[[], datetime]
 SourceRevisionResolver = Callable[[Path], str]
+SourceRepositoryResolver = Callable[[Path], str]
 RegistryFactory = Callable[[str], EphemeralRegistry]
 KindFactory = Callable[[str], KindCluster]
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 ToolResolver = Callable[[str], str | None]
+ToolVersionResolver = Callable[[str], str | None]
 ProcessRunnerFactory = Callable[[Path], SafeProcessRunner]
 ReleaseValidator = Callable[
     [ReleaseGateRequest, SafeProcessRunner], ReleaseGateResult
@@ -122,14 +131,51 @@ _EXECUTION_ENVIRONMENT_KEYS = frozenset(
 )
 _MAX_EXECUTION_OUTPUT_BYTES = 1024 * 1024
 _OVERALL_EXECUTION_TIMEOUT_SECONDS = 3600.0
+_SEMANTIC_VERSION = re.compile(r"(?<![0-9])v?([0-9]+\.[0-9]+\.[0-9]+(?:[+.-][A-Za-z0-9.-]+)?)")
+_GITHUB_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_DERIVED_OR_MUTABLE_EVIDENCE_FILES = frozenset(
+    {
+        "SHA256SUMS",
+        "artifacts.json",
+        "attestation.json",
+        "checksums.json",
+        "commands.json",
+        "deployment.json",
+        "execution-evidence.json",
+        "execution-plan.json",
+        "plan.json",
+        "policy.json",
+        "report.json",
+        "report.md",
+        "resources.json",
+        "run.json",
+        "smoke.json",
+        "state.json",
+        "summary.md",
+    }
+)
 
 
 class ExecutionError(DevOpsStackError):
     """A stable execution failure that can be recorded without leaking input."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        evidence_path: str = "execution-plan.json",
+        reproduction_command: str = (
+            "devops-stack execute --project . --profile supply-chain"
+        ),
+    ):
         self.code = code
-        super().__init__(f"{code}: {message}")
+        self.evidence_path = evidence_path
+        self.reproduction_command = reproduction_command
+        super().__init__(
+            f"{code}: {message}; evidence: {evidence_path}; "
+            f"reproduce: {reproduction_command}"
+        )
 
 
 @dataclass(frozen=True)
@@ -266,6 +312,128 @@ def _default_source_revision(
             "Git source revision must use lowercase hexadecimal",
         )
     return revision
+
+
+def _source_repository_uri(value: str) -> str | None:
+    """Normalize a Git remote without preserving credentials or local paths."""
+
+    value = value.strip()
+    if not value:
+        return None
+    if value.startswith("git@github.com:"):
+        repository = value.removeprefix("git@github.com:").removesuffix(".git")
+        if _GITHUB_REPOSITORY.fullmatch(repository):
+            return f"https://github.com/{repository}"
+    parsed = urlsplit(value)
+    if parsed.scheme in {"http", "https", "ssh", "git"} and parsed.hostname:
+        path = parsed.path.rstrip("/").removesuffix(".git")
+        if not path or path == "/":
+            return None
+        scheme = "https" if parsed.hostname.lower() == "github.com" else parsed.scheme
+        return urlunsplit((scheme, parsed.hostname, path, "", ""))
+    fingerprint = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"urn:devops-stack:source:local:{fingerprint}"
+
+
+def _default_source_repository(
+    project: Path,
+    command_runner: CommandRunner = subprocess.run,
+) -> str:
+    github_repository = os.environ.get("GITHUB_REPOSITORY", "")
+    if _GITHUB_REPOSITORY.fullmatch(github_repository):
+        return f"https://github.com/{github_repository}"
+    try:
+        result = command_runner(
+            ["git", "-C", str(project), "remote", "get-url", "origin"],
+            cwd=project,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    if result is not None and result.returncode == 0:
+        normalized = _source_repository_uri(result.stdout)
+        if normalized is not None:
+            return normalized
+    fingerprint = hashlib.sha256(str(project.resolve()).encode("utf-8")).hexdigest()
+    return f"urn:devops-stack:source:local:{fingerprint}"
+
+
+def _workflow_identity(source_revision: str) -> str:
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    server = os.environ.get("GITHUB_SERVER_URL", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    if (
+        _GITHUB_REPOSITORY.fullmatch(repository)
+        and server in {"https://github.com", "https://github.example.com"}
+        and run_id.isdigit()
+        and attempt.isdigit()
+    ):
+        return f"{server}/{repository}/actions/runs/{run_id}/attempts/{attempt}"
+    return f"urn:devops-stack:workflow:local:{source_revision}"
+
+
+def _parsed_tool_version(output: str) -> str | None:
+    match = _SEMANTIC_VERSION.search(output)
+    return match.group(1) if match else None
+
+
+def _default_tool_version(
+    tool: str,
+    project: Path,
+    command_runner: CommandRunner,
+) -> str | None:
+    commands: dict[str, tuple[str, ...]] = {
+        "docker": ("docker", "version", "--format", "{{.Client.Version}}"),
+        "docker-buildx": ("docker", "buildx", "version"),
+        "syft": ("syft", "version", "-o", "json"),
+        "trivy": ("trivy", "version", "--format", "json"),
+        "kind": ("kind", "version"),
+        "kubectl": ("kubectl", "version", "--client", "-o", "json"),
+        "kubeconform": ("kubeconform", "-v"),
+        "gh": ("gh", "--version"),
+    }
+    command = commands.get(tool)
+    if command is None:
+        return None
+    try:
+        result = command_runner(
+            list(command),
+            cwd=project,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    output = f"{result.stdout}\n{result.stderr}"[:65536]
+    if tool in {"syft", "trivy", "kubectl"}:
+        try:
+            value = json.loads(result.stdout)
+        except (TypeError, ValueError):
+            value = None
+        if isinstance(value, Mapping):
+            candidates: tuple[Any, ...] = (
+                value.get("version"),
+                value.get("Version"),
+                (
+                    value.get("clientVersion", {}).get("gitVersion")
+                    if isinstance(value.get("clientVersion"), Mapping)
+                    else None
+                ),
+            )
+            for candidate in candidates:
+                if isinstance(candidate, str):
+                    parsed = _parsed_tool_version(candidate)
+                    if parsed is not None:
+                        return parsed
+    return _parsed_tool_version(output)
 
 
 def vulnerability_policy_from_model(value: Mapping[str, Any]) -> VulnerabilityPolicy:
@@ -575,7 +743,9 @@ class ExecutionOrchestrator:
         kubernetes_executor: object | None = None,
         schema_command_runner: CommandRunner | None = None,
         tool_resolver: ToolResolver | None = None,
+        tool_version_resolver: ToolVersionResolver | None = None,
         source_revision_resolver: SourceRevisionResolver | None = None,
+        source_repository_resolver: SourceRepositoryResolver | None = None,
         process_runner_factory: ProcessRunnerFactory | None = None,
         release_validator: ReleaseValidator | None = None,
         clock: Clock | None = None,
@@ -587,7 +757,9 @@ class ExecutionOrchestrator:
         self._kubernetes_executor = kubernetes_executor
         self._schema_command_runner = schema_command_runner
         self._tool_resolver = tool_resolver or shutil.which
+        self._tool_version_resolver = tool_version_resolver
         self._source_revision_resolver = source_revision_resolver
+        self._source_repository_resolver = source_repository_resolver
         self._process_runner_factory = process_runner_factory
         self._release_validator = release_validator or validate_published_release
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -627,6 +799,7 @@ class ExecutionOrchestrator:
         source_revision: str,
         build_plan_hash: str,
         registry_endpoint: str,
+        buildx_version: str,
     ) -> ResolvedArtifact:
         if len(result.platforms) != 1:
             raise ExecutionError(
@@ -658,7 +831,7 @@ class ExecutionOrchestrator:
             config_digest=config_digest,
             source_revision=source_revision,
             build_plan_hash=build_plan_hash,
-            created_by_tool_version=__version__,
+            created_by_tool_version=buildx_version,
             registry_endpoint=registry_endpoint,
             build_invocation_count=result.build_invocation_count,
         )
@@ -685,7 +858,7 @@ class ExecutionOrchestrator:
             start_time=started or self._now(),
             end_time=self._now(),
             command=tuple(command),
-            tool=tool,
+            tool=tool or (None if command else "devops-stack-composer"),
             sanitized_output=output,
             evidence_paths=tuple(evidence_paths),
             failure_reason=failure_reason,
@@ -763,6 +936,7 @@ class ExecutionOrchestrator:
         profile: ValidationProfile,
         *,
         registry_mode: str,
+        tool_versions: Mapping[str, str],
     ) -> tuple[tuple[str, str], ...]:
         if profile == ValidationProfile.STATIC:
             return ()
@@ -773,6 +947,7 @@ class ExecutionOrchestrator:
                 if registry_mode == "ephemeral-local"
                 else "build-once",
             ),
+            ("docker-buildx", "build-once"),
             ("syft", "sbom"),
             ("trivy", "vulnerability-scan"),
         ]
@@ -789,8 +964,40 @@ class ExecutionOrchestrator:
         return tuple(
             (tool, stage_id)
             for tool, stage_id in required
-            if not self._tool_resolver(tool)
+            if (
+                not self._tool_resolver("docker" if tool == "docker-buildx" else tool)
+                or tool not in tool_versions
+            )
         )
+
+    def _tool_versions(
+        self,
+        profile: ValidationProfile,
+        project: Path,
+        command_runner: CommandRunner,
+    ) -> dict[str, str]:
+        versions = {"devops-stack-composer": __version__}
+        if profile == ValidationProfile.STATIC:
+            return versions
+        tools = ["docker", "docker-buildx", "syft", "trivy"]
+        if profile in {ValidationProfile.KIND_E2E, ValidationProfile.RELEASE}:
+            tools.extend(("kind", "kubectl", "kubeconform"))
+        if profile == ValidationProfile.RELEASE:
+            tools.append("gh")
+        for tool in tools:
+            executable = "docker" if tool == "docker-buildx" else tool
+            if not self._tool_resolver(executable):
+                continue
+            version = (
+                self._tool_version_resolver(tool)
+                if self._tool_version_resolver is not None
+                else _default_tool_version(tool, project, command_runner)
+            )
+            if isinstance(version, str):
+                normalized = _parsed_tool_version(version)
+                if normalized is not None:
+                    versions[tool] = normalized
+        return versions
 
     @staticmethod
     def _kubernetes_progress(
@@ -958,6 +1165,7 @@ class ExecutionOrchestrator:
             f"Overall result: **{run.final_status.value}**",
             "",
             f"- Run: `{run.run_id}`",
+            f"- Project: `{run.source_repository}` (`{run.project_path}`)",
             f"- Profile: `{run.execution_profile}`",
             f"- Source commit: `{run.source_revision}`",
             f"- Configuration hash: `{run.config_hash}`",
@@ -969,6 +1177,9 @@ class ExecutionOrchestrator:
         ]
         for key in ("docker", "jenkins", "kubernetes"):
             lines.append(f"- {key}: `{composition.lock.pin(key).commit}`")
+        lines.extend(["", "## Tool versions", ""])
+        for name, version in sorted(run.tool_versions.items()):
+            lines.append(f"- {name}: `{version}`")
         if artifact is not None:
             lines.extend(
                 [
@@ -1033,17 +1244,32 @@ class ExecutionOrchestrator:
         for stage in run.stage_results:
             evidence = ", ".join(f"`{path}`" for path in stage.evidence_paths) or "none"
             lines.append(f"| `{stage.stage_id}` | {stage.status.value} | {evidence} |")
+        nonpassed = tuple(
+            stage for stage in run.stage_results if stage.status != StageStatus.PASSED
+        )
+        lines.extend(["", "## Non-passing stages", ""])
+        if nonpassed:
+            lines.extend(
+                f"- `{stage.stage_id}`: `{stage.status.value}`"
+                for stage in nonpassed
+            )
+        else:
+            lines.append("- None")
+        lines.extend(["", "## Evidence checksums", ""])
+        lines.extend(
+            f"- `{path}`: `{digest}`"
+            for path, digest in sorted(run.evidence_checksums.items())
+        )
+        lines.extend(["", "## Evidence checksum manifests", ""])
+        lines.extend(f"- `{path}`" for path in run.evidence_checksum_paths)
         lines.extend(
             [
                 "",
                 "## Assurance limits",
                 "",
-                "- Local provenance is unsigned, unattached file evidence; its SHA-256 checksum is not a signature.",
-                "- kind proves the recorded local Kubernetes API, kubelet, Service, and rollback observations only; it is not production-cluster certification.",
-                "- Vulnerability results reflect the scanner database metadata recorded at execution time and do not prove absence of vulnerabilities.",
-                "- The generated Jenkins pipeline is statically validated; no Jenkins controller executed it in v0.2.",
             ]
         )
+        lines.extend(f"- {limitation}" for limitation in run.limitations)
         if run.failure_reason:
             lines.extend(["", "## Failure", "", run.failure_reason])
         return "\n".join(lines).rstrip() + "\n"
@@ -1072,6 +1298,34 @@ class ExecutionOrchestrator:
         )
         store.write_checksums()
         store.verify_checksums()
+
+    @staticmethod
+    def _evidence_checksums(store: EvidenceStore) -> dict[str, str]:
+        checksums = {
+            path.relative_to(store.root).as_posix(): sha256_file(path)
+            for path in store._material_files()
+            if path.relative_to(store.root).as_posix()
+            not in _DERIVED_OR_MUTABLE_EVIDENCE_FILES
+        }
+        if not checksums:
+            raise ExecutionError(
+                "EVIDENCE_CHECKSUMS_MISSING",
+                "no stable execution evidence exists to bind into the run report",
+            )
+        return dict(sorted(checksums.items()))
+
+    @staticmethod
+    def _verify_evidence_checksums(
+        store: EvidenceStore, checksums: Mapping[str, str]
+    ) -> None:
+        for relative, expected in checksums.items():
+            path = store.path(relative)
+            if not path.is_file() or path.is_symlink() or sha256_file(path) != expected:
+                raise ExecutionError(
+                    "EVIDENCE_CHECKSUM_MISMATCH",
+                    f"recorded evidence changed before sealing: {relative}",
+                    evidence_path=relative,
+                )
 
     def execute(
         self,
@@ -1114,15 +1368,27 @@ class ExecutionOrchestrator:
             )
         )
         schema_command_runner = self._schema_command_runner or subprocess_adapter
+        detected_tool_versions = self._tool_versions(
+            profile,
+            composition.project,
+            subprocess_adapter,
+        )
         missing_tools = self._missing_required_tools(
             profile,
             registry_mode=model.registry["mode"],
+            tool_versions=detected_tool_versions,
         )
         source_revision = (
             self._source_revision_resolver(composition.project)
             if self._source_revision_resolver is not None
             else _default_source_revision(composition.project, subprocess_adapter)
         )
+        source_repository = (
+            self._source_repository_resolver(composition.project)
+            if self._source_repository_resolver is not None
+            else _default_source_repository(composition.project, subprocess_adapter)
+        )
+        workflow_identity = _workflow_identity(source_revision)
         store = EvidenceStore.create(
             composition.project,
             work_directory=options.work_directory,
@@ -1178,6 +1444,7 @@ class ExecutionOrchestrator:
                     status=StageStatus.PASSED,
                     start_time=static_time,
                     end_time=self._now(),
+                    tool="devops-stack-composer",
                 )
 
             dockerfile = self._write_build_inputs(store, composition)
@@ -1320,7 +1587,7 @@ class ExecutionOrchestrator:
                         oci_description=(
                             f"Build-once execution image for {model.application_name}"
                         ),
-                        oci_source=f"urn:devops-stack:git:{source_revision}",
+                        oci_source=source_repository,
                         oci_revision=source_revision,
                         oci_created=started_at,
                     )
@@ -1354,6 +1621,7 @@ class ExecutionOrchestrator:
                     source_revision=source_revision,
                     build_plan_hash=plan.build_plan_hash,
                     registry_endpoint=registry_endpoint,
+                    buildx_version=detected_tool_versions["docker-buildx"],
                 )
                 validate_artifact_contract(artifact)
                 build_executor.verify_tag_unchanged(
@@ -1385,9 +1653,28 @@ class ExecutionOrchestrator:
                         "https://github.com/k4nul/devops-stack-composer/"
                         "build-once/v0.2"
                     ),
+                    source_repository=source_repository,
+                    workflow_identity=workflow_identity,
+                    reproduction_command=(
+                        "devops-stack artifact verify --project . --run "
+                        f"{store.run_id}"
+                    ),
+                    tool_version=__version__,
                     build_started_on=build_started,
                     build_finished_on=build_finished,
                 )
+                generated_syft_version = _parsed_tool_version(
+                    supply_chain.sbom_generator
+                )
+                if (
+                    generated_syft_version != detected_tool_versions["syft"]
+                    or supply_chain.scanner_version
+                    != detected_tool_versions["trivy"]
+                ):
+                    raise ExecutionError(
+                        "TOOL_VERSION_MISMATCH",
+                        "SBOM or scanner evidence differs from the preflight tool version",
+                    )
                 store.write_json("supply-chain.json", supply_chain.to_dict())
                 stage_results["sbom"] = self._stage(
                     plan,
@@ -2035,10 +2322,7 @@ class ExecutionOrchestrator:
                 else StageStatus.FAILED
             )
         )
-        tool_versions = {"devops-stack-composer": __version__}
-        if supply_chain is not None:
-            tool_versions["syft"] = supply_chain.sbom_generator
-            tool_versions["trivy"] = supply_chain.scanner_version
+        evidence_checksums = self._evidence_checksums(store)
         run = ExecutionRun(
             run_id=store.run_id,
             project_path=".",
@@ -2050,12 +2334,29 @@ class ExecutionOrchestrator:
             execution_profile=profile.value,
             stage_results=ordered_stages,
             final_status=final_status,
-            tool_versions=tool_versions,
+            tool_versions=detected_tool_versions,
             artifact_record=artifact,
             supply_chain_evidence=supply_chain,
             deployment_evidence=deployment,
             failure_reason=failure_reason,
+            schema_version=(
+                LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION
+                if final_status == StageStatus.BLOCKED_MISSING_REQUIRED_TOOL
+                else EXECUTION_EVIDENCE_SCHEMA_VERSION
+            ),
+            source_repository=source_repository,
+            template_revisions={
+                key: composition.lock.pin(key).commit
+                for key in ("docker", "jenkins", "kubernetes")
+            },
+            evidence_checksums=evidence_checksums,
+            evidence_checksum_paths=(
+                ("SHA256SUMS", "checksums.json")
+                if canonical_bundle
+                else ("SHA256SUMS",)
+            ),
         )
+        self._verify_evidence_checksums(store, evidence_checksums)
         if canonical_bundle:
             assert progress is not None
             if final_status == StageStatus.PASSED:

@@ -25,6 +25,7 @@ from devops_stack_composer.evidence_bundle import verify_evidence_bundle
 from devops_stack_composer.execution_models import StageStatus, SupplyChainEvidence
 from devops_stack_composer.evidence_store import EvidenceStore
 from devops_stack_composer.execution_state import ExecutionJournal, ExecutionState
+from devops_stack_composer.filesystem import sha256_file
 from devops_stack_composer.kubernetes_execution import (
     HttpSmokeResult,
     KubernetesArtifactIdentity,
@@ -455,6 +456,7 @@ class ExecutionTests(unittest.TestCase):
         kubernetes_executor=None,
         schema_command_runner=None,
         tool_resolver=None,
+        tool_version_resolver=None,
         release_validator=None,
     ):
         return ExecutionOrchestrator(
@@ -473,7 +475,23 @@ class ExecutionTests(unittest.TestCase):
                 else {}
             ),
             tool_resolver=tool_resolver or (lambda name: f"/tools/{name}"),
+            tool_version_resolver=tool_version_resolver
+            or (
+                lambda name: {
+                    "docker": "28.3.3",
+                    "docker-buildx": "0.28.0",
+                    "syft": "1.51.1",
+                    "trivy": "0.74.0",
+                    "kind": "0.33.0",
+                    "kubectl": "1.36.4",
+                    "kubeconform": "0.8.0",
+                    "gh": "2.95.0",
+                }.get(name)
+            ),
             source_revision_resolver=lambda project: REVISION,
+            source_repository_resolver=(
+                lambda project: "https://github.com/k4nul/devops-stack-composer"
+            ),
             **(
                 {"release_validator": release_validator}
                 if release_validator is not None
@@ -485,6 +503,14 @@ class ExecutionTests(unittest.TestCase):
     @staticmethod
     def stage(result, stage_id: str):
         return next(stage for stage in result.run.stage_results if stage.stage_id == stage_id)
+
+    def test_execution_errors_are_actionable(self) -> None:
+        error = ExecutionError("REQUIRED_TOOL_MISSING", "docker-buildx is unavailable")
+
+        self.assertEqual(error.evidence_path, "execution-plan.json")
+        self.assertIn("evidence: execution-plan.json", str(error))
+        self.assertIn("devops-stack execute --project .", error.reproduction_command)
+        self.assertIn("reproduce:", str(error))
 
     def test_static_profile_closes_a_verifiable_run_without_external_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -508,6 +534,12 @@ class ExecutionTests(unittest.TestCase):
             self.assertIn("execution-evidence.json", checksums)
             self.assertIn("report.md", checksums)
             self.assertNotIn("SHA256SUMS", checksums)
+            self.assertTrue(result.run.evidence_checksums)
+            for relative, digest in result.run.evidence_checksums.items():
+                self.assertEqual(checksums[relative], digest)
+            report = result.store.path("report.md").read_text(encoding="utf-8")
+            self.assertIn("## Evidence checksums", report)
+            self.assertIn("inputs/Dockerfile", report)
             fresh = verify_execution_bundle(
                 project,
                 result.run.run_id,
@@ -535,6 +567,24 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(build.execute_count, 1)
             self.assertEqual(build.tag_checks, 2)
             self.assertEqual(result.run.artifact_record.manifest_digest, DIGEST)
+            self.assertEqual(result.run.artifact_record.created_by_tool_version, "0.28.0")
+            self.assertEqual(
+                set(result.run.tool_versions),
+                {
+                    "devops-stack-composer",
+                    "docker",
+                    "docker-buildx",
+                    "syft",
+                    "trivy",
+                },
+            )
+            self.assertTrue(
+                all(stage.command or stage.tool for stage in result.run.stage_results)
+            )
+            self.assertEqual(
+                result.run.evidence_checksums["artifact.json"],
+                sha256_file(result.store.path("artifact.json")),
+            )
             self.assertEqual(result.verification.authoritative_digest, DIGEST)
             self.assertEqual(
                 result.run.stage_results[-1].stage_id,
@@ -586,6 +636,9 @@ class ExecutionTests(unittest.TestCase):
                 result.run.final_status,
                 StageStatus.BLOCKED_MISSING_REQUIRED_TOOL,
             )
+            self.assertEqual(result.run.schema_version, "1.0.0")
+            self.assertNotIn("sourceRepository", result.run.to_dict())
+            self.assertNotIn("evidenceChecksums", result.run.to_dict())
             self.assertEqual(
                 self.stage(result, "registry-lifecycle").status,
                 StageStatus.BLOCKED_MISSING_REQUIRED_TOOL,
@@ -607,6 +660,39 @@ class ExecutionTests(unittest.TestCase):
             )
             self.assertFalse(result.bundle_verification.execution_succeeded)
             verify_evidence_bundle(result.store)
+
+    def test_missing_buildx_plugin_blocks_before_registry_or_build(self) -> None:
+        build = FakeBuildExecutor()
+        registry_factory = FakeRegistryFactory()
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.orchestrator(
+                build_executor=build,
+                supply_chain_generator=FakeSupplyChainGenerator(),
+                registry_factory=registry_factory,
+                tool_version_resolver=(
+                    lambda name: None
+                    if name == "docker-buildx"
+                    else {
+                        "docker": "28.3.3",
+                        "syft": "1.44.0",
+                        "trivy": "0.69.0",
+                    }.get(name)
+                ),
+            ).execute(
+                composition(Path(directory)),
+                ExecutionOptions(
+                    profile="supply-chain",
+                    run_id="20260830T120000Z-121212121212",
+                ),
+            )
+
+            self.assertEqual(
+                result.run.final_status,
+                StageStatus.BLOCKED_MISSING_REQUIRED_TOOL,
+            )
+            self.assertIn("docker-buildx", result.run.failure_reason)
+            self.assertEqual(registry_factory.calls, 0)
+            self.assertEqual(build.execute_count, 0)
 
     def test_kubernetes_failure_persists_diagnostics_and_truthful_stage_progress(self) -> None:
         registry_factory = FakeRegistryFactory()

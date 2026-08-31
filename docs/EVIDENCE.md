@@ -34,6 +34,21 @@ convenience files. Verification requires the JSON aliases and their compatibilit
 records to describe the same plan or run; both Markdown views must match the verified
 outcome.
 
+New execution records use evidence schema `1.1.0`. That version requires the source
+repository, exact Docker/Jenkins/Kubernetes template commits, profile tool versions,
+an invocation identity for every stage, declared limitations, and a non-empty
+`evidenceChecksums` map. Each map entry is the actual SHA-256 of stable primary
+evidence captured before the derived reports and seals are written, and offline
+verification cross-checks it against the closed inventory. `evidenceChecksumPaths`
+separately names the bundle-level checksum manifests. Exact schema `1.0.0` records
+remain readable as legacy evidence; adding 1.1-only fields to a record labeled 1.0 is
+rejected rather than silently changing that historical contract.
+
+The one generation exception is a preflight run blocked by an unavailable required
+tool. It uses the exact 1.0 field set because a truthful profile-complete
+`toolVersions` map cannot exist. Other failed runs remain schema 1.1 and must record
+the complete profile-appropriate tool inventory.
+
 ## Same-digest proof
 
 For each service, the verifier relates four independent observations:

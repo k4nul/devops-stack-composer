@@ -6,7 +6,9 @@ import unittest
 from devops_stack_composer.execution_models import (
     ArtifactIntent,
     DeploymentEvidence,
+    EXECUTION_EVIDENCE_SCHEMA_VERSION,
     ExecutionRun,
+    LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
     ResolvedArtifact,
     StageResult,
     StageStatus,
@@ -170,13 +172,30 @@ class ExecutionModelTests(unittest.TestCase):
             execution_profile="kind-e2e",
             stage_results=(passed,),
             final_status=StageStatus.PASSED,
-            tool_versions={"docker": "28.0.0", "kind": "0.30.0"},
+            tool_versions={
+                "devops-stack-composer": "0.2.0",
+                "docker": "28.0.0",
+                "docker-buildx": "0.24.0",
+                "syft": "1.30.0",
+                "trivy": "0.66.0",
+                "kind": "0.30.0",
+                "kubectl": "1.33.0",
+                "kubeconform": "0.7.0",
+            },
             artifact_record=artifact(),
             supply_chain_evidence=supply_chain(),
             deployment_evidence=deployment(),
+            source_repository="https://github.com/example/sample-app",
+            template_revisions={
+                "docker": "1" * 40,
+                "jenkins": "2" * 40,
+                "kubernetes": "3" * 40,
+            },
+            evidence_checksums={"artifact.json": "4" * 64},
         )
 
         value = json.loads(run.to_json())
+        self.assertEqual(value["schemaVersion"], EXECUTION_EVIDENCE_SCHEMA_VERSION)
         self.assertEqual(value["startTime"], "2026-08-30T00:00:00Z")
         self.assertEqual(value["artifact"]["buildInvocationCount"], 1)
         self.assertEqual(value["supplyChainEvidence"]["artifactDigest"], DIGEST)
@@ -203,6 +222,7 @@ class ExecutionModelTests(unittest.TestCase):
             "stage_results": (passed,),
             "final_status": StageStatus.PASSED,
             "tool_versions": {},
+            "schema_version": LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
         }
         with self.assertRaisesRegex(ValueError, "relative path"):
             ExecutionRun(**{**base, "project_path": "/home/alice/project"})
@@ -219,6 +239,115 @@ class ExecutionModelTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "cannot have final_status PASSED"):
             ExecutionRun(**{**base, "stage_results": (failed,)})
+
+    def test_legacy_run_preserves_the_exact_1_0_field_contract(self) -> None:
+        stage = StageResult(
+            "config-schema",
+            "Validate configuration",
+            StageStatus.PASSED,
+            "2026-08-30T00:00:00Z",
+            "2026-08-30T00:00:00Z",
+        )
+        value = ExecutionRun(
+            run_id="run-1",
+            project_path=".",
+            config_hash=HASH,
+            template_lock_hash="f" * 64,
+            source_revision=REVISION,
+            start_time="2026-08-30T00:00:00Z",
+            end_time="2026-08-30T00:00:01Z",
+            execution_profile="static",
+            stage_results=(stage,),
+            final_status=StageStatus.PASSED,
+            tool_versions={},
+            schema_version=LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+        ).to_dict()
+
+        self.assertEqual(value["schemaVersion"], "1.0.0")
+        self.assertNotIn("sourceRepository", value)
+        self.assertNotIn("templateRevisions", value)
+        self.assertNotIn("evidenceChecksums", value)
+        self.assertNotIn("evidenceChecksumPaths", value)
+        self.assertNotIn("limitations", value)
+
+    def test_current_run_requires_complete_metadata(self) -> None:
+        stage = StageResult(
+            "config-schema",
+            "Validate configuration",
+            StageStatus.PASSED,
+            "2026-08-30T00:00:00Z",
+            "2026-08-30T00:00:00Z",
+            tool="devops-stack-composer",
+        )
+        base = {
+            "run_id": "run-1",
+            "project_path": ".",
+            "config_hash": HASH,
+            "template_lock_hash": "f" * 64,
+            "source_revision": REVISION,
+            "start_time": "2026-08-30T00:00:00Z",
+            "end_time": "2026-08-30T00:00:01Z",
+            "execution_profile": "static",
+            "stage_results": (stage,),
+            "final_status": StageStatus.PASSED,
+            "tool_versions": {"devops-stack-composer": "0.2.0"},
+            "source_repository": "https://github.com/example/sample-app",
+            "template_revisions": {
+                "docker": "1" * 40,
+                "jenkins": "2" * 40,
+                "kubernetes": "3" * 40,
+            },
+            "evidence_checksums": {"config.json": "4" * 64},
+        }
+
+        ExecutionRun(**base)
+        with self.assertRaisesRegex(ValueError, "exactly docker"):
+            ExecutionRun(**{**base, "template_revisions": {"docker": "1" * 40}})
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            ExecutionRun(**{**base, "evidence_checksums": {}})
+        with self.assertRaisesRegex(ValueError, "missing required tools"):
+            ExecutionRun(**{**base, "tool_versions": {"docker": "28.0.0"}})
+        failed = StageResult(
+            "config-schema",
+            "Validate configuration",
+            StageStatus.FAILED,
+            "2026-08-30T00:00:00Z",
+            "2026-08-30T00:00:00Z",
+            tool="devops-stack-composer",
+            failure_reason="validation failed",
+        )
+        with self.assertRaisesRegex(ValueError, "missing required tools"):
+            ExecutionRun(
+                **{
+                    **base,
+                    "execution_profile": "release",
+                    "stage_results": (failed,),
+                    "final_status": StageStatus.FAILED,
+                    "failure_reason": "validation failed",
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "exact checksum manifests"):
+            ExecutionRun(
+                **{
+                    **base,
+                    "evidence_checksum_paths": ("inputs/Dockerfile",),
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "require a command or tool"):
+            ExecutionRun(
+                **{
+                    **base,
+                    "stage_results": (
+                        StageResult(
+                            "config-schema",
+                            "Validate configuration",
+                            StageStatus.PASSED,
+                            "2026-08-30T00:00:00Z",
+                            "2026-08-30T00:00:00Z",
+                        ),
+                    ),
+                }
+            )
 
 
 if __name__ == "__main__":

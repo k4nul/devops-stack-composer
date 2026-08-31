@@ -21,7 +21,9 @@ from devops_stack_composer.evidence_validation import (
 from devops_stack_composer.execution_models import (
     ArtifactIntent,
     DeploymentEvidence,
+    EXECUTION_EVIDENCE_SCHEMA_VERSION,
     ExecutionRun,
+    LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
     ResolvedArtifact,
     StageResult,
     StageStatus,
@@ -41,11 +43,24 @@ MAX_STAGE_COMMAND_ARGUMENTS = 128
 class RuntimeValidationError(DevOpsStackError):
     """A stable fail-closed error raised for invalid runtime evidence."""
 
-    def __init__(self, code: str, message: str, *, evidence_path: str | None = None):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        evidence_path: str | None = None,
+        reproduction_command: str = (
+            "devops-stack artifact verify --project . --run $RUN_ID"
+        ),
+    ):
         self.code = code
+        self.detail = message
         self.evidence_path = evidence_path
+        self.reproduction_command = reproduction_command
         suffix = f"; evidence: {evidence_path}" if evidence_path else ""
-        super().__init__(f"{code}: {message}{suffix}")
+        super().__init__(
+            f"{code}: {message}{suffix}; reproduce: {reproduction_command}"
+        )
 
 
 @dataclass(frozen=True)
@@ -344,6 +359,12 @@ def _stage(value: Mapping[str, Any]) -> StageResult:
 
 def _execution_run(value: Mapping[str, Any]) -> ExecutionRun:
     try:
+        schema_version = value["schemaVersion"]
+        if schema_version not in {
+            LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+            EXECUTION_EVIDENCE_SCHEMA_VERSION,
+        }:
+            raise ValueError(f"unsupported schemaVersion: {schema_version!r}")
         artifact_value = value["artifact"]
         supply_value = value["supplyChainEvidence"]
         deployment_value = value["deploymentEvidence"]
@@ -378,6 +399,16 @@ def _execution_run(value: Mapping[str, Any]) -> ExecutionRun:
                 else None
             ),
             failure_reason=value["failureReason"],
+            schema_version=schema_version,
+            source_repository=value.get(
+                "sourceRepository", "urn:devops-stack:source:unspecified"
+            ),
+            template_revisions=value.get("templateRevisions", {}),
+            evidence_checksums=value.get("evidenceChecksums", {}),
+            evidence_checksum_paths=tuple(
+                value.get("evidenceChecksumPaths", ("SHA256SUMS",))
+            ),
+            limitations=tuple(value.get("limitations", ("legacy schema 1.0 record",))),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeValidationError(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, TypeVar
@@ -26,7 +27,9 @@ from devops_stack_composer.evidence_validation import (
 from devops_stack_composer.execution_models import (
     ArtifactIntent,
     DeploymentEvidence,
+    EXECUTION_EVIDENCE_SCHEMA_VERSION,
     ExecutionRun,
+    LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
     ResolvedArtifact,
     StageResult,
     SupplyChainEvidence,
@@ -36,6 +39,7 @@ from devops_stack_composer.filesystem import contained_path, project_root
 from devops_stack_composer.oci import digest_from_subject, parse_digest
 from devops_stack_composer.policies import profile_policy
 from devops_stack_composer.supply_chain import (
+    PROVENANCE_VERIFICATION_COMMAND,
     SupplyChainError,
     verify_provenance_evidence,
     verify_sbom_evidence,
@@ -46,9 +50,24 @@ from devops_stack_composer.supply_chain import (
 class ExecutionBundleError(DevOpsStackError):
     """Raised when stored execution evidence is unsafe or contradictory."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        evidence_path: str | None = None,
+        reproduction_command: str = (
+            "devops-stack artifact verify --project . --run $RUN_ID"
+        ),
+    ):
         self.code = code
-        super().__init__(f"{code}: {message}")
+        self.detail = message
+        self.evidence_path = evidence_path
+        self.reproduction_command = reproduction_command
+        suffix = f"; evidence: {evidence_path}" if evidence_path else ""
+        super().__init__(
+            f"{code}: {message}{suffix}; reproduce: {reproduction_command}"
+        )
 
 
 @dataclass(frozen=True)
@@ -207,12 +226,25 @@ class ExecutionBundle:
         artifact = self.artifact
         if self.supply_chain is not None:
             evidence = self.supply_chain
+            legacy_run = (
+                self.execution_run is not None
+                and self.execution_run.schema_version
+                == LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION
+            )
+            source_repository = (
+                self.execution_run.source_repository
+                if self.execution_run is not None and not legacy_run
+                else None
+            )
             try:
                 generator = verify_sbom_evidence(
                     self.root,
                     evidence.sbom_path,
                     evidence.sbom_hash,
                     artifact.immutable_image_reference,
+                    require_source_metadata=not legacy_run,
+                    source_repository=source_repository,
+                    source_revision=(None if legacy_run else artifact.source_revision),
                 )
                 if generator != evidence.sbom_generator:
                     raise ExecutionBundleError(
@@ -232,6 +264,30 @@ class ExecutionBundle:
                     artifact.immutable_image_reference,
                     source_revision=artifact.source_revision,
                     build_plan_hash=artifact.build_plan_hash,
+                    source_repository=source_repository,
+                    verification_command=(
+                        None if legacy_run else PROVENANCE_VERIFICATION_COMMAND
+                    ),
+                    reproduction_command=(
+                        None
+                        if legacy_run
+                        else "devops-stack artifact verify --project . --run "
+                        f"{self.run_id}"
+                    ),
+                    generator_tool_name=(
+                        None if legacy_run else "devops-stack-composer"
+                    ),
+                    generator_tool_version=(
+                        None
+                        if legacy_run or self.execution_run is None
+                        else self.execution_run.tool_versions.get(
+                            "devops-stack-composer"
+                        )
+                    ),
+                    buildx_version=(
+                        None if legacy_run else artifact.created_by_tool_version
+                    ),
+                    require_verification_metadata=not legacy_run,
                 )
             except SupplyChainError as exc:
                 raise ExecutionBundleError(exc.code, str(exc)) from exc
@@ -300,7 +356,7 @@ _VERIFICATION_PATH = "verification.json"
 _EVIDENCE_RUN_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 
 
-def load_execution_bundle(
+def _load_execution_bundle(
     project: Path,
     run_id: str,
     *,
@@ -424,6 +480,42 @@ def load_execution_bundle(
     return bundle
 
 
+def _bundle_reproduction_command(
+    project: Path, run_id: str, work_directory: str
+) -> str:
+    return (
+        "devops-stack artifact verify"
+        f" --project {shlex.quote(str(Path(project).resolve()))}"
+        f" --run {shlex.quote(run_id)}"
+        f" --output {shlex.quote(work_directory)}"
+    )
+
+
+def load_execution_bundle(
+    project: Path,
+    run_id: str,
+    *,
+    work_directory: str = ".devops-stack/runs",
+) -> ExecutionBundle:
+    """Load a bundle and attach its exact offline reproduction command."""
+
+    try:
+        return _load_execution_bundle(
+            project,
+            run_id,
+            work_directory=work_directory,
+        )
+    except ExecutionBundleError as exc:
+        raise ExecutionBundleError(
+            exc.code,
+            exc.detail,
+            evidence_path=exc.evidence_path or "SHA256SUMS",
+            reproduction_command=_bundle_reproduction_command(
+                project, run_id, work_directory
+            ),
+        ) from exc
+
+
 def inspect_execution_bundle(
     project: Path,
     run_id: str,
@@ -443,11 +535,22 @@ def verify_execution_bundle(
     *,
     work_directory: str = ".devops-stack/runs",
 ) -> BundleVerification:
-    return load_execution_bundle(
-        project,
-        run_id,
-        work_directory=work_directory,
-    ).verify()
+    try:
+        return load_execution_bundle(
+            project,
+            run_id,
+            work_directory=work_directory,
+        ).verify()
+    except ExecutionBundleError as exc:
+        command = _bundle_reproduction_command(project, run_id, work_directory)
+        if exc.reproduction_command == command:
+            raise
+        raise ExecutionBundleError(
+            exc.code,
+            exc.detail,
+            evidence_path=exc.evidence_path or "SHA256SUMS",
+            reproduction_command=command,
+        ) from exc
 
 
 def parse_strict_json(
@@ -951,33 +1054,46 @@ def _parse_stage(value: Mapping[str, Any], source: str) -> StageResult:
 
 
 def _parse_execution_run(value: Mapping[str, Any], source: str) -> ExecutionRun:
-    _expect_keys(
-        value,
-        {
-            "schemaVersion",
-            "runId",
-            "projectPath",
-            "configHash",
-            "templateLockHash",
-            "sourceRevision",
-            "startTime",
-            "endTime",
-            "executionProfile",
-            "stageResults",
-            "statusCounts",
-            "artifact",
-            "supplyChainEvidence",
-            "deploymentEvidence",
-            "finalStatus",
-            "failureReason",
-            "toolVersions",
-        },
-        source,
-    )
-    if value["schemaVersion"] != "1.0.0":
+    legacy_fields = {
+        "schemaVersion",
+        "runId",
+        "projectPath",
+        "configHash",
+        "templateLockHash",
+        "sourceRevision",
+        "startTime",
+        "endTime",
+        "executionProfile",
+        "stageResults",
+        "statusCounts",
+        "artifact",
+        "supplyChainEvidence",
+        "deploymentEvidence",
+        "finalStatus",
+        "failureReason",
+        "toolVersions",
+    }
+    extension_fields = {
+        "sourceRepository",
+        "templateRevisions",
+        "evidenceChecksums",
+        "evidenceChecksumPaths",
+        "limitations",
+    }
+    schema_version = value.get("schemaVersion")
+    if schema_version == LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION:
+        expected_fields = legacy_fields
+    elif schema_version == EXECUTION_EVIDENCE_SCHEMA_VERSION:
+        expected_fields = legacy_fields | extension_fields
+    else:
         raise ExecutionBundleError(
             "BUNDLE_RECORD_INVALID", f"{source} has an unsupported schemaVersion"
         )
+    _expect_keys(
+        value,
+        expected_fields,
+        source,
+    )
     stages = tuple(
         _parse_stage(
             _mapping(item, f"{source}.stageResults[{index}]"),
@@ -1022,6 +1138,28 @@ def _parse_execution_run(value: Mapping[str, Any], source: str) -> ExecutionRun:
             else None
         ),
         failure_reason=value["failureReason"],
+        schema_version=schema_version,
+        source_repository=value.get(
+            "sourceRepository", "urn:devops-stack:source:unspecified"
+        ),
+        template_revisions=_mapping(
+            value.get("templateRevisions", {}), f"{source}.templateRevisions"
+        ),
+        evidence_checksums=_mapping(
+            value.get("evidenceChecksums", {}), f"{source}.evidenceChecksums"
+        ),
+        evidence_checksum_paths=tuple(
+            _list(
+                value.get("evidenceChecksumPaths", ["SHA256SUMS"]),
+                f"{source}.evidenceChecksumPaths",
+            )
+        ),
+        limitations=tuple(
+            _list(
+                value.get("limitations", ["legacy schema 1.0 record"]),
+                f"{source}.limitations",
+            )
+        ),
     )
     if record.to_dict() != dict(value):
         raise ExecutionBundleError(
@@ -1154,6 +1292,47 @@ def _verify_record_relationships(bundle: ExecutionBundle) -> None:
             )
 
     if run is not None:
+        if run.schema_version == EXECUTION_EVIDENCE_SCHEMA_VERSION:
+            expected_checksum_paths = (
+                ("SHA256SUMS", "checksums.json")
+                if "checksums.json" in bundle.checksums
+                else ("SHA256SUMS",)
+            )
+            if run.evidence_checksum_paths != expected_checksum_paths:
+                raise ExecutionBundleError(
+                    "BUNDLE_CHECKSUM_MANIFEST_MISMATCH",
+                    "reported checksum manifests do not match the bundle layout",
+                    evidence_path="report.json",
+                )
+            if "checksums.json" in run.evidence_checksum_paths:
+                from devops_stack_composer.evidence_bundle import (
+                    EvidenceBundleError,
+                    verify_evidence_bundle,
+                )
+
+                try:
+                    verify_evidence_bundle(bundle.store)
+                except EvidenceBundleError as exc:
+                    raise ExecutionBundleError(
+                        "BUNDLE_CHECKSUM_MANIFEST_MISMATCH",
+                        "checksums.json is not a valid canonical bundle manifest",
+                        evidence_path="checksums.json",
+                    ) from exc
+            for relative_path, expected_digest in run.evidence_checksums.items():
+                inventory_digest = bundle.checksums.get(relative_path)
+                if inventory_digest is None:
+                    raise ExecutionBundleError(
+                        "EVIDENCE_FILE_MISSING",
+                        "reported evidence checksum path is absent from SHA256SUMS: "
+                        f"{relative_path}",
+                    )
+                if inventory_digest != expected_digest:
+                    raise ExecutionBundleError(
+                        "EVIDENCE_CHECKSUM_MISMATCH",
+                        "reported evidence checksum differs from SHA256SUMS: "
+                        f"{relative_path}",
+                    )
+                _checked_bytes(bundle.store, bundle.checksums, relative_path)
         for stage in run.stage_results:
             for relative_path in stage.evidence_paths:
                 if relative_path not in bundle.checksums:

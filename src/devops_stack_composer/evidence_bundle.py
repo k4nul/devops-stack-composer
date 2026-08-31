@@ -8,12 +8,17 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 from typing import Any
 
 from devops_stack_composer.errors import UnsafePathError
 from devops_stack_composer.evidence_store import EvidenceStore, EvidenceStoreError
-from devops_stack_composer.execution_models import ExecutionRun
+from devops_stack_composer.execution_models import (
+    EXECUTION_EVIDENCE_SCHEMA_VERSION,
+    LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+    ExecutionRun,
+)
 from devops_stack_composer.execution_plan import ExecutionPlan
 from devops_stack_composer.execution_state import (
     ExecutionState,
@@ -24,6 +29,7 @@ from devops_stack_composer.filesystem import normalize_relative_path, sha256_fil
 from devops_stack_composer.policies import profile_policy
 from devops_stack_composer.report import redact_sensitive
 from devops_stack_composer.runtime_validation import (
+    RuntimeValidationError,
     RuntimeVerification,
     validate_runtime_records,
 )
@@ -34,7 +40,7 @@ MAX_BUNDLE_JSON_BYTES = 4 * 1024 * 1024
 MAX_EVIDENCE_LOG_BYTES = 1024 * 1024
 AUTHENTICITY_STATUS = "NOT_ESTABLISHED"
 
-_JSON_FILES = (
+_LEGACY_JSON_FILES = (
     "run.json",
     "plan.json",
     "state.json",
@@ -46,25 +52,44 @@ _JSON_FILES = (
     "smoke.json",
     "checksums.json",
 )
-REQUIRED_BUNDLE_FILES = frozenset((*_JSON_FILES, "summary.md"))
+_JSON_FILES = (
+    *_LEGACY_JSON_FILES,
+    "report.json",
+    "execution-plan.json",
+)
+LEGACY_REQUIRED_BUNDLE_FILES = frozenset((*_LEGACY_JSON_FILES, "summary.md"))
+REQUIRED_BUNDLE_FILES = frozenset((*_JSON_FILES, "summary.md", "report.md"))
 _ASSEMBLER_JSON_FILES = tuple(
     relative
     for relative in _JSON_FILES
     if relative not in {"state.json", "plan.json", "policy.json"}
 )
 _ASSEMBLER_FILES = frozenset(
-    (*_ASSEMBLER_JSON_FILES, "summary.md", "SHA256SUMS")
+    (*_ASSEMBLER_JSON_FILES, "summary.md", "report.md", "SHA256SUMS")
 )
 
 
 class EvidenceBundleError(EvidenceStoreError):
     """A stable error raised when a bundle is incomplete or inconsistent."""
 
-    def __init__(self, code: str, message: str, *, evidence_path: str | None = None):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        evidence_path: str | None = None,
+        reproduction_command: str = (
+            "devops-stack artifact verify --project . --run $RUN_ID"
+        ),
+    ):
         self.code = code
+        self.detail = message
         self.evidence_path = evidence_path
+        self.reproduction_command = reproduction_command
         suffix = f"; evidence: {evidence_path}" if evidence_path else ""
-        super().__init__(f"{code}: {message}{suffix}")
+        super().__init__(
+            f"{code}: {message}{suffix}; reproduce: {reproduction_command}"
+        )
 
 
 @dataclass(frozen=True)
@@ -356,7 +381,7 @@ def _derived_records(
             "health": deployment["healthEndpointResult"],
             "readiness": deployment["readinessEndpointResult"],
         }
-    return {
+    records = {
         "policy.json": {
             **base,
             "executionProfile": plan["profile"],
@@ -387,6 +412,14 @@ def _derived_records(
             **smoke,
         },
     }
+    if run["schemaVersion"] == EXECUTION_EVIDENCE_SCHEMA_VERSION:
+        records.update(
+            {
+                "execution-plan.json": dict(plan),
+                "report.json": dict(run),
+            }
+        )
+    return records
 
 
 def _summary(
@@ -412,6 +445,134 @@ def _summary(
             "",
         )
     )
+
+
+def _report(
+    plan: Mapping[str, Any],
+    run: Mapping[str, Any],
+    verification: RuntimeVerification,
+) -> str:
+    artifact = run["artifact"]
+    supply = run["supplyChainEvidence"]
+    deployment = run["deploymentEvidence"]
+    lines = [
+        "<!-- schemaVersion: 1.0.0 -->",
+        "# DevOps Stack Execution Report",
+        "",
+        f"Overall result: **{verification.final_status}**",
+        "",
+        f"- Run: `{verification.run_id}`",
+        f"- Project: `{run['sourceRepository']}` (`{run['projectPath']}`)",
+        f"- Source commit: `{run['sourceRevision']}`",
+        f"- Configuration hash: `{run['configHash']}`",
+        f"- Template lock hash: `{run['templateLockHash']}`",
+        f"- Build plan hash: `{verification.build_plan_hash}`",
+        f"- Execution profile: `{verification.profile}`",
+        f"- Environment: `{plan['environment']}`",
+        "",
+        "## Locked template revisions",
+        "",
+    ]
+    revisions = run["templateRevisions"]
+    if revisions:
+        lines.extend(
+            f"- {name}: `{revision}`" for name, revision in sorted(revisions.items())
+        )
+    else:
+        lines.append("- No template revisions were recorded")
+    lines.extend(["", "## Tool versions", ""])
+    lines.extend(
+        f"- {name}: `{version}`"
+        for name, version in sorted(run["toolVersions"].items())
+    )
+    lines.extend(["", "## Authoritative artifact", ""])
+    if artifact is None:
+        lines.extend(("- Build invocations: `0`", "- No image artifact was produced"))
+    else:
+        lines.extend(
+            (
+                f"- Build invocations: `{artifact['buildInvocationCount']}`",
+                f"- Repository: `{artifact['repository']}`",
+                f"- Informational tag: `{artifact['tag']}`",
+                f"- Authoritative digest: `{artifact['manifestDigest']}`",
+                f"- Platform digest: `{artifact['platformDigest']}`",
+                f"- Platform: `{artifact['operatingSystem']}/{artifact['architecture']}`",
+                f"- Config digest: `{artifact['configDigest']}`",
+            )
+        )
+    lines.extend(["", "## Supply-chain evidence", ""])
+    if supply is None:
+        lines.append("- No supply-chain evidence was produced")
+    else:
+        lines.extend(
+            (
+                f"- SBOM: `{supply['sbomPath']}` (`{supply['sbomHash']}`)",
+                f"- Scan: `{supply['vulnerabilityReportPath']}` (`{supply['vulnerabilityReportHash']}`)",
+                f"- Vulnerability policy passed: `{str(supply['policyResult'].get('passed') is True).lower()}`",
+                f"- Provenance: `{supply['provenancePath']}` (`{supply['provenanceHash']}`)",
+                f"- Provenance verification: `{supply['verificationStatus']}`",
+            )
+        )
+    lines.extend(["", "## Kubernetes evidence", ""])
+    if deployment is None:
+        lines.append("- No Kubernetes deployment evidence was produced")
+    else:
+        lines.extend(
+            (
+                f"- Environment: `{deployment['environment']}`",
+                f"- Namespace: `{deployment['namespace']}`",
+                f"- Deployed image: `{deployment['deployedImageReference']}`",
+                f"- Actual pod image ID: `{deployment['actualPodImageId']}`",
+                f"- Rollout: `{deployment['rolloutStatus']}`",
+                f"- Health: `{deployment['healthEndpointResult'].get('status')}`",
+                f"- Readiness: `{deployment['readinessEndpointResult'].get('status')}`",
+                f"- Rollback: `{deployment['rollbackResult']}`",
+                f"- Final digest: `{deployment['finalDigest']}`",
+            )
+        )
+    lines.extend(
+        (
+            "",
+            "## Artifact identity",
+            "",
+            (
+                f"All recorded subjects resolve to `{verification.authoritative_digest}`."
+                if verification.authoritative_digest is not None
+                else "No authoritative digest was produced."
+            ),
+            "",
+            "## Stage results",
+            "",
+            "| Stage | Status | Command or tool | Evidence |",
+            "| --- | --- | --- | --- |",
+        )
+    )
+    for stage in run["stageResults"]:
+        command = " ".join(stage["command"]) or stage["tool"] or "none"
+        evidence = ", ".join(f"`{path}`" for path in stage["evidencePaths"]) or "none"
+        lines.append(
+            f"| `{stage['stageId']}` | {stage['status']} | `{command}` | {evidence} |"
+        )
+    nonpassing = [stage for stage in run["stageResults"] if stage["status"] != "PASSED"]
+    lines.extend(["", "## Skipped, blocked, failed, or not-applicable stages", ""])
+    if nonpassing:
+        lines.extend(
+            f"- `{stage['stageId']}`: `{stage['status']}`" for stage in nonpassing
+        )
+    else:
+        lines.append("- None")
+    lines.extend(["", "## Evidence checksums", ""])
+    lines.extend(
+        f"- `{path}`: `{digest}`"
+        for path, digest in sorted(run["evidenceChecksums"].items())
+    )
+    lines.extend(["", "## Evidence checksum manifests", ""])
+    lines.extend(f"- `{path}`" for path in run["evidenceChecksumPaths"])
+    lines.extend(["", "## Limitations", ""])
+    lines.extend(f"- {limitation}" for limitation in run["limitations"])
+    if run["failureReason"] is not None:
+        lines.extend(["", "## Failure", "", run["failureReason"]])
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _checksum_entries(store: EvidenceStore) -> list[dict[str, str]]:
@@ -454,8 +615,25 @@ def _checksums_record(
     }
 
 
-def _verify_required_paths(inventory: Mapping[str, str]) -> None:
-    missing = sorted(REQUIRED_BUNDLE_FILES - set(inventory))
+def _bundle_layout(
+    run: Mapping[str, Any],
+) -> tuple[tuple[str, ...], frozenset[str]]:
+    schema_version = run.get("schemaVersion")
+    if schema_version == LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION:
+        return _LEGACY_JSON_FILES, LEGACY_REQUIRED_BUNDLE_FILES
+    if schema_version == EXECUTION_EVIDENCE_SCHEMA_VERSION:
+        return _JSON_FILES, REQUIRED_BUNDLE_FILES
+    raise EvidenceBundleError(
+        "BUNDLE_RECORD_INVALID",
+        f"run.json has an unsupported schemaVersion: {schema_version!r}",
+        evidence_path="run.json",
+    )
+
+
+def _verify_required_paths(
+    inventory: Mapping[str, str], required_files: frozenset[str]
+) -> None:
+    missing = sorted(required_files - set(inventory))
     if missing:
         raise EvidenceBundleError(
             "BUNDLE_REQUIRED_FILE_MISSING",
@@ -546,9 +724,11 @@ def _verify_declared_files(
 
 
 def _verify_allowed_paths(
-    inventory: Mapping[str, str], declared_paths: set[str]
+    inventory: Mapping[str, str],
+    declared_paths: set[str],
+    required_files: frozenset[str],
 ) -> None:
-    exact = set(REQUIRED_BUNDLE_FILES) | declared_paths | {"resources.json"}
+    exact = set(required_files) | declared_paths | {"resources.json"}
     unexpected = sorted(
         relative
         for relative in inventory
@@ -559,6 +739,44 @@ def _verify_allowed_paths(
             "BUNDLE_UNEXPECTED_FILE",
             "evidence bundle contains undeclared files: " + ", ".join(unexpected),
         )
+
+
+def _verify_reported_evidence_checksums(
+    run: Mapping[str, Any], inventory: Mapping[str, str]
+) -> set[str]:
+    recorded = run.get("evidenceChecksums")
+    if recorded is None:
+        return set()
+    if not isinstance(recorded, Mapping) or not recorded:
+        raise EvidenceBundleError(
+            "BUNDLE_EVIDENCE_CHECKSUMS_INVALID",
+            "execution evidenceChecksums must be a non-empty object",
+            evidence_path="run.json",
+        )
+    verified: set[str] = set()
+    for relative, expected in sorted(recorded.items()):
+        if not isinstance(relative, str) or not isinstance(expected, str):
+            raise EvidenceBundleError(
+                "BUNDLE_EVIDENCE_CHECKSUMS_INVALID",
+                "execution evidenceChecksums entries must be string pairs",
+                evidence_path="run.json",
+            )
+        try:
+            normalized = normalize_relative_path(relative)
+        except UnsafePathError as exc:
+            raise EvidenceBundleError(
+                "BUNDLE_DECLARED_PATH_INVALID",
+                f"execution evidenceChecksums declares an unsafe path: {relative!r}",
+                evidence_path="run.json",
+            ) from exc
+        if inventory.get(normalized) != expected:
+            raise EvidenceBundleError(
+                "BUNDLE_EVIDENCE_CHECKSUM_MISMATCH",
+                f"execution evidence checksum differs for {normalized}",
+                evidence_path=normalized,
+            )
+        verified.add(normalized)
+    return verified
 
 
 def _verify_resource_record(
@@ -664,6 +882,17 @@ def assemble_evidence_bundle(
     _require_redacted(plan_record, label="plan.json")
     _require_redacted(run_record, label="run.json")
     verification = validate_runtime_records(plan_record, run_record)
+    _, required_files = _bundle_layout(run_record)
+    if (
+        run_record["schemaVersion"] == EXECUTION_EVIDENCE_SCHEMA_VERSION
+        and run_record["evidenceChecksumPaths"]
+        != ["SHA256SUMS", "checksums.json"]
+    ):
+        raise EvidenceBundleError(
+            "BUNDLE_CHECKSUM_MANIFEST_MISMATCH",
+            "canonical schema 1.1 evidence must name both checksum manifests",
+            evidence_path="run.json",
+        )
     if verification.run_id != store.run_id:
         raise EvidenceBundleError(
             "BUNDLE_RUN_ID_MISMATCH",
@@ -730,12 +959,14 @@ def assemble_evidence_bundle(
             overwrite=relative == "policy.json" and policy_path.exists(),
         )
     store.write_text("summary.md", _summary(plan_record, verification))
+    if "report.md" in required_files:
+        store.write_text("report.md", _report(plan_record, run_record, verification))
 
     _write_seals(store, plan_record, run_record, verification, overwrite=False)
     return verify_evidence_bundle(store)
 
 
-def verify_evidence_bundle(store: EvidenceStore) -> EvidenceBundleVerification:
+def _verify_evidence_bundle(store: EvidenceStore) -> EvidenceBundleVerification:
     """Verify closed-file integrity and all offline semantic cross-links."""
 
     if not isinstance(store, EvidenceStore):
@@ -744,10 +975,13 @@ def verify_evidence_bundle(store: EvidenceStore) -> EvidenceBundleVerification:
         inventory = store.verify_checksums()
     except EvidenceStoreError as exc:
         raise EvidenceBundleError("BUNDLE_INTEGRITY_INVALID", str(exc)) from exc
-    _verify_required_paths(inventory)
+    _verify_required_paths(inventory, frozenset({"run.json"}))
+    run = _read_json(store, "run.json", inventory["run.json"])
+    json_files, required_files = _bundle_layout(run)
+    _verify_required_paths(inventory, required_files)
     records = {
         relative: _read_json(store, relative, inventory[relative])
-        for relative in _JSON_FILES
+        for relative in json_files
     }
     plan = records["plan.json"]
     run = records["run.json"]
@@ -756,6 +990,15 @@ def verify_evidence_bundle(store: EvidenceStore) -> EvidenceBundleVerification:
     _require_redacted(run, label="run.json")
     _require_redacted(state, label="state.json")
     verification = validate_runtime_records(plan, run)
+    if (
+        run["schemaVersion"] == EXECUTION_EVIDENCE_SCHEMA_VERSION
+        and run["evidenceChecksumPaths"] != ["SHA256SUMS", "checksums.json"]
+    ):
+        raise EvidenceBundleError(
+            "BUNDLE_CHECKSUM_MANIFEST_MISMATCH",
+            "canonical schema 1.1 evidence must name both checksum manifests",
+            evidence_path="run.json",
+        )
     if verification.run_id != store.run_id:
         raise EvidenceBundleError(
             "BUNDLE_RUN_ID_MISMATCH",
@@ -804,9 +1047,29 @@ def verify_evidence_bundle(store: EvidenceStore) -> EvidenceBundleVerification:
             evidence_path="summary.md",
         )
 
+    if "report.md" in required_files:
+        report_payload = _read_regular_file(
+            store.path("report.md"),
+            maximum=MAX_BUNDLE_JSON_BYTES,
+            label="report.md",
+        )
+        if hashlib.sha256(report_payload).hexdigest() != inventory["report.md"]:
+            raise EvidenceBundleError(
+                "BUNDLE_FILE_CHANGED",
+                "report.md changed while it was being verified",
+                evidence_path="report.md",
+            )
+        if report_payload != _report(plan, run, verification).encode("utf-8"):
+            raise EvidenceBundleError(
+                "BUNDLE_CROSS_RECORD_MISMATCH",
+                "report.md does not match the verified execution record",
+                evidence_path="report.md",
+            )
+
     _verify_resource_record(store, inventory)
     declared_paths = _verify_declared_files(run, inventory)
-    _verify_allowed_paths(inventory, declared_paths)
+    declared_paths.update(_verify_reported_evidence_checksums(run, inventory))
+    _verify_allowed_paths(inventory, declared_paths, required_files)
     _verify_log_redaction(store, inventory)
     try:
         final_inventory = store.verify_checksums()
@@ -827,6 +1090,36 @@ def verify_evidence_bundle(store: EvidenceStore) -> EvidenceBundleVerification:
         artifact_digest=(artifact["manifestDigest"] if artifact is not None else None),
         material_file_count=len(inventory),
     )
+
+
+def verify_evidence_bundle(store: EvidenceStore) -> EvidenceBundleVerification:
+    """Verify a canonical bundle and attach an exact reproduction command."""
+
+    if not isinstance(store, EvidenceStore):
+        raise TypeError("store must be an EvidenceStore")
+    output = Path(store.relative_root).parent.as_posix()
+    command = (
+        "devops-stack evidence verify"
+        f" --project {shlex.quote(str(store.project))}"
+        f" --run {shlex.quote(store.run_id)}"
+        f" --output {shlex.quote(output)}"
+    )
+    try:
+        return _verify_evidence_bundle(store)
+    except EvidenceBundleError as exc:
+        raise EvidenceBundleError(
+            exc.code,
+            exc.detail,
+            evidence_path=exc.evidence_path or "SHA256SUMS",
+            reproduction_command=command,
+        ) from exc
+    except RuntimeValidationError as exc:
+        raise EvidenceBundleError(
+            exc.code,
+            exc.detail,
+            evidence_path=exc.evidence_path or "run.json",
+            reproduction_command=command,
+        ) from exc
 
 
 def update_sealed_resource_record(
@@ -907,6 +1200,7 @@ __all__ = [
     "EvidenceBundleVerification",
     "MAX_BUNDLE_JSON_BYTES",
     "MAX_EVIDENCE_LOG_BYTES",
+    "LEGACY_REQUIRED_BUNDLE_FILES",
     "REQUIRED_BUNDLE_FILES",
     "assemble_evidence_bundle",
     "update_sealed_resource_record",

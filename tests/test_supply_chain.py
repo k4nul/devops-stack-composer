@@ -9,6 +9,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
+from devops_stack_composer import __version__
 from devops_stack_composer.evidence_validation import (
     validate_provenance_subject,
     validate_sbom_subject,
@@ -20,7 +21,12 @@ from devops_stack_composer.filesystem import sha256_file
 from devops_stack_composer.policies import VulnerabilityPolicy
 from devops_stack_composer.supply_chain import (
     CHECKSUM_ONLY_VERIFICATION_STATUS,
+    DEFAULT_REPRODUCTION_COMMAND,
     FILE_ONLY_EXTENSION,
+    PROVENANCE_VERIFICATION_COMMAND,
+    PROVENANCE_VERIFICATION_RESULT,
+    SOURCE_REPOSITORY_ANNOTATION_PREFIX,
+    SOURCE_REVISION_ANNOTATION_PREFIX,
     SUBJECT_ANNOTATION_PREFIX,
     SupplyChainError,
     SupplyChainGenerator,
@@ -197,6 +203,14 @@ class SupplyChainTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.run_root = Path(self.temporary.name)
 
+    def test_supply_chain_errors_are_actionable(self) -> None:
+        error = SupplyChainError("MALFORMED_PROVENANCE", "missing source metadata")
+
+        self.assertEqual(error.evidence_path, "artifact.json")
+        self.assertIn("evidence: artifact.json", str(error))
+        self.assertIn("devops-stack artifact verify", error.reproduction_command)
+        self.assertIn("reproduce:", str(error))
+
     def generate(
         self,
         runner: FixtureRunner | None = None,
@@ -212,6 +226,7 @@ class SupplyChainTests(unittest.TestCase):
             artifact=artifact(),
             policy=policy or VulnerabilityPolicy(),
             builder_id="https://ci.example/builders/local",
+            source_repository="https://github.com/k4nul/devops-stack-composer",
             build_started_on="2026-08-30T01:00:00Z",
             build_finished_on="2026-08-30T01:01:00Z",
         )
@@ -259,10 +274,19 @@ class SupplyChainTests(unittest.TestCase):
             {
                 "annotationDate": "2026-08-30T01:02:03Z",
                 "annotationType": "OTHER",
-                "annotator": "Tool: devops-stack-composer-0.2.0",
+                "annotator": f"Tool: devops-stack-composer-{__version__}",
                 "comment": SUBJECT_ANNOTATION_PREFIX + REFERENCE,
             },
             sbom["annotations"],
+        )
+        self.assertIn(
+            SOURCE_REPOSITORY_ANNOTATION_PREFIX
+            + "https://github.com/k4nul/devops-stack-composer",
+            {annotation["comment"] for annotation in sbom["annotations"]},
+        )
+        self.assertIn(
+            SOURCE_REVISION_ANNOTATION_PREFIX + REVISION,
+            {annotation["comment"] for annotation in sbom["annotations"]},
         )
         validate_sbom_subject(sbom, immutable_reference=REFERENCE)
         validate_scan_subject(
@@ -276,7 +300,19 @@ class SupplyChainTests(unittest.TestCase):
             {
                 "artifactReference": REFERENCE,
                 "buildPlanHash": PLAN_HASH,
+                "sourceRepository": "https://github.com/k4nul/devops-stack-composer",
                 "sourceRevision": REVISION,
+                "verificationCommand": PROVENANCE_VERIFICATION_COMMAND,
+                "verificationResult": PROVENANCE_VERIFICATION_RESULT,
+                "reproductionCommand": DEFAULT_REPRODUCTION_COMMAND,
+                "workflowIdentity": "https://ci.example/builders/local",
+            },
+        )
+        self.assertEqual(
+            provenance["predicate"]["runDetails"]["builder"]["version"],
+            {
+                "devops-stack-composer": __version__,
+                "docker-buildx": "0.2.0",
             },
         )
         file_evidence = provenance["predicate"][FILE_ONLY_EXTENSION]
@@ -286,6 +322,15 @@ class SupplyChainTests(unittest.TestCase):
         self.assertFalse(file_evidence["attachedToRegistry"])
         self.assertFalse(file_evidence["cryptographicallyVerified"])
         self.assertFalse(file_evidence["checksumIsSignature"])
+        self.assertEqual(
+            file_evidence["verificationCommand"], PROVENANCE_VERIFICATION_COMMAND
+        )
+        self.assertEqual(
+            file_evidence["verificationResult"], PROVENANCE_VERIFICATION_RESULT
+        )
+        self.assertEqual(
+            file_evidence["reproductionCommand"], DEFAULT_REPRODUCTION_COMMAND
+        )
         self.assertNotIn("signatures", provenance)
         validate_provenance_subject(
             provenance,
@@ -448,6 +493,27 @@ class SupplyChainTests(unittest.TestCase):
                 evidence.vulnerability_report_path,
                 tampered_hash,
                 REFERENCE,
+            )
+
+    def test_rehashed_sbom_source_tampering_is_still_detected(self) -> None:
+        _, evidence = self.generate()
+        sbom = json.loads((self.run_root / evidence.sbom_path).read_text())
+        source = next(
+            annotation
+            for annotation in sbom["annotations"]
+            if annotation["comment"].startswith(SOURCE_REPOSITORY_ANNOTATION_PREFIX)
+        )
+        source["comment"] = SOURCE_REPOSITORY_ANNOTATION_PREFIX + "https://example.invalid/other"
+        tampered_hash = self.rewrite_json(evidence.sbom_path, sbom)
+
+        with self.assertRaisesRegex(SupplyChainError, "SBOM_SOURCE_MISMATCH"):
+            verify_sbom_evidence(
+                self.run_root,
+                evidence.sbom_path,
+                tampered_hash,
+                REFERENCE,
+                source_repository="https://github.com/k4nul/devops-stack-composer",
+                source_revision=REVISION,
             )
 
     def test_rehashed_provenance_subject_tampering_is_still_detected(self) -> None:

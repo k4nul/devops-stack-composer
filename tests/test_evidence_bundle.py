@@ -11,6 +11,7 @@ from devops_stack_composer.evidence_bundle import (
     AUTHENTICITY_STATUS,
     BUNDLE_SCHEMA_VERSION,
     EvidenceBundleError,
+    LEGACY_REQUIRED_BUNDLE_FILES,
     REQUIRED_BUNDLE_FILES,
     assemble_evidence_bundle,
     update_sealed_resource_record,
@@ -19,7 +20,9 @@ from devops_stack_composer.evidence_bundle import (
 from devops_stack_composer.evidence_store import EvidenceStore, EvidenceStoreError
 from devops_stack_composer.execution_models import (
     ArtifactIntent,
+    EXECUTION_EVIDENCE_SCHEMA_VERSION,
     ExecutionRun,
+    LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
     StageResult,
     StageStatus,
 )
@@ -45,6 +48,8 @@ RUN_ID = "20260830T120000Z-abcdef123456"
 OTHER_RUN_ID = "20260830T120001Z-123456abcdef"
 TIMESTAMP = "2026-08-30T12:00:00Z"
 SOURCE_REVISION = "a" * 40
+RAW_EVIDENCE = "FROM scratch\n"
+RAW_EVIDENCE_HASH = hashlib.sha256(RAW_EVIDENCE.encode("utf-8")).hexdigest()
 
 
 def execution_plan(*, run_id: str = RUN_ID) -> ExecutionPlan:
@@ -108,7 +113,15 @@ def execution_run(
         stage_results=tuple(stages),
         final_status=final_status,
         failure_reason="injected failure" if failed_stage else None,
-        tool_versions={"devops-stack": "0.2.0"},
+        tool_versions={"devops-stack-composer": "0.2.0"},
+        source_repository="https://github.com/example/sample-app",
+        template_revisions={
+            "docker": "b" * 40,
+            "jenkins": "c" * 40,
+            "kubernetes": "d" * 40,
+        },
+        evidence_checksums={"inputs/Dockerfile": RAW_EVIDENCE_HASH},
+        evidence_checksum_paths=("SHA256SUMS", "checksums.json"),
     )
 
 
@@ -121,6 +134,11 @@ def load_json(path: Path) -> dict[str, object]:
 def write_terminal_state(
     store: EvidenceStore, plan: ExecutionPlan, run: ExecutionRun
 ) -> None:
+    if (
+        run.schema_version == EXECUTION_EVIDENCE_SCHEMA_VERSION
+        and not store.path("inputs/Dockerfile").is_file()
+    ):
+        store.write_text("inputs/Dockerfile", RAW_EVIDENCE)
     machine = ExecutionStateMachine()
     if run.final_status == StageStatus.PASSED:
         states = (
@@ -253,9 +271,16 @@ class EvidenceBundleTests(unittest.TestCase):
         self.assertFalse(result.incomplete)
         self.assertFalse(result.authenticity_established)
         self.assertEqual(result.to_dict()["authenticity"], AUTHENTICITY_STATUS)
-        for relative in REQUIRED_BUNDLE_FILES - {"summary.md"}:
+        for relative in REQUIRED_BUNDLE_FILES - {"summary.md", "report.md"}:
             value = load_json(store.path(relative))
-            self.assertEqual(value["schemaVersion"], BUNDLE_SCHEMA_VERSION)
+            self.assertEqual(
+                value["schemaVersion"],
+                (
+                    EXECUTION_EVIDENCE_SCHEMA_VERSION
+                    if relative in {"run.json", "report.json"}
+                    else BUNDLE_SCHEMA_VERSION
+                ),
+            )
             expected = json.dumps(
                 value,
                 indent=2,
@@ -269,6 +294,71 @@ class EvidenceBundleTests(unittest.TestCase):
         summary = store.path("summary.md").read_text(encoding="utf-8")
         self.assertIn("schemaVersion: 1.0.0", summary)
         self.assertIn("Authenticity: **not established**", summary)
+        self.assertEqual(
+            load_json(store.path("execution-plan.json")),
+            load_json(store.path("plan.json")),
+        )
+        self.assertEqual(
+            load_json(store.path("report.json")),
+            load_json(store.path("run.json")),
+        )
+        report = store.path("report.md").read_text(encoding="utf-8")
+        for expected in (
+            "Project:",
+            "Source commit:",
+            "Configuration hash:",
+            "Locked template revisions",
+            "Tool versions",
+            "Build invocations",
+            "Supply-chain evidence",
+            "Kubernetes evidence",
+            "Stage results",
+            "Evidence checksums",
+            "Evidence checksum manifests",
+            "Limitations",
+        ):
+            self.assertIn(expected, report)
+
+    def test_legacy_run_assembles_and_verifies_with_the_exact_1_0_layout(self) -> None:
+        store = self.store()
+        plan = execution_plan()
+        current = execution_run(plan)
+        run = ExecutionRun(
+            **{
+                **current.__dict__,
+                "schema_version": LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+                "evidence_checksums": {},
+                "evidence_checksum_paths": ("SHA256SUMS",),
+            }
+        )
+
+        result = assemble(store, plan, run)
+        inventory = store.verify_checksums()
+
+        self.assertEqual(set(inventory), LEGACY_REQUIRED_BUNDLE_FILES)
+        self.assertNotIn("execution-plan.json", inventory)
+        self.assertNotIn("report.json", inventory)
+        self.assertNotIn("report.md", inventory)
+        self.assertEqual(verify_evidence_bundle(store), result)
+
+    def test_current_bundle_requires_both_canonical_checksum_manifests(self) -> None:
+        store = self.store()
+        plan = execution_plan()
+        current = execution_run(plan)
+        run = ExecutionRun(
+            **{
+                **current.__dict__,
+                "evidence_checksum_paths": ("SHA256SUMS",),
+            }
+        )
+        write_terminal_state(store, plan, run)
+
+        with self.assertRaisesRegex(
+            EvidenceBundleError, "BUNDLE_CHECKSUM_MANIFEST_MISMATCH"
+        ):
+            assemble_evidence_bundle(store, plan, run)
+
+        self.assertFalse(store.path("run.json").exists())
 
     def test_partial_failure_is_valid_but_never_successful(self) -> None:
         store = self.store()
@@ -355,8 +445,17 @@ class EvidenceBundleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             EvidenceBundleError, "BUNDLE_REQUIRED_FILE_MISSING"
-        ):
+        ) as caught:
             verify_evidence_bundle(store)
+
+        self.assertEqual(caught.exception.evidence_path, "SHA256SUMS")
+        self.assertIn(str(self.project), caught.exception.reproduction_command)
+        self.assertIn(f"--run {RUN_ID}", caught.exception.reproduction_command)
+        self.assertIn(
+            "--output .devops-stack/runs",
+            caught.exception.reproduction_command,
+        )
+        self.assertNotIn("$RUN_ID", caught.exception.reproduction_command)
 
     def test_resealed_undeclared_file_is_still_unexpected(self) -> None:
         store, _, _ = self.assembled()
@@ -374,6 +473,16 @@ class EvidenceBundleTests(unittest.TestCase):
         store.write_checksums(overwrite=True)
 
         with self.assertRaisesRegex(EvidenceBundleError, "BUNDLE_MANIFEST_MISMATCH"):
+            verify_evidence_bundle(store)
+
+    def test_reported_evidence_checksum_survives_manifest_reseal(self) -> None:
+        store, _, _ = self.assembled()
+        store.write_text("inputs/Dockerfile", "FROM busybox\n", overwrite=True)
+        reseal(store)
+
+        with self.assertRaisesRegex(
+            EvidenceBundleError, "BUNDLE_EVIDENCE_CHECKSUM_MISMATCH"
+        ):
             verify_evidence_bundle(store)
 
     def test_authorized_resource_update_reseals_and_reverifies(self) -> None:

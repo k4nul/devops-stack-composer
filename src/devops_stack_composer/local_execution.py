@@ -10,6 +10,7 @@ from devops_stack_composer.evidence_store import EvidenceStore
 from devops_stack_composer.execution_models import (
     DeploymentEvidence,
     ExecutionRun,
+    LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
     ResolvedArtifact,
     StageResult,
     StageStatus,
@@ -378,6 +379,7 @@ class LocalKindOrchestrator:
             supply_chain_evidence=products.supply_chain,
             deployment_evidence=products.deployment,
             failure_reason=failure_reason,
+            schema_version=LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
         )
 
     def _passed_stage(

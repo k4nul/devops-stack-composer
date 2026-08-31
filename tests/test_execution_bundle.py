@@ -30,6 +30,8 @@ from devops_stack_composer.execution_plan import ExecutionPlan
 from devops_stack_composer.filesystem import sha256_file
 from devops_stack_composer.supply_chain import (
     CHECKSUM_ONLY_VERIFICATION_STATUS,
+    SOURCE_REPOSITORY_ANNOTATION_PREFIX,
+    SOURCE_REVISION_ANNOTATION_PREFIX,
     SUBJECT_ANNOTATION_PREFIX,
     create_provenance_statement,
 )
@@ -40,6 +42,7 @@ CONFIG_DIGEST = "sha256:" + "c" * 64
 SOURCE_REVISION = "d" * 40
 REFERENCE = f"localhost:5000/team/app@{DIGEST}"
 RUN_ID = "20260830T120000Z-abcdef123456"
+SOURCE_REPOSITORY = "https://github.com/example/team-app"
 
 
 def _spdx(reference: str = REFERENCE) -> dict[str, object]:
@@ -65,6 +68,18 @@ def _spdx(reference: str = REFERENCE) -> dict[str, object]:
             }
         ],
         "annotations": [
+            {
+                "annotationDate": "2026-08-30T12:00:00Z",
+                "annotationType": "OTHER",
+                "annotator": "Tool: devops-stack-composer-0.2.0",
+                "comment": SOURCE_REPOSITORY_ANNOTATION_PREFIX + SOURCE_REPOSITORY,
+            },
+            {
+                "annotationDate": "2026-08-30T12:00:00Z",
+                "annotationType": "OTHER",
+                "annotator": "Tool: devops-stack-composer-0.2.0",
+                "comment": SOURCE_REVISION_ANNOTATION_PREFIX + SOURCE_REVISION,
+            },
             {
                 "annotationDate": "2026-08-30T12:00:00Z",
                 "annotationType": "OTHER",
@@ -133,7 +148,12 @@ class BundleFixture:
                 self.artifact,
                 builder_id="https://ci.example.invalid/builders/offline-test",
                 tool_name="devops-stack-composer",
+                tool_version="0.2.0",
                 generated_at="2026-08-30T12:00:00Z",
+                source_repository=SOURCE_REPOSITORY,
+                reproduction_command=(
+                    f"devops-stack artifact verify --project . --run {RUN_ID}"
+                ),
             ),
         )
         self.supply_chain = SupplyChainEvidence(
@@ -206,6 +226,7 @@ class BundleFixture:
                 status=StageStatus.PASSED,
                 start_time="2026-08-30T12:00:00Z",
                 end_time="2026-08-30T12:00:01Z",
+                tool="devops-stack-composer",
                 evidence_paths=("artifact.json",)
                 if stage.stage_id == "build-once"
                 else (),
@@ -223,10 +244,30 @@ class BundleFixture:
             execution_profile="kind-e2e",
             stage_results=stages,
             final_status=StageStatus.PASSED,
-            tool_versions={"docker": "29.1.5", "kind": "0.33.0"},
+            tool_versions={
+                "devops-stack-composer": "0.2.0",
+                "docker": "29.1.5",
+                "docker-buildx": "0.2.0",
+                "syft": "1.44.0",
+                "trivy": "0.69.0",
+                "kind": "0.33.0",
+                "kubectl": "1.33.0",
+                "kubeconform": "0.7.0",
+            },
             artifact_record=self.artifact,
             supply_chain_evidence=self.supply_chain,
             deployment_evidence=self.deployment,
+            source_repository=SOURCE_REPOSITORY,
+            template_revisions={
+                "docker": "1" * 40,
+                "jenkins": "2" * 40,
+                "kubernetes": "3" * 40,
+            },
+            evidence_checksums={
+                "sbom.spdx.json": sha256_file(
+                    self.store.path("sbom.spdx.json")
+                )
+            },
         )
         self.verification = validate_artifact_contract(
             self.artifact,
@@ -286,8 +327,17 @@ class ExecutionBundleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ExecutionBundleError, "BUNDLE_CHECKSUM_INVALID.*checksum mismatch"
-        ):
+        ) as caught:
             load_execution_bundle(self.project, RUN_ID)
+
+        self.assertEqual(caught.exception.evidence_path, "SHA256SUMS")
+        self.assertIn(str(self.project), caught.exception.reproduction_command)
+        self.assertIn(f"--run {RUN_ID}", caught.exception.reproduction_command)
+        self.assertIn(
+            "--output .devops-stack/runs",
+            caught.exception.reproduction_command,
+        )
+        self.assertNotIn("$RUN_ID", caught.exception.reproduction_command)
 
     def test_rehashed_sbom_subject_mismatch_still_fails_semantically(self) -> None:
         self.fixture.rewrite_json(
@@ -299,6 +349,7 @@ class ExecutionBundleTests(unittest.TestCase):
         self.fixture.rewrite_json("supply-chain.json", supply)
         report = self.fixture.read_json("report.json")
         report["supplyChainEvidence"]["sbomHash"] = supply["sbomHash"]
+        report["evidenceChecksums"]["sbom.spdx.json"] = supply["sbomHash"]
         self.fixture.rewrite_json("report.json", report)
         self.fixture.reseal()
 
@@ -355,6 +406,116 @@ class ExecutionBundleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ExecutionBundleError, "inventory mismatch"):
             load_execution_bundle(self.project, RUN_ID)
+
+    def test_reported_evidence_checksums_must_match_closed_inventory(self) -> None:
+        report = self.fixture.read_json("report.json")
+        report["evidenceChecksums"]["sbom.spdx.json"] = "b" * 64
+        self.fixture.rewrite_json("report.json", report)
+        self.fixture.reseal()
+
+        with self.assertRaisesRegex(
+            ExecutionBundleError, "EVIDENCE_CHECKSUM_MISMATCH"
+        ):
+            load_execution_bundle(self.project, RUN_ID)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = BundleFixture(Path(directory))
+            report = fixture.read_json("report.json")
+            report["evidenceChecksums"] = {"logs/missing.log": "b" * 64}
+            fixture.rewrite_json("report.json", report)
+            fixture.reseal()
+            with self.assertRaisesRegex(ExecutionBundleError, "EVIDENCE_FILE_MISSING"):
+                load_execution_bundle(Path(directory), RUN_ID)
+
+    def test_reported_checksum_manifests_must_match_the_bundle_layout(self) -> None:
+        report = self.fixture.read_json("report.json")
+        report["evidenceChecksumPaths"] = ["SHA256SUMS", "checksums.json"]
+        self.fixture.rewrite_json("report.json", report)
+        self.fixture.reseal()
+
+        with self.assertRaisesRegex(
+            ExecutionBundleError, "BUNDLE_CHECKSUM_MANIFEST_MISMATCH"
+        ):
+            load_execution_bundle(self.project, RUN_ID)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = BundleFixture(Path(directory))
+            fixture.store.write_json("checksums.json", {"not": "a manifest"})
+            report = fixture.read_json("report.json")
+            report["evidenceChecksumPaths"] = ["SHA256SUMS", "checksums.json"]
+            fixture.rewrite_json("report.json", report)
+            fixture.reseal()
+            with self.assertRaisesRegex(
+                ExecutionBundleError, "BUNDLE_CHECKSUM_MANIFEST_MISMATCH"
+            ):
+                load_execution_bundle(Path(directory), RUN_ID)
+
+    def test_legacy_1_0_bundle_uses_legacy_supply_chain_contracts(self) -> None:
+        sbom = self.fixture.read_json("sbom.spdx.json")
+        sbom["annotations"] = [
+            annotation
+            for annotation in sbom["annotations"]
+            if not annotation["comment"].startswith(
+                (SOURCE_REPOSITORY_ANNOTATION_PREFIX, SOURCE_REVISION_ANNOTATION_PREFIX)
+            )
+        ]
+        self.fixture.rewrite_json("sbom.spdx.json", sbom)
+
+        provenance = self.fixture.read_json("provenance.json")
+        predicate = provenance["predicate"]
+        external = predicate["buildDefinition"]["externalParameters"]
+        for field in (
+            "sourceRepository",
+            "workflowIdentity",
+            "verificationCommand",
+            "verificationResult",
+            "reproductionCommand",
+        ):
+            external.pop(field)
+        source_dependency = predicate["buildDefinition"]["resolvedDependencies"][0]
+        source_dependency.pop("uri")
+        predicate["runDetails"]["builder"]["version"] = {
+            "devops-stack-composer": "0.2.0"
+        }
+        extension = predicate["devopsStack_fileEvidence"]
+        for field in (
+            "verificationCommand",
+            "verificationResult",
+            "reproductionCommand",
+        ):
+            extension.pop(field)
+        self.fixture.rewrite_json("provenance.json", provenance)
+
+        supply = self.fixture.read_json("supply-chain.json")
+        supply["sbomHash"] = sha256_file(self.fixture.store.path("sbom.spdx.json"))
+        supply["provenanceHash"] = sha256_file(
+            self.fixture.store.path("provenance.json")
+        )
+        self.fixture.rewrite_json("supply-chain.json", supply)
+
+        report = self.fixture.read_json("report.json")
+        report["schemaVersion"] = "1.0.0"
+        for field in (
+            "sourceRepository",
+            "templateRevisions",
+            "evidenceChecksums",
+            "evidenceChecksumPaths",
+            "limitations",
+        ):
+            report.pop(field)
+        report["toolVersions"] = {}
+        for stage in report["stageResults"]:
+            stage["command"] = []
+            stage["tool"] = None
+        report["supplyChainEvidence"] = supply
+        self.fixture.rewrite_json("report.json", report)
+        self.fixture.reseal()
+
+        bundle = load_execution_bundle(self.project, RUN_ID)
+        verification = bundle.verify()
+
+        self.assertEqual(bundle.execution_run.schema_version, "1.0.0")
+        self.assertTrue(verification.passed)
 
     def test_duplicate_record_and_stored_verification_disagreements_fail(self) -> None:
         report = self.fixture.read_json("report.json")

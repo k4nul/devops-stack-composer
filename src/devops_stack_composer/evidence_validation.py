@@ -20,6 +20,12 @@ from devops_stack_composer.oci import (
     parse_oci_reference,
     require_same_digest,
 )
+from devops_stack_composer.supply_chain import (
+    DEFAULT_REPRODUCTION_COMMAND,
+    SupplyChainError,
+    validate_provenance_statement,
+    validate_spdx_document,
+)
 
 
 _INDEX_MEDIA_TYPES = frozenset(
@@ -33,11 +39,21 @@ _INDEX_MEDIA_TYPES = frozenset(
 class ArtifactContractError(DevOpsStackError):
     """A stable artifact-identity violation with an actionable evidence location."""
 
-    def __init__(self, code: str, message: str, *, evidence_path: str | None = None):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        evidence_path: str | None = None,
+        reproduction_command: str = DEFAULT_REPRODUCTION_COMMAND,
+    ):
         self.code = code
         self.evidence_path = evidence_path
+        self.reproduction_command = reproduction_command
         suffix = f"; evidence: {evidence_path}" if evidence_path else ""
-        super().__init__(f"{code}: {message}{suffix}")
+        super().__init__(
+            f"{code}: {message}{suffix}; reproduce: {reproduction_command}"
+        )
 
 
 @dataclass(frozen=True)
@@ -65,27 +81,37 @@ def _same_digest(subjects: Mapping[str, str], *, code: str, evidence_path: str) 
         raise ArtifactContractError(code, str(exc), evidence_path=evidence_path) from exc
 
 
-def validate_sbom_subject(
-    document: Mapping[str, Any],
-    *,
-    immutable_reference: str,
+def _supply_chain_message(error: SupplyChainError) -> str:
+    message = str(error).removeprefix(f"{error.code}: ")
+    return message.split("; evidence: ", 1)[0]
+
+
+def _validate_legacy_sbom_subject(
+    document: Mapping[str, Any], immutable_reference: str
 ) -> None:
     if document.get("spdxVersion") != "SPDX-2.3":
         raise ArtifactContractError(
-            "SBOM_INVALID", "SBOM must be SPDX 2.3 JSON", evidence_path="sbom.spdx.json"
+            "SBOM_INVALID",
+            "SBOM must be SPDX 2.3 JSON",
+            evidence_path="sbom.spdx.json",
         )
     creation = document.get("creationInfo")
     creators = creation.get("creators") if isinstance(creation, Mapping) else None
     if not isinstance(creators, list) or not any(
-        isinstance(value, str) and value.startswith("Tool: syft-") for value in creators
+        isinstance(value, str) and value.startswith("Tool: syft-")
+        for value in creators
     ):
         raise ArtifactContractError(
-            "SBOM_INVALID", "SBOM does not identify Syft as its generator", evidence_path="sbom.spdx.json"
+            "SBOM_INVALID",
+            "SBOM does not identify Syft as its generator",
+            evidence_path="sbom.spdx.json",
         )
     packages = document.get("packages")
     if not isinstance(packages, list) or not packages:
         raise ArtifactContractError(
-            "SBOM_INVALID", "SBOM package inventory is empty", evidence_path="sbom.spdx.json"
+            "SBOM_INVALID",
+            "SBOM package inventory is empty",
+            evidence_path="sbom.spdx.json",
         )
     annotations = document.get("annotations")
     expected = f"devops-stack.io/subject={immutable_reference}"
@@ -100,6 +126,42 @@ def validate_sbom_subject(
             "SBOM must contain one exact composer subject annotation",
             evidence_path="sbom.spdx.json",
         )
+
+
+def validate_sbom_subject(
+    document: Mapping[str, Any],
+    *,
+    immutable_reference: str,
+    source_repository: str | None = None,
+    source_revision: str | None = None,
+    require_source_metadata: bool = False,
+) -> None:
+    """Validate the complete SPDX document and its source/subject bindings.
+
+    The alternate and Jenkins verification paths intentionally share the same
+    validator as locally generated evidence.  This keeps source identity and
+    provenance requirements from becoming weaker when evidence is verified
+    outside an execution bundle.
+    """
+
+    if not require_source_metadata and source_repository is None and source_revision is None:
+        _validate_legacy_sbom_subject(document, immutable_reference)
+        return
+    try:
+        validate_spdx_document(
+            document,
+            immutable_reference,
+            source_repository=source_repository,
+            source_revision=source_revision,
+            require_source_metadata=require_source_metadata,
+        )
+    except SupplyChainError as exc:
+        code = "SBOM_INVALID" if exc.code == "MALFORMED_SBOM" else exc.code
+        raise ArtifactContractError(
+            code,
+            _supply_chain_message(exc),
+            evidence_path="sbom.spdx.json",
+        ) from exc
 
 
 def validate_scan_subject(
@@ -142,48 +204,105 @@ def validate_provenance_subject(
     *,
     repository: str,
     expected_digest: str,
+    source_repository: str | None = None,
+    source_revision: str | None = None,
+    workflow_identity: str | None = None,
+    build_plan_hash: str | None = None,
+    verification_command: str | None = None,
+    reproduction_command: str | None = None,
+    generator_tool_name: str | None = None,
+    generator_tool_version: str | None = None,
+    buildx_version: str | None = None,
+    require_verification_metadata: bool = False,
 ) -> None:
-    if statement.get("_type") != "https://in-toto.io/Statement/v1":
+    """Validate the complete SLSA file-evidence statement and source bindings."""
+
+    strict_metadata = require_verification_metadata or any(
+        value is not None
+        for value in (
+            source_repository,
+            source_revision,
+            workflow_identity,
+            build_plan_hash,
+            verification_command,
+            reproduction_command,
+            generator_tool_name,
+            generator_tool_version,
+            buildx_version,
+        )
+    )
+    if not strict_metadata:
+        if statement.get("_type") != "https://in-toto.io/Statement/v1":
+            raise ArtifactContractError(
+                "PROVENANCE_INVALID",
+                "provenance must be an in-toto Statement v1",
+                evidence_path="provenance.json",
+            )
+        if statement.get("predicateType") != "https://slsa.dev/provenance/v1":
+            raise ArtifactContractError(
+                "PROVENANCE_INVALID",
+                "provenance must use the SLSA v1 predicate",
+                evidence_path="provenance.json",
+            )
+        subjects = statement.get("subject")
+        if not isinstance(subjects, list) or len(subjects) != 1:
+            raise ArtifactContractError(
+                "PROVENANCE_SUBJECT_MISMATCH",
+                "provenance must contain exactly one subject",
+                evidence_path="provenance.json",
+            )
+        subject = subjects[0]
+        digest = subject.get("digest") if isinstance(subject, Mapping) else None
+        sha256 = digest.get("sha256") if isinstance(digest, Mapping) else None
+        name = subject.get("name") if isinstance(subject, Mapping) else None
+        if name != repository or not isinstance(sha256, str):
+            raise ArtifactContractError(
+                "PROVENANCE_SUBJECT_MISMATCH",
+                "provenance subject name or SHA-256 is missing",
+                evidence_path="provenance.json",
+            )
+        received = f"sha256:{sha256}"
+        if received != expected_digest:
+            raise ArtifactContractError(
+                "PROVENANCE_SUBJECT_MISMATCH",
+                f"provenance subject is {received}, expected {expected_digest}",
+                evidence_path="provenance.json",
+            )
+        if not isinstance(statement.get("predicate"), Mapping):
+            raise ArtifactContractError(
+                "PROVENANCE_INVALID",
+                "provenance predicate is missing",
+                evidence_path="provenance.json",
+            )
+        return
+
+    immutable_reference = f"{repository}@{expected_digest}"
+    try:
+        validate_provenance_statement(
+            statement,
+            immutable_reference,
+            source_repository=source_repository,
+            source_revision=source_revision,
+            workflow_identity=workflow_identity,
+            build_plan_hash=build_plan_hash,
+            verification_command=verification_command,
+            reproduction_command=reproduction_command,
+            generator_tool_name=generator_tool_name,
+            generator_tool_version=generator_tool_version,
+            buildx_version=buildx_version,
+            require_verification_metadata=require_verification_metadata,
+        )
+    except SupplyChainError as exc:
+        code = (
+            "PROVENANCE_INVALID"
+            if exc.code == "MALFORMED_PROVENANCE"
+            else exc.code
+        )
         raise ArtifactContractError(
-            "PROVENANCE_INVALID",
-            "provenance must be an in-toto Statement v1",
+            code,
+            _supply_chain_message(exc),
             evidence_path="provenance.json",
-        )
-    if statement.get("predicateType") != "https://slsa.dev/provenance/v1":
-        raise ArtifactContractError(
-            "PROVENANCE_INVALID",
-            "provenance must use the SLSA v1 predicate",
-            evidence_path="provenance.json",
-        )
-    subjects = statement.get("subject")
-    if not isinstance(subjects, list) or len(subjects) != 1:
-        raise ArtifactContractError(
-            "PROVENANCE_SUBJECT_MISMATCH",
-            "provenance must contain exactly one subject",
-            evidence_path="provenance.json",
-        )
-    subject = subjects[0]
-    subject_digest = subject.get("digest") if isinstance(subject, Mapping) else None
-    sha256 = subject_digest.get("sha256") if isinstance(subject_digest, Mapping) else None
-    name = subject.get("name") if isinstance(subject, Mapping) else None
-    if name != repository or not isinstance(sha256, str):
-        raise ArtifactContractError(
-            "PROVENANCE_SUBJECT_MISMATCH",
-            "provenance subject name or SHA-256 is missing",
-            evidence_path="provenance.json",
-        )
-    received = f"sha256:{sha256}"
-    if received != expected_digest:
-        raise ArtifactContractError(
-            "PROVENANCE_SUBJECT_MISMATCH",
-            f"provenance subject is {received}, expected {expected_digest}",
-            evidence_path="provenance.json",
-        )
-    predicate = statement.get("predicate")
-    if not isinstance(predicate, Mapping):
-        raise ArtifactContractError(
-            "PROVENANCE_INVALID", "provenance predicate is missing", evidence_path="provenance.json"
-        )
+        ) from exc
 
 
 def _pod_specs(document: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:

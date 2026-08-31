@@ -9,6 +9,7 @@ import json
 from pathlib import PurePosixPath
 import re
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from devops_stack_composer.oci import (
     digest_from_image_id,
@@ -27,6 +28,50 @@ _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _PLATFORM = re.compile(r"^[a-z0-9]+/[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)?$")
 _TOOL_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[+.-][A-Za-z0-9.-]+)?$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+EXECUTION_EVIDENCE_SCHEMA_VERSION = "1.1.0"
+LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION = "1.0.0"
+
+EXECUTION_LIMITATIONS = (
+    "Local provenance is unsigned, unattached file evidence; its SHA-256 checksum is not a signature.",
+    "kind records local Kubernetes behavior only and is not production-cluster certification.",
+    "Vulnerability results reflect the recorded scanner database and do not prove absence of vulnerabilities.",
+    "The generated Jenkins pipeline is statically validated; no Jenkins controller executed it in v0.2.",
+)
+
+_TEMPLATE_REVISION_NAMES = frozenset({"docker", "jenkins", "kubernetes"})
+_REQUIRED_TOOL_VERSIONS = {
+    "static": frozenset({"devops-stack-composer"}),
+    "supply-chain": frozenset(
+        {"devops-stack-composer", "docker", "docker-buildx", "syft", "trivy"}
+    ),
+    "kind-e2e": frozenset(
+        {
+            "devops-stack-composer",
+            "docker",
+            "docker-buildx",
+            "syft",
+            "trivy",
+            "kind",
+            "kubectl",
+            "kubeconform",
+        }
+    ),
+    "release": frozenset(
+        {
+            "devops-stack-composer",
+            "docker",
+            "docker-buildx",
+            "syft",
+            "trivy",
+            "kind",
+            "kubectl",
+            "kubeconform",
+            "gh",
+        }
+    ),
+}
 
 
 def _nonempty(name: str, value: str) -> str:
@@ -508,14 +553,76 @@ class ExecutionRun:
     supply_chain_evidence: SupplyChainEvidence | None = None
     deployment_evidence: DeploymentEvidence | None = None
     failure_reason: str | None = None
+    schema_version: str = EXECUTION_EVIDENCE_SCHEMA_VERSION
+    source_repository: str = "urn:devops-stack:source:unspecified"
+    template_revisions: Mapping[str, str] = field(default_factory=dict)
+    evidence_checksums: Mapping[str, str] = field(default_factory=dict)
+    evidence_checksum_paths: tuple[str, ...] = ("SHA256SUMS",)
+    limitations: tuple[str, ...] = EXECUTION_LIMITATIONS
 
     def __post_init__(self) -> None:
         if not isinstance(self.run_id, str) or not _RUN_ID.fullmatch(self.run_id):
             raise ValueError("run_id must use safe filename characters")
+        if self.schema_version not in {
+            LEGACY_EXECUTION_EVIDENCE_SCHEMA_VERSION,
+            EXECUTION_EVIDENCE_SCHEMA_VERSION,
+        }:
+            raise ValueError("schema_version must be 1.0.0 or 1.1.0")
         _relative_path("project_path", self.project_path, allow_dot=True)
         validate_sha256_hex(self.config_hash)
         validate_sha256_hex(self.template_lock_hash)
         _git_revision("source_revision", self.source_revision)
+        source_repository = _nonempty("source_repository", self.source_repository)
+        parsed_repository = urlsplit(source_repository)
+        if (
+            not parsed_repository.scheme
+            or parsed_repository.username is not None
+            or parsed_repository.password is not None
+        ):
+            raise ValueError("source_repository must be an absolute URI without userinfo")
+        revisions = _string_mapping("template_revisions", self.template_revisions)
+        for name, revision in revisions.items():
+            _identifier("template revision name", name)
+            _git_revision(f"template revision {name}", revision)
+        if (
+            self.schema_version == EXECUTION_EVIDENCE_SCHEMA_VERSION
+            and set(revisions) != _TEMPLATE_REVISION_NAMES
+        ):
+            raise ValueError(
+                "template_revisions must contain exactly docker, jenkins, and kubernetes"
+            )
+        object.__setattr__(self, "template_revisions", revisions)
+        evidence_checksums = _string_mapping(
+            "evidence_checksums", self.evidence_checksums
+        )
+        for path, digest in evidence_checksums.items():
+            _relative_path("evidence checksum path", path)
+            if not _SHA256.fullmatch(digest):
+                raise ValueError("evidence checksum values must be SHA-256 digests")
+        if (
+            self.schema_version == EXECUTION_EVIDENCE_SCHEMA_VERSION
+            and not evidence_checksums
+        ):
+            raise ValueError("evidence_checksums must not be empty")
+        object.__setattr__(self, "evidence_checksums", evidence_checksums)
+        checksum_paths = tuple(
+            _relative_path("evidence_checksum_path", path)
+            for path in self.evidence_checksum_paths
+        )
+        if not checksum_paths or len(set(checksum_paths)) != len(checksum_paths):
+            raise ValueError("evidence_checksum_paths must contain unique paths")
+        if self.schema_version == EXECUTION_EVIDENCE_SCHEMA_VERSION and checksum_paths not in {
+            ("SHA256SUMS",),
+            ("SHA256SUMS", "checksums.json"),
+        }:
+            raise ValueError(
+                "evidence_checksum_paths must identify the exact checksum manifests"
+            )
+        object.__setattr__(self, "evidence_checksum_paths", checksum_paths)
+        limitations = tuple(_nonempty("limitation", value) for value in self.limitations)
+        if not limitations or len(set(limitations)) != len(limitations):
+            raise ValueError("limitations must contain unique values")
+        object.__setattr__(self, "limitations", limitations)
         start = _timestamp("start_time", self.start_time)
         end = _timestamp("end_time", self.end_time)
         if datetime.fromisoformat(end.replace("Z", "+00:00")) < datetime.fromisoformat(
@@ -546,6 +653,30 @@ class ExecutionRun:
             "tool_versions",
             _string_mapping("tool_versions", self.tool_versions),
         )
+        if self.schema_version == EXECUTION_EVIDENCE_SCHEMA_VERSION:
+            for name, version in self.tool_versions.items():
+                _nonempty(f"tool version {name}", version)
+            required_tools = _REQUIRED_TOOL_VERSIONS.get(self.execution_profile)
+            if required_tools is None:
+                raise ValueError(
+                    "execution_profile must be static, supply-chain, kind-e2e, or release"
+                )
+            missing_tools = sorted(required_tools - set(self.tool_versions))
+            if missing_tools:
+                raise ValueError(
+                    "tool_versions is missing required tools: "
+                    + ", ".join(missing_tools)
+                )
+            stages_without_invocation = tuple(
+                stage.stage_id
+                for stage in stages
+                if not stage.command and stage.tool is None
+            )
+            if stages_without_invocation:
+                raise ValueError(
+                    "schema 1.1 stages require a command or tool: "
+                    + ", ".join(stages_without_invocation)
+                )
         blocking = {
             StageStatus.FAILED,
             StageStatus.BLOCKED_MISSING_REQUIRED_TOOL,
@@ -565,8 +696,8 @@ class ExecutionRun:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "schemaVersion": "1.0.0",
+        value: dict[str, Any] = {
+            "schemaVersion": self.schema_version,
             "runId": self.run_id,
             "projectPath": self.project_path,
             "configHash": self.config_hash,
@@ -588,6 +719,17 @@ class ExecutionRun:
             "failureReason": self.failure_reason,
             "toolVersions": dict(self.tool_versions),
         }
+        if self.schema_version == EXECUTION_EVIDENCE_SCHEMA_VERSION:
+            value.update(
+                {
+                    "sourceRepository": self.source_repository,
+                    "templateRevisions": dict(self.template_revisions),
+                    "evidenceChecksums": dict(self.evidence_checksums),
+                    "evidenceChecksumPaths": list(self.evidence_checksum_paths),
+                    "limitations": list(self.limitations),
+                }
+            )
+        return value
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2, sort_keys=True, allow_nan=False) + "\n"

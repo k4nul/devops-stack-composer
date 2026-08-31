@@ -166,6 +166,7 @@ def execution_run() -> ExecutionRun:
         status=StageStatus.NOT_APPLICABLE,
         start_time="2026-08-30T00:00:01Z",
         end_time="2026-08-30T00:00:01Z",
+        tool="devops-stack-composer",
     )
     return ExecutionRun(
         run_id="20260830T000000Z-012345abcdef",
@@ -178,10 +179,26 @@ def execution_run() -> ExecutionRun:
         execution_profile="kind-e2e",
         stage_results=(passed, not_applicable),
         final_status=StageStatus.PASSED,
-        tool_versions={"docker": "28.0.0", "kind": "0.30.0"},
+        tool_versions={
+            "devops-stack-composer": "0.2.0",
+            "docker": "28.0.0",
+            "docker-buildx": "0.24.0",
+            "syft": "1.30.0",
+            "trivy": "0.66.0",
+            "kind": "0.30.0",
+            "kubectl": "1.33.0",
+            "kubeconform": "0.7.0",
+        },
         artifact_record=resolved_artifact(),
         supply_chain_evidence=supply_chain_evidence(),
         deployment_evidence=deployment_evidence(),
+        source_repository="https://github.com/example/sample-app",
+        template_revisions={
+            "docker": "7" * 40,
+            "jenkins": "8" * 40,
+            "kubernetes": "9" * 40,
+        },
+        evidence_checksums={"artifact.json": "a" * 64},
     )
 
 
@@ -264,6 +281,63 @@ class RuntimeSchemaTests(unittest.TestCase):
             target["unexpected"] = True  # type: ignore[index]
             with self.subTest(record="execution-evidence", path=path):
                 self.assert_invalid(self.evidence_validator, value)
+
+    def test_execution_evidence_1_1_extensions_are_required_and_strict(self) -> None:
+        required_extensions = (
+            "sourceRepository",
+            "templateRevisions",
+            "evidenceChecksums",
+            "evidenceChecksumPaths",
+            "limitations",
+        )
+        for field in required_extensions:
+            value = execution_run().to_dict()
+            value.pop(field)
+            with self.subTest(missing=field):
+                self.assert_invalid(self.evidence_validator, value)
+
+        mutations = (
+            ("templateRevisions", {"docker": "7" * 40}),
+            (
+                "templateRevisions",
+                {
+                    "docker": "7" * 40,
+                    "jenkins": "8" * 40,
+                    "kubernetes": "9" * 40,
+                    "extra": "a" * 40,
+                },
+            ),
+            ("evidenceChecksums", {}),
+            ("evidenceChecksumPaths", ["inputs/Dockerfile"]),
+            ("toolVersions", {"devops-stack-composer": ""}),
+            ("toolVersions", {"devops-stack-composer": "0.2.0"}),
+            ("executionProfile", "custom"),
+        )
+        for field, replacement in mutations:
+            value = execution_run().to_dict()
+            value[field] = replacement
+            with self.subTest(field=field, replacement=replacement):
+                self.assert_invalid(self.evidence_validator, value)
+
+    def test_execution_evidence_1_0_remains_exactly_backward_compatible(self) -> None:
+        value = execution_run().to_dict()
+        value["schemaVersion"] = "1.0.0"
+        for field in (
+            "sourceRepository",
+            "templateRevisions",
+            "evidenceChecksums",
+            "evidenceChecksumPaths",
+            "limitations",
+        ):
+            value.pop(field)
+        value["toolVersions"] = {}
+        value["stageResults"][0]["command"] = []
+        value["stageResults"][0]["tool"] = None
+
+        self.evidence_validator.validate(value)
+
+        value["limitations"] = ["not part of schema 1.0"]
+        self.assert_invalid(self.evidence_validator, value)
 
     def test_tampered_status_hash_git_path_and_time_values_are_rejected(self) -> None:
         mutations = (

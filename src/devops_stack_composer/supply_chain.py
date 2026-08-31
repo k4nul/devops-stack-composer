@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from devops_stack_composer import __version__
 from devops_stack_composer.errors import (
     DevOpsStackError,
     GeneratedFileConflictError,
@@ -47,9 +48,18 @@ IN_TOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 SLSA_PROVENANCE_TYPE = "https://slsa.dev/provenance/v1"
 BUILD_TYPE = "https://github.com/k4nul/devops-stack-composer/build-types/build-once/v0.2"
 SUBJECT_ANNOTATION_PREFIX = "devops-stack.io/subject="
+SOURCE_REPOSITORY_ANNOTATION_PREFIX = "devops-stack.io/source-repository="
+SOURCE_REVISION_ANNOTATION_PREFIX = "devops-stack.io/source-revision="
 FILE_ONLY_EXTENSION = "devopsStack_fileEvidence"
 CHECKSUM_ONLY_VERIFICATION_STATUS = (
     "CHECKSUM_ONLY_FILE_EVIDENCE:signature=false,attachment=false,crypto=false"
+)
+PROVENANCE_VERIFICATION_COMMAND = (
+    "devops_stack_composer.supply_chain.validate_provenance_statement"
+)
+PROVENANCE_VERIFICATION_RESULT = "PASSED"
+DEFAULT_REPRODUCTION_COMMAND = (
+    "devops-stack artifact verify --project . --run $RUN_ID"
 )
 
 _GIT_REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -59,6 +69,8 @@ _RFC3339 = re.compile(
     r"(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$"
 )
 _SYFT_CREATOR = re.compile(r"^Tool: syft-(\S+)$")
+_RUN_ID = re.compile(r"^(?:\$RUN_ID|[A-Za-z0-9][A-Za-z0-9._-]{0,127})$")
+_EVIDENCE_COMMAND_PATH = re.compile(r"^[A-Za-z0-9_./-]+$")
 _MAX_TOOL_JSON_BYTES = 64 * 1024 * 1024
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -68,9 +80,21 @@ Clock = Callable[[], datetime]
 class SupplyChainError(DevOpsStackError):
     """Raised when generated supply-chain evidence is invalid or mismatched."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        evidence_path: str = "artifact.json",
+        reproduction_command: str = DEFAULT_REPRODUCTION_COMMAND,
+    ):
         self.code = code
-        super().__init__(f"{code}: {message}")
+        self.evidence_path = evidence_path
+        self.reproduction_command = reproduction_command
+        super().__init__(
+            f"{code}: {message}; evidence: {evidence_path}; "
+            f"reproduce: {reproduction_command}"
+        )
 
 
 def _required_text(name: str, value: Any, *, code: str) -> str:
@@ -91,6 +115,46 @@ def _required_uri(name: str, value: Any, *, code: str) -> str:
     parsed = urlsplit(value)
     if not parsed.scheme or parsed.username is not None or parsed.password is not None:
         raise SupplyChainError(code, f"{name} must be an absolute URI without userinfo")
+    return value
+
+
+def _required_reproduction_command(value: Any, *, code: str) -> str:
+    value = _required_text("provenance reproduction command", value, code=code)
+    arguments = value.split(" ")
+    if arguments[:3] != ["devops-stack", "artifact", "verify"]:
+        raise SupplyChainError(
+            code,
+            "provenance reproductionCommand must be a bounded artifact verify command",
+        )
+    arguments = arguments[3:]
+    if arguments[:2] == ["--project", "."]:
+        arguments = arguments[2:]
+    valid = len(arguments) == 2 and arguments[0] == "--run" and bool(
+        _RUN_ID.fullmatch(arguments[1])
+    )
+    if not valid and 4 <= len(arguments) <= 8 and len(arguments) % 2 == 0:
+        flags = arguments[::2]
+        ordered_flags = ["--artifact", "--sbom", "--scan", "--provenance"]
+        valid = (
+            flags[0] == "--artifact"
+            and flags[-1] == "--provenance"
+            and len(flags) == len(set(flags))
+            and flags == [flag for flag in ordered_flags if flag in flags]
+        )
+        for path in arguments[1::2]:
+            if not _EVIDENCE_COMMAND_PATH.fullmatch(path):
+                valid = False
+                break
+            try:
+                normalize_relative_path(path)
+            except (DevOpsStackError, ValueError):
+                valid = False
+                break
+    if not valid:
+        raise SupplyChainError(
+            code,
+            "provenance reproductionCommand must be a bounded artifact verify command",
+        )
     return value
 
 
@@ -225,6 +289,9 @@ def validate_spdx_document(
     immutable_image_reference: str,
     *,
     require_subject_annotation: bool = True,
+    require_source_metadata: bool = True,
+    source_repository: str | None = None,
+    source_revision: str | None = None,
 ) -> str:
     """Validate the required SPDX 2.3 structure and exact OCI subject binding.
 
@@ -296,16 +363,72 @@ def validate_spdx_document(
     validated_annotations = [
         _validate_spdx_annotation(annotation) for annotation in annotations
     ]
+    comments = tuple(str(annotation["comment"]) for annotation in validated_annotations)
     expected_comment = SUBJECT_ANNOTATION_PREFIX + expected
-    if require_subject_annotation and not any(
-        annotation["annotationType"] == "OTHER"
-        and annotation["comment"] == expected_comment
+    subject_annotations = tuple(
+        annotation
         for annotation in validated_annotations
+        if str(annotation["comment"]).startswith(SUBJECT_ANNOTATION_PREFIX)
+    )
+    if require_subject_annotation and (
+        len(subject_annotations) != 1
+        or subject_annotations[0]["annotationType"] != "OTHER"
+        or subject_annotations[0]["comment"] != expected_comment
     ):
         raise SupplyChainError(
             "SBOM_SUBJECT_MISMATCH",
-            "SBOM has no valid top-level annotation for the exact OCI subject",
+            "SBOM must contain one exact top-level annotation for the OCI subject",
         )
+    if not isinstance(require_source_metadata, bool):
+        raise TypeError("require_source_metadata must be boolean")
+    if require_source_metadata or source_repository is not None or source_revision is not None:
+        repository_comments = tuple(
+            comment
+            for comment in comments
+            if comment.startswith(SOURCE_REPOSITORY_ANNOTATION_PREFIX)
+        )
+        revision_comments = tuple(
+            comment
+            for comment in comments
+            if comment.startswith(SOURCE_REVISION_ANNOTATION_PREFIX)
+        )
+        if len(repository_comments) != 1 or len(revision_comments) != 1:
+            raise SupplyChainError(
+                "SBOM_SOURCE_MISMATCH",
+                "SBOM must contain one source repository and one source revision annotation",
+            )
+        _required_uri(
+            "SBOM source repository",
+            repository_comments[0].removeprefix(SOURCE_REPOSITORY_ANNOTATION_PREFIX),
+            code=code,
+        )
+        recorded_revision = revision_comments[0].removeprefix(
+            SOURCE_REVISION_ANNOTATION_PREFIX
+        )
+        if not _GIT_REVISION.fullmatch(recorded_revision):
+            raise SupplyChainError(code, "SBOM source revision must be a full Git commit")
+    if source_repository is not None:
+        source_repository = _required_uri(
+            "SBOM source repository", source_repository, code=code
+        )
+        expected_source = SOURCE_REPOSITORY_ANNOTATION_PREFIX + source_repository
+        if comments.count(expected_source) != 1:
+            raise SupplyChainError(
+                "SBOM_SOURCE_MISMATCH",
+                "SBOM must contain one exact source repository annotation",
+            )
+    if source_revision is not None:
+        source_revision = _required_text(
+            "SBOM source revision", source_revision, code=code
+        )
+        if not _GIT_REVISION.fullmatch(source_revision):
+            raise SupplyChainError(code, "SBOM source revision must be a full Git commit")
+        expected_revision = SOURCE_REVISION_ANNOTATION_PREFIX + source_revision
+        if comments.count(expected_revision) != 1:
+            raise SupplyChainError(
+                "SBOM_SOURCE_MISMATCH",
+                "SBOM must contain one exact source revision annotation",
+            )
     return syft_creators[0]
 
 
@@ -315,18 +438,25 @@ def _bind_spdx_subject(
     *,
     generated_at: str,
     annotator: str,
+    source_repository: str,
+    source_revision: str,
 ) -> None:
     annotations = document.setdefault("annotations", [])
     if not isinstance(annotations, list):
         raise SupplyChainError("MALFORMED_SBOM", "SBOM annotations must be an array")
-    annotations.append(
-        {
-            "annotationDate": generated_at,
-            "annotationType": "OTHER",
-            "annotator": annotator,
-            "comment": SUBJECT_ANNOTATION_PREFIX + immutable_image_reference,
-        }
-    )
+    for comment in (
+        SOURCE_REPOSITORY_ANNOTATION_PREFIX + source_repository,
+        SOURCE_REVISION_ANNOTATION_PREFIX + source_revision,
+        SUBJECT_ANNOTATION_PREFIX + immutable_image_reference,
+    ):
+        annotations.append(
+            {
+                "annotationDate": generated_at,
+                "annotationType": "OTHER",
+                "annotator": annotator,
+                "comment": comment,
+            }
+        )
 
 
 def parse_trivy_findings(
@@ -457,6 +587,11 @@ def create_provenance_statement(
     builder_id: str,
     tool_name: str,
     generated_at: str,
+    tool_version: str = __version__,
+    source_repository: str = "urn:devops-stack:source:unspecified",
+    workflow_identity: str | None = None,
+    verification_command: str = PROVENANCE_VERIFICATION_COMMAND,
+    reproduction_command: str = DEFAULT_REPRODUCTION_COMMAND,
     build_started_on: str | datetime | None = None,
     build_finished_on: str | datetime | None = None,
 ) -> dict[str, Any]:
@@ -471,12 +606,43 @@ def create_provenance_statement(
     builder_id = _required_uri(
         "provenance builder id", builder_id, code="MALFORMED_PROVENANCE"
     )
+    source_repository = _required_uri(
+        "provenance source repository",
+        source_repository,
+        code="MALFORMED_PROVENANCE",
+    )
+    workflow_identity = _required_uri(
+        "provenance workflow identity",
+        workflow_identity or builder_id,
+        code="MALFORMED_PROVENANCE",
+    )
+    verification_command = _required_text(
+        "provenance verification command",
+        verification_command,
+        code="MALFORMED_PROVENANCE",
+    )
+    if verification_command != PROVENANCE_VERIFICATION_COMMAND:
+        raise SupplyChainError(
+            "MALFORMED_PROVENANCE",
+            "provenance verification command must name the validator that is executed",
+        )
+    reproduction_command = _required_reproduction_command(
+        reproduction_command, code="MALFORMED_PROVENANCE"
+    )
     tool_name = _required_text(
         "provenance tool name", tool_name, code="MALFORMED_PROVENANCE"
     )
     if not _TOOL_NAME.fullmatch(tool_name):
         raise SupplyChainError(
             "MALFORMED_PROVENANCE", "provenance tool name uses invalid syntax"
+        )
+    tool_version = _required_text(
+        "provenance tool version", tool_version, code="MALFORMED_PROVENANCE"
+    )
+    if tool_name == "docker-buildx":
+        raise SupplyChainError(
+            "MALFORMED_PROVENANCE",
+            "provenance generator tool name must be distinct from docker-buildx",
         )
     generated_at = _normalize_timestamp(
         "provenance generation time",
@@ -518,13 +684,19 @@ def create_provenance_statement(
                 "buildType": BUILD_TYPE,
                 "externalParameters": {
                     "artifactReference": reference.immutable_reference,
+                    "sourceRepository": source_repository,
                     "sourceRevision": artifact.source_revision,
                     "buildPlanHash": artifact.build_plan_hash,
+                    "workflowIdentity": workflow_identity,
+                    "verificationCommand": verification_command,
+                    "verificationResult": PROVENANCE_VERIFICATION_RESULT,
+                    "reproductionCommand": reproduction_command,
                 },
                 "internalParameters": {},
                 "resolvedDependencies": [
                     {
                         "name": "source",
+                        "uri": source_repository,
                         "digest": {"gitCommit": artifact.source_revision},
                     },
                     {
@@ -536,7 +708,10 @@ def create_provenance_statement(
             "runDetails": {
                 "builder": {
                     "id": builder_id,
-                    "version": {tool_name: artifact.created_by_tool_version},
+                    "version": {
+                        tool_name: tool_version,
+                        "docker-buildx": artifact.created_by_tool_version,
+                    },
                 },
                 "metadata": metadata,
                 "byproducts": [],
@@ -549,6 +724,9 @@ def create_provenance_statement(
                 "attachedToRegistry": False,
                 "cryptographicallyVerified": False,
                 "checksumIsSignature": False,
+                "verificationCommand": verification_command,
+                "verificationResult": PROVENANCE_VERIFICATION_RESULT,
+                "reproductionCommand": reproduction_command,
             },
         },
     }
@@ -557,6 +735,13 @@ def create_provenance_statement(
         reference.immutable_reference,
         source_revision=artifact.source_revision,
         build_plan_hash=artifact.build_plan_hash,
+        source_repository=source_repository,
+        workflow_identity=workflow_identity,
+        verification_command=verification_command,
+        reproduction_command=reproduction_command,
+        generator_tool_name=tool_name,
+        generator_tool_version=tool_version,
+        buildx_version=artifact.created_by_tool_version,
     )
     return statement
 
@@ -567,6 +752,14 @@ def validate_provenance_statement(
     *,
     source_revision: str | None = None,
     build_plan_hash: str | None = None,
+    source_repository: str | None = None,
+    workflow_identity: str | None = None,
+    verification_command: str | None = None,
+    reproduction_command: str | None = None,
+    generator_tool_name: str | None = None,
+    generator_tool_version: str | None = None,
+    buildx_version: str | None = None,
+    require_verification_metadata: bool = True,
 ) -> None:
     """Structurally validate an in-toto SLSA v1 file-only provenance statement."""
 
@@ -628,6 +821,64 @@ def validate_provenance_statement(
         raise SupplyChainError(code, "provenance sourceRevision does not match the artifact")
     if build_plan_hash is not None and recorded_plan_hash != build_plan_hash:
         raise SupplyChainError(code, "provenance buildPlanHash does not match the artifact")
+    if not isinstance(require_verification_metadata, bool):
+        raise TypeError("require_verification_metadata must be boolean")
+    recorded_repository_value = external.get("sourceRepository")
+    recorded_workflow_value = external.get("workflowIdentity")
+    recorded_verification_value = external.get("verificationCommand")
+    recorded_verification_result = external.get("verificationResult")
+    recorded_reproduction_value = external.get("reproductionCommand")
+    strict_metadata = require_verification_metadata or any(
+        value is not None
+        for value in (
+            source_repository,
+            workflow_identity,
+            verification_command,
+            reproduction_command,
+        )
+    )
+    if strict_metadata:
+        recorded_repository = _required_uri(
+            "provenance sourceRepository", recorded_repository_value, code=code
+        )
+        recorded_workflow = _required_uri(
+            "provenance workflowIdentity", recorded_workflow_value, code=code
+        )
+        recorded_verification_command = _required_text(
+            "provenance verificationCommand", recorded_verification_value, code=code
+        )
+        if recorded_verification_command != PROVENANCE_VERIFICATION_COMMAND:
+            raise SupplyChainError(
+                code,
+                "provenance verificationCommand must name the executed validator",
+            )
+        if recorded_verification_result != PROVENANCE_VERIFICATION_RESULT:
+            raise SupplyChainError(
+                code,
+                "provenance verificationResult must record the successful validator result",
+            )
+        recorded_reproduction_command = _required_reproduction_command(
+            recorded_reproduction_value, code=code
+        )
+    else:
+        recorded_repository = None
+        recorded_workflow = None
+        recorded_verification_command = None
+        recorded_reproduction_command = None
+    if source_repository is not None and recorded_repository != source_repository:
+        raise SupplyChainError(code, "provenance sourceRepository does not match")
+    if workflow_identity is not None and recorded_workflow != workflow_identity:
+        raise SupplyChainError(code, "provenance workflowIdentity does not match")
+    if (
+        verification_command is not None
+        and recorded_verification_command != verification_command
+    ):
+        raise SupplyChainError(code, "provenance verificationCommand does not match")
+    if (
+        reproduction_command is not None
+        and recorded_reproduction_command != reproduction_command
+    ):
+        raise SupplyChainError(code, "provenance reproductionCommand does not match")
     _mapping(
         "provenance internalParameters",
         build_definition.get("internalParameters"),
@@ -647,7 +898,14 @@ def validate_provenance_statement(
             dependency.get("digest"),
             code=code,
         )
-        if dependency.get("name") == "source" and dependency_digest.get("gitCommit") == recorded_revision:
+        if (
+            dependency.get("name") == "source"
+            and (
+                recorded_repository is None
+                or dependency.get("uri") == recorded_repository
+            )
+            and dependency_digest.get("gitCommit") == recorded_revision
+        ):
             source_dependency = True
         if dependency.get("name") == "build-plan" and dependency_digest.get("sha256") == recorded_plan_hash:
             plan_dependency = True
@@ -667,6 +925,20 @@ def validate_provenance_statement(
         if not isinstance(name, str) or not _TOOL_NAME.fullmatch(name):
             raise SupplyChainError(code, "provenance builder version has an invalid tool name")
         _required_text(f"provenance builder version {name}", version, code=code)
+    if strict_metadata:
+        recorded_buildx_version = _required_text(
+            "provenance docker-buildx version", versions.get("docker-buildx"), code=code
+        )
+        expected_generator_name = generator_tool_name or "devops-stack-composer"
+        recorded_generator_version = _required_text(
+            f"provenance {expected_generator_name} version",
+            versions.get(expected_generator_name),
+            code=code,
+        )
+        if generator_tool_version is not None and recorded_generator_version != generator_tool_version:
+            raise SupplyChainError(code, "provenance generator tool version does not match")
+        if buildx_version is not None and recorded_buildx_version != buildx_version:
+            raise SupplyChainError(code, "provenance docker-buildx version does not match")
     metadata = _mapping("provenance metadata", run_details.get("metadata"), code=code)
     started = finished = None
     if metadata.get("startedOn") is not None:
@@ -703,6 +975,22 @@ def validate_provenance_statement(
             "file-only provenance must explicitly mark signature, attachment, and "
             "cryptographic verification false",
         )
+    if strict_metadata:
+        if file_evidence.get("verificationCommand") != recorded_verification_command:
+            raise SupplyChainError(
+                code,
+                "file-only provenance verification command must match build parameters",
+            )
+        if file_evidence.get("verificationResult") != PROVENANCE_VERIFICATION_RESULT:
+            raise SupplyChainError(
+                code,
+                "file-only provenance must record the successful validator result",
+            )
+        if file_evidence.get("reproductionCommand") != recorded_reproduction_command:
+            raise SupplyChainError(
+                code,
+                "file-only provenance reproduction command must match build parameters",
+            )
 
 
 def verify_evidence_checksum(
@@ -754,6 +1042,10 @@ def verify_sbom_evidence(
     relative_path: str,
     expected_sha256: str,
     immutable_image_reference: str,
+    *,
+    require_source_metadata: bool = True,
+    source_repository: str | None = None,
+    source_revision: str | None = None,
 ) -> str:
     document = _verified_json_file(
         run_root,
@@ -762,7 +1054,13 @@ def verify_sbom_evidence(
         source="stored SPDX SBOM",
         code="MALFORMED_SBOM",
     )
-    return validate_spdx_document(document, immutable_image_reference)
+    return validate_spdx_document(
+        document,
+        immutable_image_reference,
+        require_source_metadata=require_source_metadata,
+        source_repository=source_repository,
+        source_revision=source_revision,
+    )
 
 
 def verify_vulnerability_evidence(
@@ -789,6 +1087,14 @@ def verify_provenance_evidence(
     *,
     source_revision: str | None = None,
     build_plan_hash: str | None = None,
+    source_repository: str | None = None,
+    workflow_identity: str | None = None,
+    verification_command: str | None = None,
+    reproduction_command: str | None = None,
+    generator_tool_name: str | None = None,
+    generator_tool_version: str | None = None,
+    buildx_version: str | None = None,
+    require_verification_metadata: bool = True,
 ) -> None:
     statement = _verified_json_file(
         run_root,
@@ -802,6 +1108,14 @@ def verify_provenance_evidence(
         immutable_image_reference,
         source_revision=source_revision,
         build_plan_hash=build_plan_hash,
+        source_repository=source_repository,
+        workflow_identity=workflow_identity,
+        verification_command=verification_command,
+        reproduction_command=reproduction_command,
+        generator_tool_name=generator_tool_name,
+        generator_tool_version=generator_tool_version,
+        buildx_version=buildx_version,
+        require_verification_metadata=require_verification_metadata,
     )
 
 
@@ -982,8 +1296,13 @@ class SupplyChainGenerator:
         artifact: ResolvedArtifact,
         policy: VulnerabilityPolicy,
         builder_id: str,
+        source_repository: str = "urn:devops-stack:source:unspecified",
+        workflow_identity: str | None = None,
+        verification_command: str = PROVENANCE_VERIFICATION_COMMAND,
+        reproduction_command: str = DEFAULT_REPRODUCTION_COMMAND,
         generated_at: datetime | None = None,
         tool_name: str = "devops-stack-composer",
+        tool_version: str = __version__,
         build_started_on: str | datetime | None = None,
         build_finished_on: str | datetime | None = None,
         sbom_path: str = "sbom.spdx.json",
@@ -1006,6 +1325,30 @@ class SupplyChainGenerator:
             raise ValueError("timeout_seconds must be a positive integer")
         if not isinstance(insecure_local_registry, bool):
             raise ValueError("insecure_local_registry must be boolean")
+        source_repository = _required_uri(
+            "source repository", source_repository, code="MALFORMED_PROVENANCE"
+        )
+        workflow_identity = _required_uri(
+            "workflow identity",
+            workflow_identity or builder_id,
+            code="MALFORMED_PROVENANCE",
+        )
+        verification_command = _required_text(
+            "verification command",
+            verification_command,
+            code="MALFORMED_PROVENANCE",
+        )
+        if verification_command != PROVENANCE_VERIFICATION_COMMAND:
+            raise SupplyChainError(
+                "MALFORMED_PROVENANCE",
+                "verification command must name the validator that is executed",
+            )
+        reproduction_command = _required_reproduction_command(
+            reproduction_command, code="MALFORMED_PROVENANCE"
+        )
+        tool_version = _required_text(
+            "generator tool version", tool_version, code="MALFORMED_PROVENANCE"
+        )
         if insecure_local_registry and artifact.registry_endpoint.split(":", 1)[0] not in {
             "127.0.0.1",
             "localhost",
@@ -1042,7 +1385,7 @@ class SupplyChainGenerator:
             current_time,
             code="EVIDENCE_TIME_INVALID",
         )
-        annotator = f"Tool: {tool_name}-{artifact.created_by_tool_version}"
+        annotator = f"Tool: {tool_name}-{tool_version}"
 
         immutable_reference = reference.immutable_reference
         sbom_document = self._run_json_file(
@@ -1066,14 +1409,22 @@ class SupplyChainGenerator:
             sbom_document,
             immutable_reference,
             require_subject_annotation=False,
+            require_source_metadata=False,
         )
         _bind_spdx_subject(
             sbom_document,
             immutable_reference,
             generated_at=generation_time,
             annotator=annotator,
+            source_repository=source_repository,
+            source_revision=artifact.source_revision,
         )
-        validate_spdx_document(sbom_document, immutable_reference)
+        validate_spdx_document(
+            sbom_document,
+            immutable_reference,
+            source_repository=source_repository,
+            source_revision=artifact.source_revision,
+        )
 
         vulnerability_report = self._run_json_file(
             lambda output: (
@@ -1120,7 +1471,12 @@ class SupplyChainGenerator:
             artifact,
             builder_id=builder_id,
             tool_name=tool_name,
+            tool_version=tool_version,
             generated_at=generation_time,
+            source_repository=source_repository,
+            workflow_identity=workflow_identity,
+            verification_command=verification_command,
+            reproduction_command=reproduction_command,
             build_started_on=build_started_on,
             build_finished_on=build_finished_on,
         )
@@ -1132,7 +1488,14 @@ class SupplyChainGenerator:
         )
         provenance_hash = _write_json_evidence(root, provenance_path, provenance)
 
-        verify_sbom_evidence(root, sbom_path, sbom_hash, immutable_reference)
+        verify_sbom_evidence(
+            root,
+            sbom_path,
+            sbom_hash,
+            immutable_reference,
+            source_repository=source_repository,
+            source_revision=artifact.source_revision,
+        )
         verify_vulnerability_evidence(
             root,
             vulnerability_report_path,
@@ -1146,6 +1509,13 @@ class SupplyChainGenerator:
             immutable_reference,
             source_revision=artifact.source_revision,
             build_plan_hash=artifact.build_plan_hash,
+            source_repository=source_repository,
+            workflow_identity=workflow_identity,
+            verification_command=verification_command,
+            reproduction_command=reproduction_command,
+            generator_tool_name=tool_name,
+            generator_tool_version=tool_version,
+            buildx_version=artifact.created_by_tool_version,
         )
 
         return SupplyChainEvidence(

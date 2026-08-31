@@ -179,6 +179,28 @@ def successful_evidence(
         supply = supply_chain_evidence()
     if profile in {"kind-e2e", "release"}:
         deployment = deployment_evidence()
+    tool_versions = {
+        "devops-stack-composer": "0.2.0",
+    }
+    if profile != "static":
+        tool_versions.update(
+            {
+                "docker": "28.0.0",
+                "docker-buildx": "0.24.0",
+                "syft": "1.30.0",
+                "trivy": "0.66.0",
+            }
+        )
+    if profile in {"kind-e2e", "release"}:
+        tool_versions.update(
+            {
+                "kind": "0.30.0",
+                "kubectl": "1.33.0",
+                "kubeconform": "0.7.0",
+            }
+        )
+    if profile == "release":
+        tool_versions["gh"] = "2.76.0"
     return ExecutionRun(
         run_id=RUN_ID,
         project_path=".",
@@ -190,10 +212,17 @@ def successful_evidence(
         execution_profile=profile,
         stage_results=stage_results,
         final_status=StageStatus.PASSED,
-        tool_versions={"devops-stack": "0.2.0"},
+        tool_versions=tool_versions,
         artifact_record=artifact,
         supply_chain_evidence=supply,
         deployment_evidence=deployment,
+        source_repository="https://github.com/example/sample-app",
+        template_revisions={
+            "docker": "3" * 40,
+            "jenkins": "4" * 40,
+            "kubernetes": "5" * 40,
+        },
+        evidence_checksums={"logs/config-schema.log": "6" * 64},
     ).to_dict()
 
 
@@ -231,6 +260,57 @@ class RuntimeValidationTests(unittest.TestCase):
                     result.authoritative_digest,
                     None if profile == "static" else DIGEST,
                 )
+
+    def test_legacy_1_0_record_does_not_require_1_1_metadata(self) -> None:
+        plan = execution_plan("static")
+        evidence = successful_evidence(plan)
+        evidence["schemaVersion"] = "1.0.0"
+        for field in (
+            "sourceRepository",
+            "templateRevisions",
+            "evidenceChecksums",
+            "evidenceChecksumPaths",
+            "limitations",
+        ):
+            evidence.pop(field)
+        evidence["toolVersions"] = {}
+        for stage in evidence["stageResults"]:
+            stage["command"] = []
+            stage["tool"] = None
+
+        result = validate_runtime_records(plan, evidence)
+
+        self.assertEqual(result.final_status, "PASSED")
+        self.assertFalse(result.incomplete)
+
+    def test_current_metadata_requires_profile_tools_and_stage_invocations(self) -> None:
+        plan = execution_plan("supply-chain")
+        missing_tool = successful_evidence(plan)
+        missing_tool["toolVersions"].pop("docker")
+        assert_code(
+            self,
+            "RUNTIME_SCHEMA_INVALID",
+            lambda: validate_runtime_records(plan, missing_tool),
+        )
+
+        invocationless = successful_evidence(plan)
+        invocationless["stageResults"][0]["command"] = []
+        invocationless["stageResults"][0]["tool"] = None
+        assert_code(
+            self,
+            "RUNTIME_SCHEMA_INVALID",
+            lambda: validate_runtime_records(plan, invocationless),
+        )
+
+        credentialed_source = successful_evidence(plan)
+        credentialed_source["sourceRepository"] = (
+            "https://token@example.com/example/sample-app"
+        )
+        assert_code(
+            self,
+            "EVIDENCE_RECORD_INVALID",
+            lambda: validate_runtime_records(plan, credentialed_source),
+        )
 
     def test_supply_chain_index_can_use_a_distinct_platform_digest(self) -> None:
         plan = execution_plan(
