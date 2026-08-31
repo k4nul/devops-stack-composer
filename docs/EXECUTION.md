@@ -160,8 +160,8 @@ GH_TOKEN="$(gh auth token)" devops-stack execute \
   --project examples/python-service \
   --environment staging \
   --profile release \
-  --release-assets .devops-stack/release-v0.2.1 \
-  --release-version 0.2.1 \
+  --release-assets .devops-stack/release-v0.2.2 \
+  --release-version 0.2.2 \
   --release-repository k4nul/devops-stack-composer \
   --json
 ```

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.2 - 2026-08-31
+
+- Bind schema 1.1 execution evidence to exact source, template, tool, checksum,
+  SBOM, vulnerability, provenance, deployment, and runtime identities while
+  preserving verification of exact 1.0 bundles from v0.2.1.
+- Emit source-bound Jenkins artifact v2 evidence, retain v1 verification
+  compatibility, and archive successful provenance only after offline validation.
+- Pin the generated Node.js and Python base-image defaults by digest and require
+  observable post-rollback recovery evidence.
+- Stage resumable no-clobber draft releases, complete cumulative validation before
+  publication, verify the live tag target around publication, and reinstall both
+  distributions from fresh public downloads without pip-cache reuse.
+- Enforce cached quality-tool provenance and Python 3.10-3.12 CI matrix gates before
+  release workflows can proceed.
+
 ## 0.2.1 - 2026-08-31
 
 - Isolate GitHub CLI configuration and state in a cleaned runtime directory so the

@@ -78,7 +78,7 @@ class CliTests(unittest.TestCase):
             main(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(output.getvalue(), "devops-stack 0.2.1\n")
+        self.assertEqual(output.getvalue(), "devops-stack 0.2.2\n")
 
     def test_implicit_project_lock_cannot_cross_symlink_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -406,7 +406,7 @@ class CliTests(unittest.TestCase):
             release_execute.release_assets,
             ".devops-stack/release-v0.2.0",
         )
-        self.assertEqual(release_execute.release_version, "0.2.1")
+        self.assertEqual(release_execute.release_version, "0.2.2")
         self.assertEqual(inspect.artifact_command, "inspect")
         self.assertEqual(verify.artifact, "out/execution/artifact.json")
         self.assertEqual(cluster.kind_command, "destroy")
@@ -416,7 +416,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(cleanup.execution_command, "cleanup")
         self.assertEqual(evidence.evidence_command, "verify")
         self.assertEqual(release.release_command, "assemble")
-        self.assertEqual(release.version, "0.2.1")
+        self.assertEqual(release.version, "0.2.2")
 
         configured_execute = build_parser().parse_args(["execute"])
         self.assertIsNone(configured_execute.profile)
