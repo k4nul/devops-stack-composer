@@ -239,7 +239,60 @@ class JenkinsAdapterTests(unittest.TestCase):
         self.assertIn("out/execution/artifact.json", jenkinsfile)
         self.assertIn(f"Tool: devops-stack-composer-{__version__}", jenkinsfile)
         self.assertIn(
-            f"version: ['devops-stack-composer': '{__version__}']", jenkinsfile
+            "version: ['devops-stack-composer': env.COMPOSER_VERSION, "
+            "'docker-buildx': env.DOCKER_BUILDX_VERSION]",
+            jenkinsfile,
+        )
+        self.assertIn(f"COMPOSER_VERSION = '{__version__}'", jenkinsfile)
+        self.assertIn("schemaVersion: 'jenkins-artifact-v2'", jenkinsfile)
+        self.assertIn(
+            "sourceRepository.startsWith('git@github.com:')",
+            jenkinsfile,
+        )
+        self.assertIn(
+            'sourceRepository = "https://github.com/${githubRepository}"',
+            jenkinsfile,
+        )
+        self.assertIn(
+            "The checked-out source repository must be an absolute URI without URL userinfo.",
+            jenkinsfile,
+        )
+        self.assertIn(
+            "sourceRepository.contains('?') || sourceRepository.contains('#')",
+            jenkinsfile,
+        )
+        self.assertIn("BUILD_URL must not contain a query or fragment.", jenkinsfile)
+        for binding in (
+            "sourceRepository: env.SOURCE_REPOSITORY",
+            "sourceRevision: env.SOURCE_REVISION",
+            "buildPlanHash: env.BUILD_PLAN_HASH",
+            "workflowIdentity: env.WORKFLOW_IDENTITY",
+            "composerVersion: env.COMPOSER_VERSION",
+            "dockerBuildxVersion: env.DOCKER_BUILDX_VERSION",
+            "verificationCommand: "
+            "'devops_stack_composer.supply_chain.validate_provenance_statement'",
+            "verificationResult: 'PASSED'",
+            "reproductionCommand: 'devops-stack artifact verify --artifact "
+            "out/execution/artifact.json --sbom out/supply-chain/sbom.json "
+            "--scan out/supply-chain/vulnerabilities.json --provenance "
+            "out/supply-chain/provenance.json'",
+        ):
+            self.assertIn(binding, jenkinsfile)
+        self.assertEqual(
+            jenkinsfile.count('"devops-stack.io/subject=${env.IMAGE_REF}"'),
+            1,
+        )
+        self.assertEqual(
+            jenkinsfile.count(
+                '"devops-stack.io/source-repository=${env.SOURCE_REPOSITORY}"'
+            ),
+            1,
+        )
+        self.assertEqual(
+            jenkinsfile.count(
+                '"devops-stack.io/source-revision=${env.SOURCE_REVISION}"'
+            ),
+            1,
         )
         self.assertIn(
             "Image tag moved while the registry digest was being resolved",
@@ -655,6 +708,22 @@ class JenkinsAdapterTests(unittest.TestCase):
         self.assertLess(scan, verify)
         self.assertEqual(jenkinsfile.count("docker/build.sh --push"), 1)
         self.assertNotIn("docker/build.sh --load", jenkinsfile)
+        provenance_archive = (
+            "archiveArtifacts artifacts: "
+            "'out/supply-chain/provenance.json', fingerprint: true, "
+            "onlyIfSuccessful: true"
+        )
+        verification_command = "devops-stack artifact verify --artifact"
+        self.assertEqual(jenkinsfile.count(provenance_archive), 1)
+        self.assertLess(
+            jenkinsfile.index(verification_command),
+            jenkinsfile.index(provenance_archive),
+        )
+        produce_provenance = jenkinsfile[
+            jenkinsfile.index("stage('Produce Provenance')") : verify
+        ]
+        self.assertNotIn(provenance_archive, produce_provenance)
+        self.assertIn("rm -f out/supply-chain/provenance.json", jenkinsfile)
         sbom_start = jenkinsfile.index("stage('Generate SBOM')")
         sbom_end = jenkinsfile.index("stage('Scan Same Digest')")
         sbom_stage = jenkinsfile[sbom_start:sbom_end]

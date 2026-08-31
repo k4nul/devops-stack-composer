@@ -1042,7 +1042,14 @@ def _jenkins_v2_artifact_mismatches(
         "Image tag moved while the registry digest was being resolved",
         'env.IMAGE_REF = "${env.IMAGE_REPOSITORY}@${env.IMAGE_DIGEST}"',
         "out/execution/artifact.json",
+        "schemaVersion: 'jenkins-artifact-v2'",
         "manifestDigest: env.IMAGE_DIGEST",
+        "sourceRepository: env.SOURCE_REPOSITORY",
+        "sourceRevision: env.SOURCE_REVISION",
+        "buildPlanHash: env.BUILD_PLAN_HASH",
+        "workflowIdentity: env.WORKFLOW_IDENTITY",
+        "composerVersion: env.COMPOSER_VERSION",
+        "dockerBuildxVersion: env.DOCKER_BUILDX_VERSION",
         "buildInvocationCount: 1",
     )
     if resolve_entry is None or any(

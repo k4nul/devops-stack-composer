@@ -27,6 +27,10 @@ from devops_stack_composer.model import (
     supply_chain_scan_requested,
 )
 from devops_stack_composer.sources import SourceResolution
+from devops_stack_composer.supply_chain import (
+    PROVENANCE_VERIFICATION_COMMAND,
+    PROVENANCE_VERIFICATION_RESULT,
+)
 from devops_stack_composer.validation import ValidationStatus
 
 
@@ -261,6 +265,32 @@ def _image_intent_stage_lines(model: NormalizedDevOpsModel) -> list[str]:
         "            steps {",
         "                script {",
         "                    env.SOURCE_REVISION = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()",
+        "                    String sourceRepository = sh(script: 'git config --get remote.origin.url', returnStdout: true).trim()",
+        "                    if (sourceRepository.startsWith('git@github.com:')) {",
+        "                        String githubRepository = sourceRepository.substring('git@github.com:'.length())",
+        "                        if (githubRepository.endsWith('.git')) {",
+        "                            githubRepository = githubRepository.substring(0, githubRepository.length() - '.git'.length())",
+        "                        }",
+        r"                        if (!(githubRepository ==~ /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/)) {",
+        "                            error('The checked-out GitHub SSH remote has an invalid repository path.')",
+        "                        }",
+        '                        sourceRepository = "https://github.com/${githubRepository}"',
+        "                    }",
+        "                    if (sourceRepository.contains('?') || sourceRepository.contains('#')) {",
+        "                        error('The checked-out source repository URI must not contain a query or fragment.')",
+        "                    }",
+        r"                    if (!(sourceRepository ==~ /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^@\s\/]+(?:\/[^\s]*)?$/)) {",
+        "                        error('The checked-out source repository must be an absolute URI without URL userinfo.')",
+        "                    }",
+        "                    env.SOURCE_REPOSITORY = sourceRepository",
+        "                    String workflowIdentity = env.BUILD_URL?.trim()",
+        "                    if (workflowIdentity?.contains('?') || workflowIdentity?.contains('#')) {",
+        "                        error('BUILD_URL must not contain a query or fragment.')",
+        "                    }",
+        r"                    if (!(workflowIdentity ==~ /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^@\s\/]+(?:\/[^\s]*)?$/)) {",
+        "                        error('BUILD_URL must be an absolute Jenkins workflow URI without URL userinfo.')",
+        "                    }",
+        "                    env.WORKFLOW_IDENTITY = workflowIdentity",
         "                    env.GIT_COMMIT_SHA = env.SOURCE_REVISION.take(12)",
     ]
     if model.image_tag_strategy == "fixed":
@@ -388,15 +418,23 @@ def _resolve_digest_stage_lines(routed_branches: tuple[str, ...]) -> list[str]:
             "                    if (!(env.BUILD_PLAN_HASH ==~ /^[0-9a-f]{64}$/)) {",
             "                        error('Generated Docker metadata hash is not a lowercase SHA-256 value.')",
             "                    }",
+            "                    env.DOCKER_BUILDX_VERSION = sh(script: 'docker buildx version', returnStdout: true).trim()",
+            "                    if (!env.DOCKER_BUILDX_VERSION || env.DOCKER_BUILDX_VERSION.contains('\\r') || env.DOCKER_BUILDX_VERSION.contains('\\n')) {",
+            "                        error('docker buildx version returned an invalid version string.')",
+            "                    }",
             "                    Map artifactContract = [",
-            "                        schemaVersion: 'jenkins-artifact-v1',",
+            "                        schemaVersion: 'jenkins-artifact-v2',",
             "                        repository: env.IMAGE_REPOSITORY,",
             "                        tag: env.IMAGE_TAG,",
             "                        tagReference: env.IMAGE_TAG_REF,",
             "                        manifestDigest: env.IMAGE_DIGEST,",
             "                        immutableImageReference: env.IMAGE_REF,",
+            "                        sourceRepository: env.SOURCE_REPOSITORY,",
             "                        sourceRevision: env.SOURCE_REVISION,",
             "                        buildPlanHash: env.BUILD_PLAN_HASH,",
+            "                        workflowIdentity: env.WORKFLOW_IDENTITY,",
+            "                        composerVersion: env.COMPOSER_VERSION,",
+            "                        dockerBuildxVersion: env.DOCKER_BUILDX_VERSION,",
             "                        buildInvocationCount: 1,",
             "                        verificationStatus: 'RESOLVED_UNVERIFIED'",
             "                    ]",
@@ -418,10 +456,13 @@ def _generate_sbom_stage_lines(
     sbom = model.supply_chain.get("sbom", {})
     enabled = bool(sbom.get("enabled", False))
     output_format = str(sbom.get("format", "spdx-json"))
+    tool_output_format = (
+        "spdx-json@2.3" if output_format == "spdx-json" else output_format
+    )
     output_path = "out/supply-chain/sbom.json"
     command = (
         "mkdir -p out/supply-chain && "
-        f"syft \"$IMAGE_REF\" -o {output_format}={output_path}"
+        f"syft \"$IMAGE_REF\" -o {tool_output_format}={output_path}"
     )
     lines = ["        stage('Generate SBOM') {"]
     lines.extend(_branch_when_lines(routed_branches, "            "))
@@ -438,7 +479,11 @@ def _generate_sbom_stage_lines(
             lines.extend(
                 [
                     "                    List annotations = sbomDocument.annotations instanceof List ? sbomDocument.annotations : []",
-                    f"                    annotations.add([annotationDate: env.EVIDENCE_CREATED, annotationType: 'OTHER', annotator: 'Tool: devops-stack-composer-{__version__}', comment: \"devops-stack.io/subject=${{env.IMAGE_REF}}\"])",
+                    "                    List composerAnnotationPrefixes = ['devops-stack.io/subject=', 'devops-stack.io/source-repository=', 'devops-stack.io/source-revision=']",
+                    "                    annotations = annotations.findAll { annotation -> !(annotation instanceof Map) || !(annotation.comment instanceof String) || !composerAnnotationPrefixes.any { prefix -> annotation.comment.startsWith(prefix) } }",
+                    "                    for (String comment in [\"devops-stack.io/subject=${env.IMAGE_REF}\", \"devops-stack.io/source-repository=${env.SOURCE_REPOSITORY}\", \"devops-stack.io/source-revision=${env.SOURCE_REVISION}\"]) {",
+                    f"                        annotations.add([annotationDate: env.EVIDENCE_CREATED, annotationType: 'OTHER', annotator: 'Tool: devops-stack-composer-{__version__}', comment: comment])",
+                    "                    }",
                     "                    sbomDocument.annotations = annotations",
                 ]
             )
@@ -446,7 +491,11 @@ def _generate_sbom_stage_lines(
             lines.extend(
                 [
                     "                    List properties = sbomDocument.properties instanceof List ? sbomDocument.properties : []",
+                    "                    List composerPropertyNames = ['devops-stack.io/subject', 'devops-stack.io/source-repository', 'devops-stack.io/source-revision']",
+                    "                    properties = properties.findAll { property -> !(property instanceof Map) || !composerPropertyNames.contains(property.name) }",
                     "                    properties.add([name: 'devops-stack.io/subject', value: env.IMAGE_REF])",
+                    "                    properties.add([name: 'devops-stack.io/source-repository', value: env.SOURCE_REPOSITORY])",
+                    "                    properties.add([name: 'devops-stack.io/source-revision', value: env.SOURCE_REVISION])",
                     "                    sbomDocument.properties = properties",
                 ]
             )
@@ -511,6 +560,7 @@ def _provenance_stage_lines(
 ) -> list[str]:
     provenance = model.supply_chain.get("provenance", {})
     enabled = bool(provenance.get("enabled", False))
+    reproduction_command = _artifact_verification_command(model)
     lines = ["        stage('Produce Provenance') {"]
     lines.extend(_branch_when_lines(routed_branches, "            "))
     lines.append("            steps {")
@@ -525,17 +575,16 @@ def _provenance_stage_lines(
                 "                        predicate: [",
                 "                            buildDefinition: [",
                 "                                buildType: 'https://github.com/k4nul/devops-stack-composer/build-types/build-once/v0.2',",
-                "                                externalParameters: [artifactReference: env.IMAGE_REF, sourceRevision: env.SOURCE_REVISION, buildPlanHash: env.BUILD_PLAN_HASH],",
+                f"                                externalParameters: [artifactReference: env.IMAGE_REF, sourceRepository: env.SOURCE_REPOSITORY, sourceRevision: env.SOURCE_REVISION, buildPlanHash: env.BUILD_PLAN_HASH, workflowIdentity: env.WORKFLOW_IDENTITY, verificationCommand: {_groovy_string(PROVENANCE_VERIFICATION_COMMAND)}, verificationResult: {_groovy_string(PROVENANCE_VERIFICATION_RESULT)}, reproductionCommand: {_groovy_string(reproduction_command)}],",
                 "                                internalParameters: [:],",
-                "                                resolvedDependencies: [[name: 'source', digest: [gitCommit: env.SOURCE_REVISION]], [name: 'build-plan', digest: [sha256: env.BUILD_PLAN_HASH]]]",
+                "                                resolvedDependencies: [[name: 'source', uri: env.SOURCE_REPOSITORY, digest: [gitCommit: env.SOURCE_REVISION]], [name: 'build-plan', digest: [sha256: env.BUILD_PLAN_HASH]]]",
                 "                            ],",
-                f"                            runDetails: [builder: [id: 'https://www.jenkins.io/', version: ['devops-stack-composer': '{__version__}']], metadata: [:], byproducts: []],",
-                "                            devopsStack_fileEvidence: [mode: 'file-only', generatedAt: env.EVIDENCE_CREATED, signatureGenerated: false, signatureVerified: false, attachedToRegistry: false, cryptographicallyVerified: false, checksumIsSignature: false]",
+                "                            runDetails: [builder: [id: 'https://www.jenkins.io/', version: ['devops-stack-composer': env.COMPOSER_VERSION, 'docker-buildx': env.DOCKER_BUILDX_VERSION]], metadata: [:], byproducts: []],",
+                f"                            devopsStack_fileEvidence: [mode: 'file-only', generatedAt: env.EVIDENCE_CREATED, signatureGenerated: false, signatureVerified: false, attachedToRegistry: false, cryptographicallyVerified: false, checksumIsSignature: false, verificationCommand: {_groovy_string(PROVENANCE_VERIFICATION_COMMAND)}, verificationResult: {_groovy_string(PROVENANCE_VERIFICATION_RESULT)}, reproductionCommand: {_groovy_string(reproduction_command)}]",
                 "                        ]",
                 "                    ]",
                 "                    writeFile file: 'out/supply-chain/provenance.json', text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(statement)) + '\\n'",
                 "                }",
-                "                archiveArtifacts artifacts: 'out/supply-chain/provenance.json', fingerprint: true, onlyIfSuccessful: true",
             ]
         )
     else:
@@ -544,10 +593,7 @@ def _provenance_stage_lines(
     return lines
 
 
-def _verify_artifact_stage_lines(
-    model: NormalizedDevOpsModel,
-    routed_branches: tuple[str, ...],
-) -> list[str]:
+def _artifact_verification_command(model: NormalizedDevOpsModel) -> str:
     arguments = ["--artifact out/execution/artifact.json"]
     if model.supply_chain.get("sbom", {}).get("enabled", False):
         arguments.append("--sbom out/supply-chain/sbom.json")
@@ -555,18 +601,34 @@ def _verify_artifact_stage_lines(
         arguments.append("--scan out/supply-chain/vulnerabilities.json")
     if model.supply_chain.get("provenance", {}).get("enabled", False):
         arguments.append("--provenance out/supply-chain/provenance.json")
-    command = "devops-stack artifact verify " + " ".join(arguments)
+    return "devops-stack artifact verify " + " ".join(arguments)
+
+
+def _verify_artifact_stage_lines(
+    model: NormalizedDevOpsModel,
+    routed_branches: tuple[str, ...],
+) -> list[str]:
+    command = _artifact_verification_command(model)
     lines = ["        stage('Verify Artifact Contract') {"]
     lines.extend(_branch_when_lines(routed_branches, "            "))
-    lines.extend(
-        [
-            "            steps {",
-            f"                sh {_groovy_string(command)}",
-            "            }",
-            "        }",
-            "",
-        ]
-    )
+    lines.append("            steps {")
+    if model.supply_chain.get("provenance", {}).get("enabled", False):
+        lines.extend(
+            [
+                "                script {",
+                "                    try {",
+                f"                        sh {_groovy_string(command)}",
+                "                        archiveArtifacts artifacts: 'out/supply-chain/provenance.json', fingerprint: true, onlyIfSuccessful: true",
+                "                    } catch (Exception verificationError) {",
+                "                        sh 'rm -f out/supply-chain/provenance.json'",
+                "                        throw verificationError",
+                "                    }",
+                "                }",
+            ]
+        )
+    else:
+        lines.append(f"                sh {_groovy_string(command)}")
+    lines.extend(["            }", "        }", ""])
     return lines
 
 
@@ -638,6 +700,7 @@ def _render_jenkinsfile(model: NormalizedDevOpsModel) -> str:
             f"        IMAGE_REGISTRY = {_groovy_string(model.image_registry)}",
             f"        IMAGE_REPOSITORY = {_groovy_string(model.image_name)}",
             f"        REGISTRY_CREDENTIAL_ID = {_groovy_string(model.credential_id)}",
+            f"        COMPOSER_VERSION = {_groovy_string(__version__)}",
             "    }",
             "",
             "    stages {",

@@ -1340,7 +1340,7 @@ class CrossProjectValidationTests(unittest.TestCase):
             ),
             (
                 "sbom",
-                'syft "$IMAGE_REF" -o spdx-json=out/supply-chain/sbom.json',
+                'syft "$IMAGE_REF" -o spdx-json@2.3=out/supply-chain/sbom.json',
                 'syft "$IMAGE_REF" -o cyclonedx-json=out/supply-chain/sbom.json',
                 "jenkins.Jenkinsfile.supplyChain.sbom",
             ),
@@ -1357,6 +1357,12 @@ class CrossProjectValidationTests(unittest.TestCase):
                 "subject: [[name: env.IMAGE_REPOSITORY, digest: [sha256: env.IMAGE_DIGEST.substring(7)]]],",
                 "subject: [[name: env.IMAGE_REPOSITORY, digest: [sha256: '0' * 64]]],",
                 "jenkins.Jenkinsfile.supplyChain.provenance",
+            ),
+            (
+                "artifact-source-binding",
+                "sourceRepository: env.SOURCE_REPOSITORY,",
+                "sourceRepository: 'https://example.invalid/unbound',",
+                "jenkins.Jenkinsfile.digestResolution",
             ),
         )
         for name, expected_text, replacement, expected_path in cases:
@@ -1835,7 +1841,7 @@ class CrossProjectValidationTests(unittest.TestCase):
             (
                 "sbom",
                 "echo 'SBOM generation is disabled by the normalized model.'",
-                'sh \'syft "$IMAGE_REF" -o spdx-json=out/supply-chain/sbom.json\'',
+                'sh \'syft "$IMAGE_REF" -o spdx-json@2.3=out/supply-chain/sbom.json\'',
                 "jenkins.Jenkinsfile.supplyChain.sbom",
             ),
             (

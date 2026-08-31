@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from devops_stack_composer.evidence_validation import (
     ArtifactContractError,
@@ -13,6 +14,7 @@ from devops_stack_composer.evidence_validation import (
     validate_scan_subject,
 )
 from devops_stack_composer.execution_bundle import load_strict_json_file
+from devops_stack_composer.filesystem import normalize_relative_path
 from devops_stack_composer.oci import (
     digest_from_subject,
     parse_digest,
@@ -22,10 +24,13 @@ from devops_stack_composer.oci import (
     validate_tag,
 )
 from devops_stack_composer.policies import VulnerabilityPolicy
-from devops_stack_composer.supply_chain import parse_trivy_findings
+from devops_stack_composer.supply_chain import (
+    PROVENANCE_VERIFICATION_COMMAND,
+    parse_trivy_findings,
+)
 
 
-_FIELDS = {
+_V1_FIELDS = {
     "schemaVersion",
     "repository",
     "tag",
@@ -37,21 +42,63 @@ _FIELDS = {
     "buildInvocationCount",
     "verificationStatus",
 }
+_V2_FIELDS = _V1_FIELDS | {
+    "sourceRepository",
+    "workflowIdentity",
+    "composerVersion",
+    "dockerBuildxVersion",
+}
 
 
 def _text(value: Any, name: str) -> str:
-    if not isinstance(value, str) or not value or value != value.strip():
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
         raise ArtifactContractError(
             "JENKINS_ARTIFACT_INVALID",
-            f"{name} must be a non-empty string without surrounding whitespace",
+            f"{name} must be non-empty and contain no surrounding whitespace or controls",
             evidence_path="artifact.json",
         )
     return value
 
 
+def _uri(value: Any, name: str) -> str:
+    value = _text(value, name)
+    parsed = urlsplit(value)
+    if not parsed.scheme or parsed.username is not None or parsed.password is not None:
+        raise ArtifactContractError(
+            "JENKINS_ARTIFACT_INVALID",
+            f"{name} must be an absolute URI without userinfo",
+            evidence_path="artifact.json",
+        )
+    return value
+
+
+def _reproduction_command(
+    artifact_path: str,
+    *,
+    sbom_path: str | None,
+    scan_path: str | None,
+    provenance_path: str,
+) -> str:
+    arguments = ["--artifact", normalize_relative_path(artifact_path)]
+    if sbom_path is not None:
+        arguments.extend(("--sbom", normalize_relative_path(sbom_path)))
+    if scan_path is not None:
+        arguments.extend(("--scan", normalize_relative_path(scan_path)))
+    arguments.extend(("--provenance", normalize_relative_path(provenance_path)))
+    return "devops-stack artifact verify " + " ".join(arguments)
+
+
 def _validate_cyclonedx_subject(
     document: Mapping[str, Any],
     immutable_reference: str,
+    *,
+    source_repository: str | None = None,
+    source_revision: str | None = None,
 ) -> None:
     if document.get("bomFormat") != "CycloneDX":
         raise ArtifactContractError(
@@ -67,16 +114,26 @@ def _validate_cyclonedx_subject(
             evidence_path="sbom.json",
         )
     properties = document.get("properties")
-    subjects = [
-        item.get("value")
-        for item in properties or ()
-        if isinstance(item, Mapping)
-        and item.get("name") == "devops-stack.io/subject"
-    ]
-    if subjects != [immutable_reference]:
+    expected_properties = {"devops-stack.io/subject": immutable_reference}
+    if source_repository is not None and source_revision is not None:
+        expected_properties.update(
+            {
+                "devops-stack.io/source-repository": source_repository,
+                "devops-stack.io/source-revision": source_revision,
+            }
+        )
+    recorded = {
+        name: [
+            item.get("value")
+            for item in properties or ()
+            if isinstance(item, Mapping) and item.get("name") == name
+        ]
+        for name in expected_properties
+    }
+    if any(recorded[name] != [expected] for name, expected in expected_properties.items()):
         raise ArtifactContractError(
             "SBOM_SUBJECT_MISMATCH",
-            "CycloneDX SBOM must contain one exact composer subject property",
+            "CycloneDX SBOM must contain one exact subject and source identity property",
             evidence_path="sbom.json",
         )
 
@@ -93,16 +150,18 @@ def verify_jenkins_artifact_files(
     """Strictly compare every supplied Jenkins evidence subject offline."""
 
     artifact = load_strict_json_file(project, artifact_path)
-    if set(artifact) != _FIELDS:
+    schema_version = artifact.get("schemaVersion")
+    expected_fields = (
+        _V1_FIELDS
+        if schema_version == "jenkins-artifact-v1"
+        else _V2_FIELDS
+        if schema_version == "jenkins-artifact-v2"
+        else None
+    )
+    if expected_fields is None or set(artifact) != expected_fields:
         raise ArtifactContractError(
             "JENKINS_ARTIFACT_INVALID",
-            "artifact.json fields do not match jenkins-artifact-v1",
-            evidence_path=artifact_path,
-        )
-    if artifact.get("schemaVersion") != "jenkins-artifact-v1":
-        raise ArtifactContractError(
-            "JENKINS_ARTIFACT_INVALID",
-            "artifact.json schemaVersion is unsupported",
+            "artifact.json fields do not match its Jenkins artifact schema version",
             evidence_path=artifact_path,
         )
     repository = _text(artifact.get("repository"), "repository")
@@ -151,7 +210,29 @@ def verify_jenkins_artifact_files(
             "sourceRevision must be lowercase hexadecimal",
             evidence_path=artifact_path,
         )
-    validate_sha256_hex(_text(artifact.get("buildPlanHash"), "buildPlanHash"))
+    build_plan_hash = validate_sha256_hex(
+        _text(artifact.get("buildPlanHash"), "buildPlanHash")
+    )
+    source_repository = (
+        _uri(artifact.get("sourceRepository"), "sourceRepository")
+        if schema_version == "jenkins-artifact-v2"
+        else None
+    )
+    workflow_identity = (
+        _uri(artifact.get("workflowIdentity"), "workflowIdentity")
+        if schema_version == "jenkins-artifact-v2"
+        else None
+    )
+    composer_version = (
+        _text(artifact.get("composerVersion"), "composerVersion")
+        if schema_version == "jenkins-artifact-v2"
+        else None
+    )
+    buildx_version = (
+        _text(artifact.get("dockerBuildxVersion"), "dockerBuildxVersion")
+        if schema_version == "jenkins-artifact-v2"
+        else None
+    )
     if artifact.get("buildInvocationCount") != 1:
         raise ArtifactContractError(
             "BUILD_INVOKED_MORE_THAN_ONCE",
@@ -173,9 +254,22 @@ def verify_jenkins_artifact_files(
     if sbom_path is not None:
         sbom = load_strict_json_file(project, sbom_path)
         if sbom.get("spdxVersion") == "SPDX-2.3":
-            validate_sbom_subject(sbom, immutable_reference=immutable_reference)
+            validate_sbom_subject(
+                sbom,
+                immutable_reference=immutable_reference,
+                source_repository=source_repository,
+                source_revision=(
+                    source_revision if source_repository is not None else None
+                ),
+                require_source_metadata=source_repository is not None,
+            )
         else:
-            _validate_cyclonedx_subject(sbom, immutable_reference)
+            _validate_cyclonedx_subject(
+                sbom,
+                immutable_reference,
+                source_repository=source_repository,
+                source_revision=source_revision,
+            )
         subjects["sbom"] = immutable_reference
     if scan_path is not None:
         scan = load_strict_json_file(project, scan_path)
@@ -191,15 +285,54 @@ def verify_jenkins_artifact_files(
                     evidence_path=scan_path,
                 )
         artifact_name = scan["ArtifactName"]
-        assert isinstance(artifact_name, str)
+        if not isinstance(artifact_name, str):
+            raise ArtifactContractError(
+                "SCAN_SUBJECT_MISMATCH",
+                "Jenkins scan ArtifactName must be a string",
+                evidence_path=scan_path,
+            )
         subjects["scan"] = str(digest_from_subject(artifact_name))
     if provenance_path is not None:
         provenance = load_strict_json_file(project, provenance_path)
-        validate_provenance_subject(
-            provenance,
-            repository=repository,
-            expected_digest=manifest_digest,
-        )
+        if schema_version == "jenkins-artifact-v1":
+            validate_provenance_subject(
+                provenance,
+                repository=repository,
+                expected_digest=manifest_digest,
+            )
+        else:
+            if (
+                source_repository is None
+                or workflow_identity is None
+                or composer_version is None
+                or buildx_version is None
+            ):  # pragma: no cover - exact v2 fields were parsed above
+                raise ArtifactContractError(
+                    "JENKINS_ARTIFACT_INVALID",
+                    "jenkins-artifact-v2 source and tool metadata is incomplete",
+                    evidence_path=artifact_path,
+                )
+            reproduction_command = _reproduction_command(
+                artifact_path,
+                sbom_path=sbom_path,
+                scan_path=scan_path,
+                provenance_path=provenance_path,
+            )
+            validate_provenance_subject(
+                provenance,
+                repository=repository,
+                expected_digest=manifest_digest,
+                source_repository=source_repository,
+                source_revision=source_revision,
+                workflow_identity=workflow_identity,
+                build_plan_hash=build_plan_hash,
+                verification_command=PROVENANCE_VERIFICATION_COMMAND,
+                reproduction_command=reproduction_command,
+                generator_tool_name="devops-stack-composer",
+                generator_tool_version=composer_version,
+                buildx_version=buildx_version,
+                require_verification_metadata=True,
+            )
         subjects["provenance"] = immutable_reference
 
     authoritative = require_same_digest(subjects)
