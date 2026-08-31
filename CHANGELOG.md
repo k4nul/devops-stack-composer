@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4 - 2026-08-31
+
+- Correct the evidence-layout contract to distinguish lightweight execution records
+  from the canonical closed bundles emitted by `kind-e2e` and `release` profiles.
+- Advance from the unpublished v0.2.3 candidate without moving its tag or publishing
+  its canceled draft after independent verification found the documentation mismatch.
+
 ## 0.2.3 - 2026-08-31
 
 - Give both draft-consuming verification jobs the push-equivalent release

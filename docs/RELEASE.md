@@ -38,23 +38,23 @@ python -m twine check dist/*.whl dist/*.tar.gz
 
 devops-stack release materials \
   --project . \
-  --version 0.2.3 \
+  --version 0.2.4 \
   --commit "$(git rev-parse HEAD)" \
   --output dist/release-materials
 
 devops-stack release assemble \
   --project . \
-  --version 0.2.3 \
+  --version 0.2.4 \
   --commit "$(git rev-parse HEAD)" \
   --materials dist/release-materials \
   --evidence-run RUN_ID \
   --evidence-output examples/python-service/.devops-stack/release-runs \
-  --output dist/release-v0.2.3
+  --output dist/release-v0.2.4
 
 devops-stack release verify \
   --project . \
-  --directory dist/release-v0.2.3 \
-  --version 0.2.3 \
+  --directory dist/release-v0.2.4 \
+  --version 0.2.4 \
   --commit "$(git rev-parse HEAD)"
 ```
 
@@ -67,8 +67,8 @@ After all checks pass, create one annotated tag at the clean `main` commit and p
 it without force:
 
 ```sh
-git tag -a v0.2.3 -m "release: v0.2.3"
-git push origin v0.2.3
+git tag -a v0.2.4 -m "release: v0.2.4"
+git push origin v0.2.4
 ```
 
 `.github/workflows/release.yml` then performs the release independently:
@@ -135,7 +135,7 @@ files. Verify a downloaded file with:
 gh attestation verify PATH \
   --repo k4nul/devops-stack-composer \
   --signer-workflow k4nul/devops-stack-composer/.github/workflows/release.yml \
-  --source-ref refs/tags/v0.2.3 \
+  --source-ref refs/tags/v0.2.4 \
   --source-digest COMMIT
 ```
 
