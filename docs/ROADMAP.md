@@ -1,6 +1,6 @@
 # Roadmap
 
-DevOps Stack Composer `0.2.2` is an alpha integration with a deliberately small public
+DevOps Stack Composer `0.2.3` is an alpha integration with a deliberately small public
 contract: one schema version, three pinned adapters, three environments, Kustomize
 output, Jenkins-owned delivery, and an explicit local execution/evidence path.
 

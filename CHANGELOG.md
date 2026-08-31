@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3 - 2026-08-31
+
+- Give both draft-consuming verification jobs the push-equivalent release
+  visibility required by GitHub while keeping credentials step-scoped and checkout
+  credentials disabled.
+- Lock the draft permission and publication dependency boundary with an executable
+  workflow contract test and document immutable failed-candidate recovery.
+- Advance from the unpublished v0.2.2 candidate without moving its tag or publishing
+  its failed draft.
+
 ## 0.2.2 - 2026-08-31
 
 - Bind schema 1.1 execution evidence to exact source, template, tool, checksum,

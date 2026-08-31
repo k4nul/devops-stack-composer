@@ -5,7 +5,7 @@ Docker build, Jenkins delivery pipeline, and Kubernetes deployment tree. It is a
 orchestration layer over three independent public templates: it pins and invokes
 their supported interfaces instead of copying their repositories into this one.
 
-The current release is `v0.2.2` and the configuration API remains
+The current release is `v0.2.3` and the configuration API remains
 `devops-stack.io/v1alpha1`.
 
 ## What it provides
@@ -216,8 +216,8 @@ Execution plans can be previewed first with the same arguments under
     ```sh
     devops-stack release verify \
       --project . \
-      --directory dist/release-v0.2.2 \
-      --version 0.2.2 \
+      --directory dist/release-v0.2.3 \
+      --version 0.2.3 \
       --commit "$(git rev-parse HEAD)" \
       --json
     ```
