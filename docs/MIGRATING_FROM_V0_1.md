@@ -59,6 +59,13 @@ The Docker, Jenkins-template, and Kubernetes source commit pins are unchanged fr
 v0.1.0. `templates.lock.json` changes only the Jenkins adapter version from `1.0.0`
 to `2.0.0`, reflecting the new generated contract and pipeline semantics.
 
+There is also an intentional content-only Dockerfile delta for `nodejs`, `python`,
+and `static` applications: their generated Node.js and Python base-image defaults now
+use `tag@sha256:<manifest-digest>` references. This does not change the 33-path count,
+but it does change the owned Dockerfile bytes. Review that immutable base selection
+before accepting the regenerated manifest; a direct build-argument override is not
+covered by the default-image guarantee.
+
 ## Update policy fields
 
 Legacy supply-chain keys remain supported, but the v0.2 form makes enforcement and

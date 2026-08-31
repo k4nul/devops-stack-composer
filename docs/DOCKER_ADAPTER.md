@@ -28,6 +28,15 @@ configured positive UID/GID, and uses the configured run command. With `multiSta
 true`, build and runtime stages are separate; Python copies installed packages and all
 types copy the workspace into the runtime stage.
 
+The generated Node.js and Python defaults (including both halves of the static-site
+pair) retain readable tags but also include exact manifest-list digests. As a result,
+registry tag movement cannot silently change those default base bytes. The Java, Go,
+and Rust defaults remain explicitly version-tagged rather than digest-pinned; the
+project does not claim bit-for-bit image reproducibility for them. A direct Docker
+build can override the generated `BUILDER_IMAGE` or `RUNTIME_IMAGE` arguments, but
+that override is outside the adapter's default-image guarantee and must be reviewed as
+part of the build invocation.
+
 For `existing`, `build.dockerfile.path` is resolved beneath `application.root` and
 copied to generated output. Strict validation scans the final stage and requires its
 last `USER` instruction to contain the configured numeric UID (optionally with a GID).
