@@ -59,10 +59,14 @@ jobs:
 
           tag = os.environ["GITHUB_REF_NAME"]
           match = re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag)
-          assert match is not None, tag
+          if match is None:
+              raise RuntimeError(f"release tag is not a stable semantic version: {tag}")
           version = tag[1:]
           metadata = tomllib.loads(Path("pyproject.toml").read_text())
-          assert metadata["project"]["version"] == version, metadata["project"]["version"]
+          if metadata["project"]["version"] != version:
+              raise RuntimeError(
+                  f"package version {metadata['project']['version']} does not match {tag}"
+              )
           head = subprocess.run(
               ["git", "rev-parse", "--verify", "HEAD^{commit}"],
               check=True,
@@ -81,15 +85,18 @@ jobs:
               capture_output=True,
               text=True,
           ).stdout
-          assert head == tagged == os.environ["GITHUB_SHA"], (head, tagged)
-          assert status == "", status
+          if head != tagged or tagged != os.environ["GITHUB_SHA"]:
+              raise RuntimeError(
+                  f"tag, checkout, and workflow commits differ: head={head}, tag={tagged}"
+              )
+          if status:
+              raise RuntimeError(f"release checkout is not clean: {status}")
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
               stream.write(f"version={version}\n")
           PY
 
       - name: Install package and release tooling
         run: |
-          python -m pip install --upgrade pip
           python -m pip install . build==1.6.0 twine==7.0.0
           python -m pip check
 
@@ -120,10 +127,14 @@ jobs:
           docker_pattern = re.compile(r"^(?:26|27|28|29)\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
           buildx_pattern = re.compile(r"^v0\.(?:2[0-9]|3[0-6])\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
           client, server, buildx = sys.argv[1:]
-          assert docker_pattern.fullmatch(client), client
-          assert docker_pattern.fullmatch(server), server
-          assert client.split(".", 1)[0] == server.split(".", 1)[0], (client, server)
-          assert buildx_pattern.fullmatch(buildx), buildx
+          if docker_pattern.fullmatch(client) is None:
+              raise RuntimeError(f"Docker client is outside the reviewed range: {client}")
+          if docker_pattern.fullmatch(server) is None:
+              raise RuntimeError(f"Docker server is outside the reviewed range: {server}")
+          if client.split(".", 1)[0] != server.split(".", 1)[0]:
+              raise RuntimeError(f"Docker client/server major mismatch: {client}, {server}")
+          if buildx_pattern.fullmatch(buildx) is None:
+              raise RuntimeError(f"Buildx is outside the reviewed range: {buildx}")
           value = {
               "buildx": buildx,
               "dockerClient": client,
@@ -157,8 +168,10 @@ jobs:
           from pathlib import Path
 
           report = json.loads((Path(os.environ["RUNNER_TEMP"]) / "doctor.json").read_text())
-          assert report["passed"] is True, report
-          assert report["counts"]["BLOCKED_MISSING_REQUIRED_TOOL"] == 0, report["counts"]
+          if report["passed"] is not True:
+              raise RuntimeError(f"release host diagnostics did not pass: {report}")
+          if report["counts"]["BLOCKED_MISSING_REQUIRED_TOOL"] != 0:
+              raise RuntimeError(f"release host is missing required tools: {report['counts']}")
           PY
 
       - name: Allocate an execution run ID
@@ -196,17 +209,23 @@ jobs:
 
           wheel = tuple(Path("dist").glob("devops_stack_composer-*.whl"))
           sdist = tuple(Path("dist").glob("devops_stack_composer-*.tar.gz"))
-          assert len(wheel) == len(sdist) == 1, (wheel, sdist)
+          if len(wheel) != 1 or len(sdist) != 1:
+              raise RuntimeError(f"expected one wheel and one sdist: {wheel}, {sdist}")
           with zipfile.ZipFile(wheel[0]) as archive:
               names = archive.namelist()
-          assert any(name.endswith("/METADATA") for name in names), names
+          if not any(name.endswith("/METADATA") for name in names):
+              raise RuntimeError(f"wheel has no METADATA record: {names}")
           with tarfile.open(sdist[0], "r:gz") as archive:
               names = archive.getnames()
-          assert any(name.endswith("/PKG-INFO") for name in names), names
-          assert not any(
-              "/examples/python-service/build/" in name or name.endswith(".pyz")
+          if not any(name.endswith("/PKG-INFO") for name in names):
+              raise RuntimeError(f"sdist has no PKG-INFO record: {names}")
+          leaked = tuple(
+              name
               for name in names
-          ), names
+              if "/examples/python-service/build/" in name or name.endswith(".pyz")
+          )
+          if leaked:
+              raise RuntimeError(f"sdist contains generated build output: {leaked}")
           PY
 
       - name: Assemble and offline-verify the release set
@@ -321,7 +340,7 @@ jobs:
           name: release-${{ github.ref_name }}
           path: release-assets
 
-      - name: Inspect existing release state without mutation
+      - name: Create an empty draft if the tag has no release
         id: release-state
         env:
           GH_TOKEN: ${{ github.token }}
@@ -345,34 +364,164 @@ jobs:
           if release is None:
               state = "missing"
           else:
-              assert release["tagName"] == os.environ["GITHUB_REF_NAME"], release
+              if release["tagName"] != os.environ["GITHUB_REF_NAME"]:
+                  raise RuntimeError(f"release tag mismatch: {release}")
               if not release["isDraft"]:
                   raise RuntimeError("refusing to modify an existing published release")
-              assert release["isPrerelease"] is False, release
-              assert release["publishedAt"] is None, release
+              if release["isPrerelease"] is not False:
+                  raise RuntimeError(f"existing draft is unexpectedly a prerelease: {release}")
+              if release["publishedAt"] is not None:
+                  raise RuntimeError(f"existing draft has a publication timestamp: {release}")
               state = "draft"
+          (root / "release-state.txt").write_text(state + "\n", encoding="utf-8")
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
               stream.write(f"state={state}\n")
           print(f"release state: {state}")
           PY
+          release_state=$(<"$RUNNER_TEMP/release-state.txt")
+          if [[ "$release_state" == "missing" ]]; then
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "DevOps Stack Composer $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
 
-      - name: Generate GitHub artifact attestations
-        if: ${{ steps.release-state.outputs.state == 'missing' }}
+      - name: Reconcile the existing draft asset subset
+        id: draft-assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,publishedAt,assets \
+            > "$RUNNER_TEMP/reconciled-draft.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          expected_paths = tuple(sorted(Path("release-assets").iterdir()))
+          if len(expected_paths) != 11:
+              raise RuntimeError(f"release set must contain exactly 11 assets: {expected_paths}")
+          if any(not path.is_file() or path.is_symlink() for path in expected_paths):
+              raise RuntimeError(f"release set contains a non-regular asset: {expected_paths}")
+          expected_names = {path.name for path in expected_paths}
+          if len(expected_names) != len(expected_paths):
+              raise RuntimeError("release set contains duplicate asset names")
+          if any(Path(name).name != name or "\n" in name or "\r" in name for name in expected_names):
+              raise RuntimeError("release set contains an unsafe asset name")
+
+          document = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "reconciled-draft.json").read_text()
+          )
+          if document["tagName"] != os.environ["GITHUB_REF_NAME"]:
+              raise RuntimeError(f"release tag mismatch: {document}")
+          if document["isDraft"] is not True or document["publishedAt"] is not None:
+              raise RuntimeError(f"refusing to reconcile a non-draft release: {document}")
+          if document["isPrerelease"] is not False:
+              raise RuntimeError(f"draft is unexpectedly a prerelease: {document}")
+          existing = [asset["name"] for asset in document["assets"]]
+          if len(existing) != len(set(existing)):
+              raise RuntimeError(f"draft contains duplicate asset names: {existing}")
+          unexpected = sorted(set(existing) - expected_names)
+          if unexpected:
+              raise RuntimeError(f"draft contains unexpected assets: {unexpected}")
+          missing = sorted(expected_names - set(existing))
+          root = Path(os.environ["RUNNER_TEMP"])
+          (root / "existing-assets.txt").write_text(
+              "".join(f"{name}\n" for name in sorted(existing)), encoding="utf-8"
+          )
+          (root / "missing-assets.txt").write_text(
+              "".join(f"{name}\n" for name in missing), encoding="utf-8"
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+              stream.write(f"missing={'true' if missing else 'false'}\n")
+          print(f"existing assets: {len(existing)}; missing assets: {len(missing)}")
+          PY
+          mkdir -p .devops-stack/existing-draft-assets
+          if [[ -s "$RUNNER_TEMP/existing-assets.txt" ]]; then
+            gh release download "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir .devops-stack/existing-draft-assets
+          fi
+          python - <<'PY'
+          from hashlib import sha256
+          import os
+          from pathlib import Path
+
+          expected = {
+              path.name: sha256(path.read_bytes()).hexdigest()
+              for path in Path("release-assets").iterdir()
+          }
+          names = tuple(
+              line
+              for line in (
+                  Path(os.environ["RUNNER_TEMP"]) / "existing-assets.txt"
+              ).read_text(encoding="utf-8").splitlines()
+              if line
+          )
+          downloaded_paths = tuple(
+              sorted(Path(".devops-stack/existing-draft-assets").iterdir())
+          )
+          if any(not path.is_file() or path.is_symlink() for path in downloaded_paths):
+              raise RuntimeError(
+                  f"downloaded draft subset contains a non-regular file: {downloaded_paths}"
+              )
+          downloaded = {
+              path.name: sha256(path.read_bytes()).hexdigest()
+              for path in downloaded_paths
+          }
+          wanted = {name: expected[name] for name in names}
+          if downloaded != wanted:
+              raise RuntimeError(
+                  f"existing draft assets differ from the release set: "
+                  f"expected={wanted}, downloaded={downloaded}"
+              )
+          PY
+
+      - name: Generate GitHub artifact attestations before any asset upload
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-assets/*
 
-      - name: Stage the GitHub release as a draft
-        if: ${{ steps.release-state.outputs.state == 'missing' }}
+      - name: Verify attestations and upload only missing assets without clobbering
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" release-assets/* \
+          for asset in release-assets/*; do
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF" \
+              --format json > /dev/null
+          done
+          gh release view "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --draft \
-            --title "DevOps Stack Composer $GITHUB_REF_NAME" \
-            --generate-notes
+            --json tagName,isDraft,isPrerelease,publishedAt \
+            > "$RUNNER_TEMP/pre-upload-draft.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          document = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "pre-upload-draft.json").read_text()
+          )
+          if document["tagName"] != os.environ["GITHUB_REF_NAME"]:
+              raise RuntimeError(f"release tag mismatch before upload: {document}")
+          if document["isDraft"] is not True or document["publishedAt"] is not None:
+              raise RuntimeError(f"refusing to upload to a non-draft release: {document}")
+          if document["isPrerelease"] is not False:
+              raise RuntimeError(f"draft is unexpectedly a prerelease: {document}")
+          PY
+          while IFS= read -r asset; do
+            [[ -n "$asset" ]] || continue
+            gh release upload "$GITHUB_REF_NAME" "release-assets/$asset" \
+              --repo "$GITHUB_REPOSITORY"
+          done < "$RUNNER_TEMP/missing-assets.txt"
 
       - name: Independently download and verify the draft
         env:
@@ -388,8 +537,10 @@ jobs:
 
           def inventory(directory):
               entries = tuple(directory.iterdir())
-              assert len(entries) == 11, entries
-              assert all(path.is_file() and not path.is_symlink() for path in entries), entries
+              if len(entries) != 11:
+                  raise RuntimeError(f"release inventory must contain 11 files: {entries}")
+              if any(not path.is_file() or path.is_symlink() for path in entries):
+                  raise RuntimeError(f"release inventory contains a non-regular file: {entries}")
               return {
                   path.name: sha256(path.read_bytes()).hexdigest()
                   for path in entries
@@ -397,7 +548,11 @@ jobs:
 
           expected = inventory(Path("release-assets"))
           downloaded = inventory(Path(".devops-stack/draft-release"))
-          assert expected == downloaded, (expected, downloaded)
+          if expected != downloaded:
+              raise RuntimeError(
+                  f"downloaded draft differs from the release set: "
+                  f"expected={expected}, downloaded={downloaded}"
+              )
           PY
           for asset in .devops-stack/draft-release/*; do
             gh attestation verify "$asset" \
@@ -419,14 +574,16 @@ jobs:
           release = json.loads(
               (Path(os.environ["RUNNER_TEMP"]) / "draft-release.json").read_text()
           )
-          assert release["tagName"] == os.environ["GITHUB_REF_NAME"], release
-          assert release["isDraft"] is True, release
-          assert release["isPrerelease"] is False, release
-          assert release["publishedAt"] is None, release
-          assert len(release["assets"]) == 11, release
-          assert {asset["name"] for asset in release["assets"]} == {
-              path.name for path in Path("release-assets").iterdir()
-          }, release
+          expected_names = {path.name for path in Path("release-assets").iterdir()}
+          actual_names = {asset["name"] for asset in release["assets"]}
+          if release["tagName"] != os.environ["GITHUB_REF_NAME"]:
+              raise RuntimeError(f"draft tag mismatch: {release}")
+          if release["isDraft"] is not True or release["publishedAt"] is not None:
+              raise RuntimeError(f"release is not an unpublished draft: {release}")
+          if release["isPrerelease"] is not False:
+              raise RuntimeError(f"draft is unexpectedly a prerelease: {release}")
+          if len(release["assets"]) != 11 or actual_names != expected_names:
+              raise RuntimeError(f"draft asset set is not exact: {release}")
           PY
 
       - name: Upload draft-staging diagnostics
@@ -480,7 +637,6 @@ jobs:
 
       - name: Install package and checksum-pinned execution tools
         run: |
-          python -m pip install --upgrade pip
           python -m pip install .
           python -m pip check
           scripts/install-kind-e2e-tools.sh \
@@ -505,10 +661,14 @@ jobs:
           docker_pattern = re.compile(r"^(?:26|27|28|29)\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
           buildx_pattern = re.compile(r"^v0\.(?:2[0-9]|3[0-6])\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
           client, server, buildx = sys.argv[1:]
-          assert docker_pattern.fullmatch(client), client
-          assert docker_pattern.fullmatch(server), server
-          assert client.split(".", 1)[0] == server.split(".", 1)[0], (client, server)
-          assert buildx_pattern.fullmatch(buildx), buildx
+          if docker_pattern.fullmatch(client) is None:
+              raise RuntimeError(f"Docker client is outside the reviewed range: {client}")
+          if docker_pattern.fullmatch(server) is None:
+              raise RuntimeError(f"Docker server is outside the reviewed range: {server}")
+          if client.split(".", 1)[0] != server.split(".", 1)[0]:
+              raise RuntimeError(f"Docker client/server major mismatch: {client}, {server}")
+          if buildx_pattern.fullmatch(buildx) is None:
+              raise RuntimeError(f"Buildx is outside the reviewed range: {buildx}")
           value = {
               "buildx": buildx,
               "dockerClient": client,
@@ -578,18 +738,27 @@ jobs:
                   / "draft-validation-verification.json"
               ).read_text()
           )
-          assert release["downloadedFromGitHub"] is True, release
-          assert release["githubArtifactAttestationsVerified"] is True, release
-          assert release["workingTreeClean"] is True, release
-          assert release["sourceCommit"] == os.environ["GITHUB_SHA"], release
-          assert release["tagCommit"] == os.environ["GITHUB_SHA"], release
-          assert artifact["buildInvocationCount"] == 1, artifact
-          assert verification["passed"] is True, verification
-          assert verification["bundleVerification"]["executionSucceeded"] is True, verification
-          assert (
+          if release["downloadedFromGitHub"] is not True:
+              raise RuntimeError(f"release profile did not download GitHub assets: {release}")
+          if release["githubArtifactAttestationsVerified"] is not True:
+              raise RuntimeError(f"release profile did not verify attestations: {release}")
+          if release["workingTreeClean"] is not True:
+              raise RuntimeError(f"release profile found a dirty worktree: {release}")
+          if release["sourceCommit"] != os.environ["GITHUB_SHA"]:
+              raise RuntimeError(f"release source commit mismatch: {release}")
+          if release["tagCommit"] != os.environ["GITHUB_SHA"]:
+              raise RuntimeError(f"release tag commit mismatch: {release}")
+          if artifact["buildInvocationCount"] != 1:
+              raise RuntimeError(f"release profile did not build exactly once: {artifact}")
+          if verification["passed"] is not True:
+              raise RuntimeError(f"artifact verification did not pass: {verification}")
+          if verification["bundleVerification"]["executionSucceeded"] is not True:
+              raise RuntimeError(f"release bundle execution did not succeed: {verification}")
+          if (
               verification["bundleVerification"]["artifactDigest"]
-              == artifact["manifestDigest"]
-          ), verification
+              != artifact["manifestDigest"]
+          ):
+              raise RuntimeError(f"release artifact digest mismatch: {verification}")
           PY
 
       - name: Retry exact owned-resource cleanup
@@ -682,13 +851,19 @@ jobs:
 
           def inventory(directory):
               entries = tuple(directory.iterdir())
-              assert len(entries) == 11, entries
-              assert all(path.is_file() and not path.is_symlink() for path in entries), entries
+              if len(entries) != 11:
+                  raise RuntimeError(f"release inventory must contain 11 files: {entries}")
+              if any(not path.is_file() or path.is_symlink() for path in entries):
+                  raise RuntimeError(f"release inventory contains a non-regular file: {entries}")
               return {path.name: sha256(path.read_bytes()).hexdigest() for path in entries}
 
           expected = inventory(Path("expected-assets"))
           downloaded = inventory(Path(".devops-stack/final-draft-assets"))
-          assert expected == downloaded, (expected, downloaded)
+          if expected != downloaded:
+              raise RuntimeError(
+                  f"downloaded draft differs from the release set: "
+                  f"expected={expected}, downloaded={downloaded}"
+              )
           PY
           for asset in .devops-stack/final-draft-assets/*; do
             gh attestation verify "$asset" \
@@ -710,13 +885,16 @@ jobs:
           release = json.loads(
               (Path(os.environ["RUNNER_TEMP"]) / "final-draft.json").read_text()
           )
-          assert release["tagName"] == os.environ["GITHUB_REF_NAME"], release
-          assert release["isDraft"] is True, release
-          assert release["isPrerelease"] is False, release
-          assert release["publishedAt"] is None, release
-          assert {asset["name"] for asset in release["assets"]} == {
-              path.name for path in Path("expected-assets").iterdir()
-          }, release
+          expected_names = {path.name for path in Path("expected-assets").iterdir()}
+          actual_names = {asset["name"] for asset in release["assets"]}
+          if release["tagName"] != os.environ["GITHUB_REF_NAME"]:
+              raise RuntimeError(f"draft tag mismatch: {release}")
+          if release["isDraft"] is not True or release["publishedAt"] is not None:
+              raise RuntimeError(f"release is not an unpublished draft: {release}")
+          if release["isPrerelease"] is not False:
+              raise RuntimeError(f"draft is unexpectedly a prerelease: {release}")
+          if len(release["assets"]) != 11 or actual_names != expected_names:
+              raise RuntimeError(f"draft asset set is not exact: {release}")
           PY
 
       - name: Isolated-install and fully verify both draft distributions
@@ -792,13 +970,17 @@ jobs:
           release = json.loads(
               (Path(os.environ["RUNNER_TEMP"]) / "pre-publication-release.json").read_text()
           )
-          assert release["tagName"] == os.environ["GITHUB_REF_NAME"], release
-          assert release["isPrerelease"] is False, release
+          if release["tagName"] != os.environ["GITHUB_REF_NAME"]:
+              raise RuntimeError(f"release tag mismatch before publication: {release}")
+          if release["isPrerelease"] is not False:
+              raise RuntimeError(f"release is unexpectedly a prerelease: {release}")
           if release["isDraft"]:
-              assert release["publishedAt"] is None, release
+              if release["publishedAt"] is not None:
+                  raise RuntimeError(f"draft has a publication timestamp: {release}")
               print("draft")
           else:
-              assert release["publishedAt"] is not None, release
+              if release["publishedAt"] is None:
+                  raise RuntimeError(f"published release has no publication timestamp: {release}")
               print("published")
           PY
           )
@@ -812,13 +994,19 @@ jobs:
 
           def inventory(directory):
               entries = tuple(directory.iterdir())
-              assert len(entries) == 11, entries
-              assert all(path.is_file() and not path.is_symlink() for path in entries), entries
+              if len(entries) != 11:
+                  raise RuntimeError(f"release inventory must contain 11 files: {entries}")
+              if any(not path.is_file() or path.is_symlink() for path in entries):
+                  raise RuntimeError(f"release inventory contains a non-regular file: {entries}")
               return {path.name: sha256(path.read_bytes()).hexdigest() for path in entries}
 
           expected = inventory(Path("expected-assets"))
           candidate = inventory(Path(".devops-stack/publication-candidate"))
-          assert expected == candidate, (expected, candidate)
+          if expected != candidate:
+              raise RuntimeError(
+                  f"publication candidate differs from the release set: "
+                  f"expected={expected}, candidate={candidate}"
+              )
           PY
           for asset in .devops-stack/publication-candidate/*; do
             gh attestation verify "$asset" \
@@ -828,9 +1016,19 @@ jobs:
               --source-ref "$GITHUB_REF" \
               --format json > /dev/null
           done
+          server_tag_commit=$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2F${GITHUB_REF_NAME}" \
+              --jq .sha
+          )
+          if [[ "$server_tag_commit" != "$GITHUB_SHA" ]]; then
+            echo "server-side tag commit mismatch: expected $GITHUB_SHA, got $server_tag_commit" >&2
+            exit 1
+          fi
           if [[ "$release_state" == "draft" ]]; then
             gh release edit "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
+              --tag "$GITHUB_REF_NAME" \
               --verify-tag \
               --draft=false \
               --latest
@@ -847,13 +1045,16 @@ jobs:
           release = json.loads(
               (Path(os.environ["RUNNER_TEMP"]) / "published-release.json").read_text()
           )
-          assert release["tagName"] == os.environ["GITHUB_REF_NAME"], release
-          assert release["isDraft"] is False, release
-          assert release["isPrerelease"] is False, release
-          assert release["publishedAt"] is not None, release
-          assert {asset["name"] for asset in release["assets"]} == {
-              path.name for path in Path("expected-assets").iterdir()
-          }, release
+          expected_names = {path.name for path in Path("expected-assets").iterdir()}
+          actual_names = {asset["name"] for asset in release["assets"]}
+          if release["tagName"] != os.environ["GITHUB_REF_NAME"]:
+              raise RuntimeError(f"published release tag mismatch: {release}")
+          if release["isDraft"] is not False or release["publishedAt"] is None:
+              raise RuntimeError(f"release was not published: {release}")
+          if release["isPrerelease"] is not False:
+              raise RuntimeError(f"published release is unexpectedly a prerelease: {release}")
+          if len(release["assets"]) != 11 or actual_names != expected_names:
+              raise RuntimeError(f"published release asset set is not exact: {release}")
           PY
 
       - name: Upload publication diagnostics
@@ -930,21 +1131,31 @@ jobs:
 
           def inventory(directory):
               entries = tuple(directory.iterdir())
-              assert len(entries) == 11, entries
-              assert all(path.is_file() and not path.is_symlink() for path in entries), entries
+              if len(entries) != 11:
+                  raise RuntimeError(f"release inventory must contain 11 files: {entries}")
+              if any(not path.is_file() or path.is_symlink() for path in entries):
+                  raise RuntimeError(f"release inventory contains a non-regular file: {entries}")
               return {path.name: sha256(path.read_bytes()).hexdigest() for path in entries}
 
           expected = inventory(Path("expected-assets"))
           published = inventory(Path(".devops-stack/public-release-assets"))
-          assert expected == published, (expected, published)
+          if expected != published:
+              raise RuntimeError(
+                  f"published assets differ from the release set: "
+                  f"expected={expected}, published={published}"
+              )
           release = json.loads(
               (Path(os.environ["RUNNER_TEMP"]) / "public-release.json").read_text()
           )
-          assert release["tagName"] == os.environ["GITHUB_REF_NAME"], release
-          assert release["isDraft"] is False, release
-          assert release["isPrerelease"] is False, release
-          assert release["publishedAt"] is not None, release
-          assert {asset["name"] for asset in release["assets"]} == set(published), release
+          actual_names = {asset["name"] for asset in release["assets"]}
+          if release["tagName"] != os.environ["GITHUB_REF_NAME"]:
+              raise RuntimeError(f"public release tag mismatch: {release}")
+          if release["isDraft"] is not False or release["publishedAt"] is None:
+              raise RuntimeError(f"release is not public: {release}")
+          if release["isPrerelease"] is not False:
+              raise RuntimeError(f"public release is unexpectedly a prerelease: {release}")
+          if len(release["assets"]) != 11 or actual_names != set(published):
+              raise RuntimeError(f"public release asset set is not exact: {release}")
           PY
           for asset in .devops-stack/public-release-assets/*; do
             gh attestation verify "$asset" \
@@ -962,6 +1173,20 @@ jobs:
             "$RELEASE_VERSION" \
             "$GITHUB_SHA" \
             > "$RUNNER_TEMP/post-publication-install-verification.json"
+
+      - name: Reconfirm the public tag still targets the validated commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          server_tag_commit=$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2F${GITHUB_REF_NAME}" \
+              --jq .sha
+          )
+          if [[ "$server_tag_commit" != "$GITHUB_SHA" ]]; then
+            echo "server-side tag commit mismatch: expected $GITHUB_SHA, got $server_tag_commit" >&2
+            exit 1
+          fi
 
       - name: Upload post-publication diagnostics
         if: ${{ always() }}

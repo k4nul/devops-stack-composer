@@ -17,7 +17,15 @@ SENSITIVE_ENVIRONMENT = re.compile(
     re.IGNORECASE,
 )
 UNTRUSTED_PACKAGE_ENVIRONMENT_KEYS = frozenset(
-    {"GIT_ASKPASS", "NETRC", "PIP_EXTRA_INDEX_URL", "PIP_INDEX_URL", "SSH_ASKPASS"}
+    {
+        "GIT_ASKPASS",
+        "NETRC",
+        "PIP_CACHE_DIR",
+        "PIP_EXTRA_INDEX_URL",
+        "PIP_INDEX_URL",
+        "PYTHONOPTIMIZE",
+        "SSH_ASKPASS",
+    }
 )
 
 
@@ -35,7 +43,9 @@ def sanitized_environment() -> dict[str, str]:
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
             "PIP_CONFIG_FILE": os.devnull,
+            "PIP_NO_CACHE_DIR": "1",
             "PIP_NO_INPUT": "1",
+            "PYTHONOPTIMIZE": "",
         }
     )
     return environment
@@ -68,6 +78,7 @@ def verify_distribution(
                 "pip",
                 "--disable-pip-version-check",
                 "install",
+                "--no-cache-dir",
                 str(distribution),
             ],
             check=True,
@@ -93,9 +104,11 @@ def verify_distribution(
             env=child_environment,
             stdin=subprocess.DEVNULL,
         )
-        assert version.stdout.strip() == f"devops-stack {expected_version}", (
-            version.stdout
-        )
+        if version.stdout.strip() != f"devops-stack {expected_version}":
+            raise RuntimeError(
+                "installed CLI version does not match the release: "
+                + version.stdout.strip()
+            )
 
         check = r"""
 import json
@@ -112,15 +125,18 @@ from devops_stack_composer.resources import schema_path
 expected_version = os.environ["RELEASE_VERSION"]
 expected_commit = os.environ["RELEASE_COMMIT"]
 assets = Path(os.environ["ASSET_DIRECTORY"])
-assert __version__ == expected_version, __version__
+if __version__ != expected_version:
+    raise RuntimeError(f"installed package version mismatch: {__version__}")
 verification = verify_release_assets(
     assets.parent,
     assets.name,
     expected_version=expected_version,
     expected_commit=expected_commit,
 )
-assert verification.manifest.version == expected_version, verification
-assert verification.manifest.source_commit == expected_commit, verification
+if verification.manifest.version != expected_version:
+    raise RuntimeError("release manifest version does not match the installed package")
+if verification.manifest.source_commit != expected_commit:
+    raise RuntimeError("release manifest source commit does not match the tag commit")
 schema_names = (
     "devops-stack.schema.json",
     "execution-report.schema.json",
@@ -132,7 +148,8 @@ for name in schema_names:
     downloaded = json.loads((assets / name).read_text())
     Draft7Validator.check_schema(packaged)
     Draft7Validator.check_schema(downloaded)
-    assert packaged == downloaded, name
+    if packaged != downloaded:
+        raise RuntimeError(f"downloaded schema differs from installed schema: {name}")
     schemas[name] = packaged
 config = yaml.safe_load((assets / "devops-stack.example.yaml").read_text())
 errors = tuple(
@@ -141,7 +158,8 @@ errors = tuple(
         format_checker=FormatChecker(),
     ).iter_errors(config)
 )
-assert not errors, errors
+if errors:
+    raise RuntimeError(f"example configuration fails the downloaded schema: {errors}")
 """
         child_environment.update(
             {
