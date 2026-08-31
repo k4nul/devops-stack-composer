@@ -54,7 +54,8 @@ jobs:
             src/devops_stack_composer/release_assets.py \
             src/devops_stack_composer/release_validation.py \
             tests/test_release_assets.py \
-            tests/test_release_validation.py
+            tests/test_release_validation.py \
+            tests/test_release_workflow.py
           ruff check \
             scripts/check-doc-links.py \
             scripts/verify-release-distributions.py
