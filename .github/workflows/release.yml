@@ -31,6 +31,20 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Restore checksum-pinned execution tool archives
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/devops-stack-tool-archives
+          key: execution-tools-${{ runner.os }}-amd64-v1-kind-0.33.0-kubectl-1.36.4-kubeconform-0.8.0-syft-1.51.1-trivy-0.74.0-gh-2.95.0
+
+      - name: Restore the versioned Trivy database cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ runner.os }}-v0.74.0-${{ github.run_id }}-${{ github.run_attempt }}-build
+          restore-keys: |
+            trivy-db-${{ runner.os }}-v0.74.0-
+
       - name: Validate tag, version, commit, and worktree
         id: release-version
         run: |
@@ -82,7 +96,9 @@ jobs:
 
       - name: Install checksum-pinned execution tools
         run: |
-          scripts/install-kind-e2e-tools.sh "$RUNNER_TEMP/devops-stack-tools"
+          scripts/install-kind-e2e-tools.sh \
+            "$RUNNER_TEMP/devops-stack-tools" \
+            "$RUNNER_TEMP/devops-stack-tool-archives"
           echo "$RUNNER_TEMP/devops-stack-tools" >> "$GITHUB_PATH"
 
       - name: Resolve immutable templates and diagnose the release host
@@ -179,10 +195,10 @@ jobs:
           python -m json.tool "$RUNNER_TEMP/release-verification.json"
 
       - name: Retry exact owned-resource cleanup
-        if: ${{ always() && env.RUN_ID != '' }}
+        if: ${{ always() }}
         run: |
-          run_directory="examples/python-service/.devops-stack/release-runs/$RUN_ID"
-          if [[ -d "$run_directory" ]]; then
+          run_directory="examples/python-service/.devops-stack/release-runs/${RUN_ID:-}"
+          if [[ -n "${RUN_ID:-}" && -d "$run_directory" ]]; then
             devops-stack execution cleanup \
               --project examples/python-service \
               --run "$RUN_ID" \
@@ -190,7 +206,26 @@ jobs:
               --json
           fi
 
+      - name: Upload release-build diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-build-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            examples/python-service/.devops-stack/release-runs/${{ env.RUN_ID }}
+            ${{ runner.temp }}/*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Clean Docker build cache and report disk usage
+        if: ${{ always() }}
+        run: |
+          docker buildx prune --all --force
+          docker system prune --all --force --volumes
+          docker system df
+
       - name: Upload the closed release set
+        if: ${{ success() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ github.ref_name }}
@@ -198,8 +233,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  publish-github:
-    name: Attest, publish, and independently download
+  stage-draft:
+    name: Attest and stage a verified draft
     needs: build-release
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -238,26 +273,27 @@ jobs:
         with:
           subject-path: release-assets/*
 
-      - name: Publish the GitHub release
+      - name: Stage the GitHub release as a draft
         run: |
           gh release create "$GITHUB_REF_NAME" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
+            --draft \
             --title "DevOps Stack Composer $GITHUB_REF_NAME" \
             --generate-notes
 
-      - name: Independently download and verify publication
+      - name: Independently download and verify the draft
         run: |
-          mkdir -p .devops-stack/published-release
+          mkdir -p .devops-stack/draft-release
           gh release download "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --dir .devops-stack/published-release
+            --dir .devops-stack/draft-release
           devops-stack release verify \
             --project . \
-            --directory .devops-stack/published-release \
+            --directory .devops-stack/draft-release \
             --version "${GITHUB_REF_NAME#v}" \
             --commit "$GITHUB_SHA" \
-            --json > "$RUNNER_TEMP/published-verification.json"
+            --json > "$RUNNER_TEMP/draft-verification.json"
           python - <<'PY'
           from hashlib import sha256
           from pathlib import Path
@@ -270,10 +306,10 @@ jobs:
               }
 
           assert inventory(Path("release-assets")) == inventory(
-              Path(".devops-stack/published-release")
+              Path(".devops-stack/draft-release")
           )
           PY
-          for asset in .devops-stack/published-release/*; do
+          for asset in .devops-stack/draft-release/*; do
             gh attestation verify "$asset" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
@@ -284,14 +320,36 @@ jobs:
           gh release view "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --json tagName,isDraft,isPrerelease,publishedAt,assets \
-            > "$RUNNER_TEMP/publication.json"
-          python -m json.tool "$RUNNER_TEMP/publication.json"
+            > "$RUNNER_TEMP/draft-release.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
 
-  post-publication:
-    name: Run the cumulative published-release profile
+          release = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "draft-release.json").read_text()
+          )
+          assert release["tagName"] == os.environ["GITHUB_REF_NAME"], release
+          assert release["isDraft"] is True, release
+          assert release["isPrerelease"] is False, release
+          assert release["publishedAt"] is None, release
+          assert len(release["assets"]) == 11, release
+          PY
+
+      - name: Upload draft-staging diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: draft-staging-diagnostics-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  validate-draft:
+    name: Run the cumulative release profile against the draft
     needs:
       - build-release
-      - publish-github
+      - stage-draft
     runs-on: ubuntu-latest
     timeout-minutes: 50
     permissions:
@@ -312,12 +370,28 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Restore checksum-pinned execution tool archives
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/devops-stack-tool-archives
+          key: execution-tools-${{ runner.os }}-amd64-v1-kind-0.33.0-kubectl-1.36.4-kubeconform-0.8.0-syft-1.51.1-trivy-0.74.0-gh-2.95.0
+
+      - name: Restore the versioned Trivy database cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ runner.os }}-v0.74.0-${{ github.run_id }}-${{ github.run_attempt }}-validate
+          restore-keys: |
+            trivy-db-${{ runner.os }}-v0.74.0-
+
       - name: Install package and checksum-pinned execution tools
         run: |
           python -m pip install --upgrade pip
           python -m pip install .
           python -m pip check
-          scripts/install-kind-e2e-tools.sh "$RUNNER_TEMP/devops-stack-tools"
+          scripts/install-kind-e2e-tools.sh \
+            "$RUNNER_TEMP/devops-stack-tools" \
+            "$RUNNER_TEMP/devops-stack-tool-archives"
           echo "$RUNNER_TEMP/devops-stack-tools" >> "$GITHUB_PATH"
 
       - name: Download the local comparison set
@@ -332,7 +406,7 @@ jobs:
             --project examples/python-service \
             --json > "$RUNNER_TEMP/templates.json"
 
-      - name: Allocate a post-publication run ID
+      - name: Allocate a draft-validation run ID
         run: |
           RUN_ID=$(python -c 'from devops_stack_composer.evidence_store import new_run_id; print(new_run_id())')
           echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
@@ -344,28 +418,31 @@ jobs:
             --no-fetch \
             --environment staging \
             --profile release \
-            --output .devops-stack/post-release-runs \
-            --image-tag "published-${GITHUB_SHA::12}" \
+            --output .devops-stack/draft-validation-runs \
+            --image-tag "draft-${GITHUB_SHA::12}" \
             --run "$RUN_ID" \
             --release-assets ".devops-stack/release-${GITHUB_REF_NAME}" \
             --release-version "$RELEASE_VERSION" \
             --release-repository "$GITHUB_REPOSITORY" \
-            --json > "$RUNNER_TEMP/post-release.json"
+            --json > "$RUNNER_TEMP/draft-validation.json"
           devops-stack artifact verify \
             --project examples/python-service \
             --run "$RUN_ID" \
-            --output .devops-stack/post-release-runs \
-            --json > "$RUNNER_TEMP/post-release-verification.json"
+            --output .devops-stack/draft-validation-runs \
+            --json > "$RUNNER_TEMP/draft-validation-verification.json"
           python - <<'PY'
           import json
           import os
           from pathlib import Path
 
-          root = Path("examples/python-service/.devops-stack/post-release-runs") / os.environ["RUN_ID"]
+          root = Path("examples/python-service/.devops-stack/draft-validation-runs") / os.environ["RUN_ID"]
           release = json.loads((root / "release-validation.json").read_text())
           artifact = json.loads((root / "artifact.json").read_text())
           verification = json.loads(
-              (Path(os.environ["RUNNER_TEMP"]) / "post-release-verification.json").read_text()
+              (
+                  Path(os.environ["RUNNER_TEMP"])
+                  / "draft-validation-verification.json"
+              ).read_text()
           )
           assert release["downloadedFromGitHub"] is True, release
           assert release["githubArtifactAttestationsVerified"] is True, release
@@ -382,64 +459,229 @@ jobs:
           PY
 
       - name: Retry exact owned-resource cleanup
-        if: ${{ always() && env.RUN_ID != '' }}
+        if: ${{ always() }}
         run: |
-          run_directory="examples/python-service/.devops-stack/post-release-runs/$RUN_ID"
-          if [[ -d "$run_directory" ]]; then
+          run_directory="examples/python-service/.devops-stack/draft-validation-runs/${RUN_ID:-}"
+          if [[ -n "${RUN_ID:-}" && -d "$run_directory" ]]; then
             devops-stack execution cleanup \
               --project examples/python-service \
               --run "$RUN_ID" \
-              --output .devops-stack/post-release-runs \
+              --output .devops-stack/draft-validation-runs \
               --json
           fi
 
-      - name: Upload post-publication evidence
-        if: ${{ always() && env.RUN_ID != '' }}
+      - name: Upload draft-validation evidence and diagnostics
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: post-publication-evidence-${{ github.sha }}-${{ github.run_attempt }}
-          path: examples/python-service/.devops-stack/post-release-runs/${{ env.RUN_ID }}
+          name: draft-validation-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            examples/python-service/.devops-stack/draft-validation-runs/${{ env.RUN_ID }}
+            ${{ runner.temp }}/*.json
           if-no-files-found: warn
           retention-days: 30
 
-  publish-pypi:
-    name: Publish distributions to PyPI
-    if: ${{ vars.PUBLISH_TO_PYPI == 'true' }}
+      - name: Clean Docker build cache and report disk usage
+        if: ${{ always() }}
+        run: |
+          docker buildx prune --all --force
+          docker system prune --all --force --volumes
+          docker system df
+
+  publish-github:
+    name: Reverify and publish the draft
     needs:
       - build-release
-      - publish-github
-      - post-publication
+      - stage-draft
+      - validate-draft
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment:
-      name: pypi
-      url: https://pypi.org/p/devops-stack-composer
+    timeout-minutes: 25
     permissions:
       actions: read
-      id-token: write
+      attestations: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      RELEASE_VERSION: ${{ needs.build-release.outputs.version }}
     steps:
-      - name: Download the verified release set
+      - name: Check out the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Download the immutable comparison set
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           name: release-${{ github.ref_name }}
-          path: release-assets
+          path: expected-assets
 
-      - name: Select only Python distributions
+      - name: Freshly download and byte-verify the draft
         run: |
-          mkdir pypi-dist
+          mkdir -p .devops-stack/final-draft-assets
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir .devops-stack/final-draft-assets
           python - <<'PY'
+          from hashlib import sha256
           from pathlib import Path
-          import shutil
 
-          assets = Path("release-assets")
-          wheels = tuple(assets.glob("devops_stack_composer-*.whl"))
-          sdists = tuple(assets.glob("devops_stack_composer-*.tar.gz"))
-          assert len(wheels) == len(sdists) == 1, (wheels, sdists)
-          for source in (*wheels, *sdists):
-              shutil.copyfile(source, Path("pypi-dist") / source.name)
+          def inventory(directory):
+              return {
+                  path.name: sha256(path.read_bytes()).hexdigest()
+                  for path in directory.iterdir()
+                  if path.is_file() and not path.is_symlink()
+              }
+
+          expected = inventory(Path("expected-assets"))
+          downloaded = inventory(Path(".devops-stack/final-draft-assets"))
+          assert expected == downloaded, (expected, downloaded)
+          assert len(downloaded) == 11, downloaded
+          PY
+          for asset in .devops-stack/final-draft-assets/*; do
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF" \
+              --format json > /dev/null
+          done
+
+      - name: Isolated-install both downloaded distributions
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          assets = Path(".devops-stack/final-draft-assets").resolve()
+          distributions = sorted(
+              (*assets.glob("devops_stack_composer-*.whl"), *assets.glob("devops_stack_composer-*.tar.gz"))
+          )
+          assert len(distributions) == 2, distributions
+          assert sum(path.name.endswith(".whl") for path in distributions) == 1
+          assert sum(path.name.endswith(".tar.gz") for path in distributions) == 1
+          expected_version = os.environ["RELEASE_VERSION"]
+          check = r'''
+          import json
+          import os
+          from pathlib import Path
+
+          from jsonschema import Draft7Validator, FormatChecker
+          import yaml
+
+          from devops_stack_composer import __version__
+          from devops_stack_composer.resources import schema_path
+
+          assert __version__ == os.environ["RELEASE_VERSION"], __version__
+          assets = Path(os.environ["ASSET_DIRECTORY"])
+          schema_names = (
+              "devops-stack.schema.json",
+              "execution-report.schema.json",
+              "execution-evidence.schema.json",
+          )
+          schemas = {}
+          for name in schema_names:
+              packaged = json.loads(schema_path(name).read_text())
+              downloaded = json.loads((assets / name).read_text())
+              Draft7Validator.check_schema(packaged)
+              Draft7Validator.check_schema(downloaded)
+              assert packaged == downloaded, name
+              schemas[name] = packaged
+          config = yaml.safe_load((assets / "devops-stack.example.yaml").read_text())
+          errors = tuple(
+              Draft7Validator(
+                  schemas["devops-stack.schema.json"],
+                  format_checker=FormatChecker(),
+              ).iter_errors(config)
+          )
+          assert not errors, errors
+          '''
+          for distribution in distributions:
+              with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
+                  root = Path(directory)
+                  environment = root / "venv"
+                  subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
+                  python = environment / "bin" / "python"
+                  subprocess.run(
+                      [str(python), "-m", "pip", "install", str(distribution)],
+                      check=True,
+                      cwd=root,
+                  )
+                  result = subprocess.run(
+                      [str(environment / "bin" / "devops-stack"), "--version"],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                      cwd=root,
+                  )
+                  assert result.stdout.strip() == f"devops-stack {expected_version}", result.stdout
+                  child_environment = dict(os.environ)
+                  child_environment["ASSET_DIRECTORY"] = str(assets)
+                  subprocess.run(
+                      [str(python), "-c", check],
+                      check=True,
+                      cwd=root,
+                      env=child_environment,
+                  )
           PY
 
-      - name: Publish with PyPI trusted publishing
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+      - name: Confirm the immutable draft and publish it
+        run: |
+          gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,publishedAt,assets \
+            > "$RUNNER_TEMP/final-draft.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          release = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "final-draft.json").read_text()
+          )
+          assert release["tagName"] == os.environ["GITHUB_REF_NAME"], release
+          assert release["isDraft"] is True, release
+          assert release["isPrerelease"] is False, release
+          assert release["publishedAt"] is None, release
+          assert len(release["assets"]) == 11, release
+          PY
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft=false \
+            --latest
+          gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,publishedAt,assets \
+            > "$RUNNER_TEMP/published-release.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          release = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "published-release.json").read_text()
+          )
+          assert release["tagName"] == os.environ["GITHUB_REF_NAME"], release
+          assert release["isDraft"] is False, release
+          assert release["isPrerelease"] is False, release
+          assert release["publishedAt"] is not None, release
+          assert len(release["assets"]) == 11, release
+          PY
+
+      - name: Upload publication diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          packages-dir: pypi-dist/
+          name: publication-diagnostics-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/*.json
+          if-no-files-found: warn
+          retention-days: 30
